@@ -198,6 +198,9 @@ enum asEEngineProp
 	// ORGLIN: script classes are implicit-handle types, so `class X` behaves as
 	// `class @X` without an `@` in the authored source (ADR-0010 slice 3).
 	asEP_IMPLICIT_HANDLE_CLASSES            = 42,
+	// ORGLIN: `[ ... ]` is accepted as a list literal where `{ ... }` is today
+	// (ADR-0011), e.g. `array<int> a = [1, 2, 3]`.
+	asEP_BRACKET_LIST_LITERALS              = 43,
 
 	asEP_LAST_PROPERTY
 };

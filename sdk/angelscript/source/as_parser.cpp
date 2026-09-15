@@ -2286,10 +2286,13 @@ asCScriptNode *asCParser::ParseExprTerm()
 		// Move to token after the type
 		RewindTo(&t2);
 
-		// The next token must be a = followed by a {
+		// The next token must be a = followed by a list literal ( '{' or, with
+		// asEP_BRACKET_LIST_LITERALS, '[' )
 		GetToken(&t2);
 		GetToken(&t3);
-		if (t2.type == ttAssignment && t3.type == ttStartStatementBlock)
+		if (t2.type == ttAssignment &&
+			(t3.type == ttStartStatementBlock ||
+			 (t3.type == ttOpenBracket && engine->ep.bracketListLiterals)))
 		{
 			// It is an initialization, now parse it for real
 			RewindTo(&t);
@@ -2300,7 +2303,12 @@ asCScriptNode *asCParser::ParseExprTerm()
 		}
 	}
 	// Or an anonymous init list, i.e. {...}
-	else if( t.type == ttStartStatementBlock )
+	// ORGLIN: with asEP_BRACKET_LIST_LITERALS `[...]` is the same list literal.
+	// '[' has no other meaning at the start of an expression term (indexing
+	// requires a preceding expression), so this is unambiguous. The node stays
+	// snInitList, so the compiler/bytecode are unchanged.
+	else if( t.type == ttStartStatementBlock ||
+			 (engine->ep.bracketListLiterals && t.type == ttOpenBracket) )
 	{
 		RewindTo(&t);
 		node->AddChildLast(ParseInitList());
@@ -3853,7 +3861,9 @@ int asCParser::ParseVarInit(asCScriptCode *in_script, asCScriptNode *in_init)
 	{
 		GetToken(&t);
 		RewindTo(&t);
-		if( t.type == ttStartStatementBlock )
+		// ORGLIN (ADR-0011): the initializer may be a '{' or '[' list literal.
+		if( t.type == ttStartStatementBlock ||
+			(t.type == ttOpenBracket && engine->ep.bracketListLiterals) )
 			scriptNode = ParseInitList();
 		else
 			scriptNode = ParseAssignment();
@@ -3905,14 +3915,16 @@ asCScriptNode *asCParser::SuperficiallyParseVarInit()
 		// Find the end of the expression
 		int indentParan = 0;
 		int indentBrace = 0;
+		int indentBracket = 0;  // ORGLIN: '[...]' list literals (ADR-0011)
 		bool firstToken = true;
-		while( indentParan || indentBrace || (t.type != ttListSeparator && t.type != ttEndStatement && t.type != ttEndStatementBlock) )
+		while( indentParan || indentBrace || indentBracket ||
+			   (t.type != ttListSeparator && t.type != ttEndStatement && t.type != ttEndStatementBlock) )
 		{
 			// ORGLIN: with optional statement termination a line break ends the
 			// initializer once the expression has started and we are not inside
-			// (...) or {...}. Without this the scanner runs to the end of the file,
-			// because it has no ';' to stop at.
-			if( !firstToken && indentParan == 0 && indentBrace == 0 &&
+			// (...), {...} or [...]. Without this the scanner runs to the end of the
+			// file, because it has no ';' to stop at.
+			if( !firstToken && indentParan == 0 && indentBrace == 0 && indentBracket == 0 &&
 				OptionalStatementTerminatorIsNewLine(t) )
 				break;
 			firstToken = false;
@@ -3922,6 +3934,10 @@ asCScriptNode *asCParser::SuperficiallyParseVarInit()
 				indentParan++;
 			else if (t.type == ttCloseParenthesis)
 				indentParan--;
+			else if (t.type == ttOpenBracket)
+				indentBracket++;
+			else if (t.type == ttCloseBracket)
+				indentBracket--;
 			else if (t.type == ttStartStatementBlock)
 				indentBrace++;
 			else if (t.type == ttEndStatementBlock)
@@ -4116,6 +4132,12 @@ asCScriptNode *asCParser::ParseStatementBlock()
 }
 
 // BNF:4: INITLIST      ::= '{' (ASSIGN | INITLIST)? (',' (ASSIGN | INITLIST)?)* '}'
+// ORGLIN (ADR-0011): with asEP_BRACKET_LIST_LITERALS the list may also be written
+// `[ ... ]`. '[' is unambiguous where a list may appear (indexing needs a preceding
+// expression), so the two spellings differ ONLY in their delimiters: the node type
+// stays snInitList, which is what the compiler and byte-code generator dispatch on,
+// so nothing downstream changes. `close` is matched to `open`, so `[1, 2}` is an
+// error rather than silently accepted.
 asCScriptNode *asCParser::ParseInitList()
 {
 	asCScriptNode *node = CreateNode(snInitList);
@@ -4124,9 +4146,19 @@ asCScriptNode *asCParser::ParseInitList()
 	sToken t1;
 
 	GetToken(&t1);
-	if( t1.type != ttStartStatementBlock )
+
+	// Decide the delimiter pair. '{' always; '[' only when enabled.
+	eTokenType openType = ttStartStatementBlock;
+	eTokenType closeType = ttEndStatementBlock;
+	if( t1.type == ttOpenBracket && engine->ep.bracketListLiterals )
 	{
-		Error(ExpectedToken("{"), &t1);
+		openType = ttOpenBracket;
+		closeType = ttCloseBracket;
+	}
+
+	if( t1.type != openType )
+	{
+		Error(ExpectedToken(openType == ttOpenBracket ? "[" : "{"), &t1);
 		Error(InsteadFound(t1), &t1);
 		return node;
 	}
@@ -4134,7 +4166,7 @@ asCScriptNode *asCParser::ParseInitList()
 	node->UpdateSourcePos(t1.pos, t1.length);
 
 	GetToken(&t1);
-	if( t1.type == ttEndStatementBlock )
+	if( t1.type == closeType )
 	{
 		node->UpdateSourcePos(t1.pos, t1.length);
 
@@ -4149,22 +4181,32 @@ asCScriptNode *asCParser::ParseInitList()
 			GetToken(&t1);
 			if( t1.type == ttListSeparator )
 			{
-				// No expression
-				node->AddChildLast(CreateNode(snUndefined));
-				node->lastChild->UpdateSourcePos(t1.pos, 1);
-
-				GetToken(&t1);
-				if( t1.type == ttEndStatementBlock )
+				// A leading comma still represents an empty element for legacy
+				// brace lists. In bracket literals it is only the separator before
+				// a conventional trailing comma, so do not add an element yet.
+				if( openType != ttOpenBracket )
 				{
-					// No expression
 					node->AddChildLast(CreateNode(snUndefined));
 					node->lastChild->UpdateSourcePos(t1.pos, 1);
+				}
+
+				GetToken(&t1);
+				if( t1.type == closeType )
+				{
+					// Legacy brace lists preserve their historical empty trailing
+					// element. Bracket literals use the conventional trailing-comma
+					// spelling, so `[1, 2,]` has two elements, not three.
+					if( openType != ttOpenBracket )
+					{
+						node->AddChildLast(CreateNode(snUndefined));
+						node->lastChild->UpdateSourcePos(t1.pos, 1);
+					}
 					node->UpdateSourcePos(t1.pos, t1.length);
 					return node;
 				}
 				RewindTo(&t1);
 			}
-			else if( t1.type == ttEndStatementBlock )
+			else if( t1.type == closeType )
 			{
 				// No expression
 				node->AddChildLast(CreateNode(snUndefined));
@@ -4174,7 +4216,8 @@ asCScriptNode *asCParser::ParseInitList()
 				// Statement block is finished
 				return node;
 			}
-			else if( t1.type == ttStartStatementBlock )
+			else if( t1.type == ttStartStatementBlock ||
+					 (t1.type == ttOpenBracket && engine->ep.bracketListLiterals) )
 			{
 				RewindTo(&t1);
 				node->AddChildLast(ParseInitList());
@@ -4183,7 +4226,7 @@ asCScriptNode *asCParser::ParseInitList()
 				GetToken(&t1);
 				if( t1.type == ttListSeparator )
 					continue;
-				else if( t1.type == ttEndStatementBlock )
+				else if( t1.type == closeType )
 				{
 					node->UpdateSourcePos(t1.pos, t1.length);
 
@@ -4192,7 +4235,7 @@ asCScriptNode *asCParser::ParseInitList()
 				}
 				else
 				{
-					Error(ExpectedTokens("}", ","), &t1);
+					Error(ExpectedTokens(closeType == ttCloseBracket ? "]" : "}", ","), &t1);
 					Error(InsteadFound(t1), &t1);
 					return node;
 				}
@@ -4207,7 +4250,7 @@ asCScriptNode *asCParser::ParseInitList()
 				GetToken(&t1);
 				if( t1.type == ttListSeparator )
 					continue;
-				else if( t1.type == ttEndStatementBlock )
+				else if( t1.type == closeType )
 				{
 					node->UpdateSourcePos(t1.pos, t1.length);
 
@@ -4216,7 +4259,7 @@ asCScriptNode *asCParser::ParseInitList()
 				}
 				else
 				{
-					Error(ExpectedTokens("}", ","), &t1);
+					Error(ExpectedTokens(closeType == ttCloseBracket ? "]" : "}", ","), &t1);
 					Error(InsteadFound(t1), &t1);
 					return node;
 				}
@@ -4277,7 +4320,9 @@ asCScriptNode *asCParser::ParseDeclaration(bool isClassProp, bool isGlobalVar)
 			{
 				GetToken(&t);
 				RewindTo(&t);
-				if( t.type == ttStartStatementBlock )
+				// ORGLIN (ADR-0011): a '[' list literal is also an initializer.
+				if( t.type == ttStartStatementBlock ||
+					(t.type == ttOpenBracket && engine->ep.bracketListLiterals) )
 				{
 					node->AddChildLast(ParseInitList());
 					if( isSyntaxError ) return node;

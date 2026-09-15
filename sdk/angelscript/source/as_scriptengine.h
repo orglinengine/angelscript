@@ -497,6 +497,7 @@ public:
 		bool   allowImplicitHandleTypes;
 		bool   optionalStatementTerminator;	// ORGLIN: line break may end a statement
 		bool   implicitHandleClasses;		// ORGLIN: script classes are implicit-handle
+		bool   bracketListLiterals;			// ORGLIN: `[ ... ]` allowed as a list literal
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;
