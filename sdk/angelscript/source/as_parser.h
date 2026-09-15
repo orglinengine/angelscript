@@ -163,7 +163,19 @@ protected:
 
 	bool FindTokenAfterType(sToken &nextToken);
 	bool FindIdentifierAfterScope(sToken& nextToken);
-	bool IsConstant(int tokenType);
+
+	// ORGLIN: optional statement terminator (ADR-0010 slice 1). When enabled via
+	// asEP_OPTIONAL_STATEMENT_TERMINATOR, a line break ends a statement/declaration
+	// exactly where a ';' would be required. `next` is the peeked token that would
+	// normally have to be ttEndStatement: it terminates the statement when it is the
+	// first significant token on its line. This keeps the number and positions of
+	// tokens identical to a ';'-terminated parse, so nothing downstream (compiler,
+	// builder, debug line cues) changes.
+	bool OptionalStatementTerminatorIsNewLine(const sToken &next);
+
+	// ORGLIN: a synthetic zero-length end-of-statement node, used when a line break
+	// terminates a declaration.
+	asCScriptNode *ParseOptionalStatementTerminator();	bool IsConstant(int tokenType);
 	bool IsOperator(int tokenType);
 	bool IsPreOperator(int tokenType);
 	bool IsPostOperator(int tokenType);

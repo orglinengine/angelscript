@@ -1001,6 +1001,34 @@ asCScriptNode *asCParser::SuperficiallyParseExpression()
 	return node;
 }
 
+// ORGLIN: see as_parser.h. True when optional statement termination is enabled
+// and `next` is the first significant token on its line — i.e. a line break
+// separates it from the previous significant token. In that case a
+// statement/declaration terminates here exactly as if a ';' had been written, so
+// the parser accepts `next` where it would normally require ttEndStatement.
+//
+// This only scans the source backwards from `next` over spaces/tabs/CR to a
+// line break, so it needs no token history and is unaffected by lookahead or
+// rewinding.
+bool asCParser::OptionalStatementTerminatorIsNewLine(const sToken &next)
+{
+	if( !engine->ep.optionalStatementTerminator )
+		return false;
+
+	size_t p = next.pos;
+	while( p > 0 )
+	{
+		char c = script->code[p - 1];
+		if( c == '\n' )
+			return true;
+		if( c != ' ' && c != '\t' && c != '\r' )
+			return false;
+		--p;
+	}
+
+	return false;
+}
+
 // BNF:18: COMMENT       ::= ('//'[^#x0A]*) | ('/*'[^*]*'*/')  // single token:  starts with // and ends with new line or starts with /* and ends with */
 // BNF:18: WHITESPACE    ::= [ #x09#x0A#x0D]+                  // single token:  spaces, tab, carriage return, line feed, and UTF8 byte-order-mark
 void asCParser::GetToken(sToken *token)
@@ -2261,6 +2289,13 @@ asCScriptNode *asCParser::ParseExprTerm()
 		if( !IsPostOperator(t.type) )
 			return node;
 
+		// ORGLIN: with optional statement termination a '++'/'--' that begins a new
+		// line is the next statement, not a post-increment of this one — otherwise
+		// `++tickCount` on its own line is absorbed and an implicit ';' is missing.
+		if( OptionalStatementTerminatorIsNewLine(t) &&
+			(t.type == ttInc || t.type == ttDec) )
+			return node;
+
 		node->AddChildLast(ParseExprPostOp());
 		if( isSyntaxError ) return node;
 	}
@@ -2711,11 +2746,17 @@ asCScriptNode *asCParser::ParseUsing()
 		GetToken(&t);
 	} while (t.type == ttScope);
 
+	// ORGLIN: a line break also terminates the using declaration. In that case `t` is
+	// the token that follows, so put it back.
 	if( t.type != ttEndStatement )
 	{
-		Error(ExpectedToken(asCTokenizer::GetDefinition(ttEndStatement)), &t);
-		Error(InsteadFound(t), &t);
-		return node;
+		if( !OptionalStatementTerminatorIsNewLine(t) )
+		{
+			Error(ExpectedToken(asCTokenizer::GetDefinition(ttEndStatement)), &t);
+			Error(InsteadFound(t), &t);
+			return node;
+		}
+		RewindTo(&t);
 	}
 
 	return node;
@@ -2987,6 +3028,14 @@ bool asCParser::IsVarDecl()
 	// It can be followed by an initialization
 	GetToken(&t1);
 	if( t1.type == ttEndStatement || t1.type == ttAssignment || t1.type == ttListSeparator )
+	{
+		RewindTo(&t);
+		return true;
+	}
+	// ORGLIN: a line break directly after the name ends the declaration (no
+	// initializer), so `dictionary combine` / `Rule g_rule` are variables, not
+	// functions (which require the '(' below).
+	if( OptionalStatementTerminatorIsNewLine(t1) )
 	{
 		RewindTo(&t);
 		return true;
@@ -3780,7 +3829,10 @@ int asCParser::ParseVarInit(asCScriptCode *in_script, asCScriptNode *in_init)
 
 	// Don't allow any more tokens after the expression
 	GetToken(&t);
-	if( t.type != ttEnd && t.type != ttEndStatement && t.type != ttListSeparator && t.type != ttEndStatementBlock )
+	// ORGLIN: a line break terminates the initializer when optional statement
+	// termination is on — the token found here is simply the next statement/member.
+	if( t.type != ttEnd && t.type != ttEndStatement && t.type != ttListSeparator && t.type != ttEndStatementBlock &&
+		!OptionalStatementTerminatorIsNewLine(t) )
 	{
 		asCString msg;
 		msg.Format(TXT_UNEXPECTED_TOKEN_s, asCTokenizer::GetDefinition(t.type));
@@ -3810,8 +3862,18 @@ asCScriptNode *asCParser::SuperficiallyParseVarInit()
 		// Find the end of the expression
 		int indentParan = 0;
 		int indentBrace = 0;
+		bool firstToken = true;
 		while( indentParan || indentBrace || (t.type != ttListSeparator && t.type != ttEndStatement && t.type != ttEndStatementBlock) )
 		{
+			// ORGLIN: with optional statement termination a line break ends the
+			// initializer once the expression has started and we are not inside
+			// (...) or {...}. Without this the scanner runs to the end of the file,
+			// because it has no ';' to stop at.
+			if( !firstToken && indentParan == 0 && indentBrace == 0 &&
+				OptionalStatementTerminatorIsNewLine(t) )
+				break;
+			firstToken = false;
+
 			sToken after;
 			if (t.type == ttOpenParenthesis)
 				indentParan++;
@@ -4197,6 +4259,15 @@ asCScriptNode *asCParser::ParseDeclaration(bool isClassProp, bool isGlobalVar)
 
 			return node;
 		}
+		// ORGLIN: a line break (or the enclosing '}') also terminates the declaration.
+		// `t` is the first token of the following member/statement, so put it back
+		// before returning — the ';' path adds no AST node, and neither does this one.
+		else if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+		{
+			RewindTo(&t);
+
+			return node;
+		}
 		else
 		{
 			Error(ExpectedTokens(",", ";"), &t);
@@ -4269,14 +4340,22 @@ asCScriptNode *asCParser::ParseExpressionStatement()
 	if( isSyntaxError ) return node;
 
 	GetToken(&t);
-	if( t.type != ttEndStatement )
+	// ORGLIN: a line break (or the enclosing '}') also terminates the statement
+	// (see OptionalStatementTerminatorIsNewLine).
+	if( t.type == ttEndStatement )
+	{
+		node->UpdateSourcePos(t.pos, t.length);
+	}
+	else if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+	{
+		RewindTo(&t);
+	}
+	else
 	{
 		Error(ExpectedToken(";"), &t);
 		Error(InsteadFound(t), &t);
 		return node;
 	}
-
-	node->UpdateSourcePos(t.pos, t.length);
 
 	return node;
 }
@@ -4758,20 +4837,36 @@ asCScriptNode *asCParser::ParseReturn()
 		return node;
 	}
 
+	// ORGLIN: a line break (or the enclosing '}') after `return` with no value on the
+	// same line is a bare return, exactly as the old preprocessor's injected `;`
+	// produced.
+	if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+	{
+		RewindTo(&t);
+		return node;
+	}
+
 	RewindTo(&t);
 
 	node->AddChildLast(ParseAssignment());
 	if( isSyntaxError ) return node;
 
 	GetToken(&t);
-	if( t.type != ttEndStatement )
+	if( t.type == ttEndStatement )
+	{
+		node->UpdateSourcePos(t.pos, t.length);
+	}
+	// ORGLIN: a line break also terminates the statement (or the enclosing '}').
+	else if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+	{
+		RewindTo(&t);
+	}
+	else
 	{
 		Error(ExpectedToken(";"), &t);
 		Error(InsteadFound(t), &t);
 		return node;
 	}
-
-	node->UpdateSourcePos(t.pos, t.length);
 
 	return node;
 }
@@ -4796,8 +4891,15 @@ asCScriptNode *asCParser::ParseBreak()
 	GetToken(&t);
 	if( t.type != ttEndStatement )
 	{
-		Error(ExpectedToken(";"), &t);
-		Error(InsteadFound(t), &t);
+		// ORGLIN: a line break (or the enclosing '}') also terminates the break
+		// statement. The peeked token is the next construct's first token, so put it back.
+		if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+			RewindTo(&t);
+		else
+		{
+			Error(ExpectedToken(";"), &t);
+			Error(InsteadFound(t), &t);
+		}
 	}
 
 	node->UpdateSourcePos(t.pos, t.length);
@@ -4825,8 +4927,15 @@ asCScriptNode *asCParser::ParseContinue()
 	GetToken(&t);
 	if( t.type != ttEndStatement )
 	{
-		Error(ExpectedToken(";"), &t);
-		Error(InsteadFound(t), &t);
+		// ORGLIN: a line break (or the enclosing '}') also terminates the continue
+		// statement. The peeked token is the next construct's first token, so put it back.
+		if( t.type == ttEndStatementBlock || OptionalStatementTerminatorIsNewLine(t) )
+			RewindTo(&t);
+		else
+		{
+			Error(ExpectedToken(";"), &t);
+			Error(InsteadFound(t), &t);
+		}
 	}
 
 	node->UpdateSourcePos(t.pos, t.length);
@@ -4873,11 +4982,15 @@ asCScriptNode *asCParser::ParseTypedef()
 
 	// Check for the end of the typedef
 	GetToken(&token);
+	// ORGLIN: a line break also terminates the typedef; put the following token back.
 	if( token.type != ttEndStatement )
 	{
 		RewindTo(&token);
-		Error(ExpectedToken(asCTokenizer::GetDefinition(token.type)), &token);
-		Error(InsteadFound(token), &token);
+		if( !OptionalStatementTerminatorIsNewLine(token) )
+		{
+			Error(ExpectedToken(asCTokenizer::GetDefinition(token.type)), &token);
+			Error(InsteadFound(token), &token);
+		}
 	}
 
 	return node;

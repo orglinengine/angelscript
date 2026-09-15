@@ -330,6 +330,11 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.allowImplicitHandleTypes = value ? true : false;
 		break;
 
+	// ORGLIN: optional statement terminator (line break ends a statement).
+	case asEP_OPTIONAL_STATEMENT_TERMINATOR:
+		ep.optionalStatementTerminator = value ? true : false;
+		break;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		ep.buildWithoutLineCues = value ? true : false;
 		break;
@@ -534,6 +539,10 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_ALLOW_IMPLICIT_HANDLE_TYPES:
 		return ep.allowImplicitHandleTypes;
 
+	// ORGLIN: optional statement terminator.
+	case asEP_OPTIONAL_STATEMENT_TERMINATOR:
+		return ep.optionalStatementTerminator;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		return ep.buildWithoutLineCues;
 
@@ -673,6 +682,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.useCharacterLiterals          = false;
 		ep.allowMultilineStrings         = false;
 		ep.allowImplicitHandleTypes      = false;
+		ep.optionalStatementTerminator   = false;	// ORGLIN: off by default (language stays unchanged)
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
 		ep.buildWithoutLineCues          = false;

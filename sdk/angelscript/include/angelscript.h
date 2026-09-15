@@ -191,6 +191,10 @@ enum asEEngineProp
 	asEP_MEMBER_INIT_MODE                   = 38,
 	asEP_BOOL_CONVERSION_MODE               = 39,
 	asEP_FOREACH_SUPPORT                    = 40,
+	// ORGLIN: allow a statement/declaration to be terminated by a line break
+	// instead of requiring a ';'. The authored .scr is then the compiled source,
+	// so debugger/LSP positions stay honest (ADR-0010 slice 1).
+	asEP_OPTIONAL_STATEMENT_TERMINATOR      = 41,
 
 	asEP_LAST_PROPERTY
 };

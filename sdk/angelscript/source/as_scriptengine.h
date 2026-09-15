@@ -495,6 +495,7 @@ public:
 		bool   useCharacterLiterals;
 		bool   allowMultilineStrings;
 		bool   allowImplicitHandleTypes;
+		bool   optionalStatementTerminator;	// ORGLIN: line break may end a statement
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;
