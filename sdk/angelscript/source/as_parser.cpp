@@ -251,6 +251,45 @@ int asCParser::ParsePropertyDeclaration(asCScriptCode *in_script)
 	return 0;
 }
 
+// ORGLIN: true when the identifier names a registered namespace, so that '.' may be
+// used as its scope operator (ADR-0010 slice 2). Deliberately narrow: only real
+// namespaces qualify, so a '.' in an ordinary expression is never mistaken for
+// scope.
+bool asCParser::IsNameSpaceIdentifier(const sToken &t)
+{
+	if( t.type != ttIdentifier )
+		return false;
+
+	asCString word;
+	word.Assign(&script->code[t.pos], t.length);
+
+	return engine->FindNameSpace(word.AddressOf()) != 0;
+}
+
+// ORGLIN: consumes the scope separator. The authored token may be '::' or, when the
+// caller has verified the preceding identifier names a namespace, '.'. Either way
+// the emitted node is the ttScope node '::' would have produced, so nothing
+// downstream changes.
+asCScriptNode *asCParser::ParseScopeOperator()
+{
+	asCScriptNode *node = CreateNode(snUndefined);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	if( t.type == ttScope || t.type == ttDot )
+	{
+		t.type = ttScope;
+		node->SetToken(&t);
+		node->UpdateSourcePos(t.pos, t.length);
+		return node;
+	}
+
+	Error(ExpectedToken("::"), &t);
+	Error(InsteadFound(t), &t);
+	return node;
+}
+
 // BNF:5: SCOPE         ::= '::'? (IDENTIFIER '::')* (IDENTIFIER TEMPLTYPELIST? '::')?
 void asCParser::ParseOptionalScope(asCScriptNode *node)
 {
@@ -266,11 +305,12 @@ void asCParser::ParseOptionalScope(asCScriptNode *node)
 		GetToken(&t1);
 		GetToken(&t2);
 	}
-	while( t1.type == ttIdentifier && t2.type == ttScope )
+	// ORGLIN: the separator may be '::' or, for a registered namespace, '.'.
+	while( t1.type == ttIdentifier && (t2.type == ttScope || (t2.type == ttDot && IsNameSpaceIdentifier(t1))) )
 	{
 		RewindTo(&t1);
 		scope->AddChildLast(ParseIdentifier());
-		scope->AddChildLast(ParseToken(ttScope));
+		scope->AddChildLast(ParseScopeOperator());
 		GetToken(&t1);
 		GetToken(&t2);
 	}
@@ -1817,7 +1857,9 @@ bool asCParser::FindIdentifierAfterScope(sToken& identifierToken)
 	GetToken(&t2);
 	RewindTo(&t1);
 
-	if (t1.type != ttScope && t2.type != ttScope)
+	// ORGLIN: a namespace separator may be '::' or, for a registered namespace, '.'.
+	if (t1.type != ttScope && t2.type != ttScope &&
+		!(t2.type == ttDot && IsNameSpaceIdentifier(t1)))
 	{
 		if (t1.type == ttIdentifier)
 		{
@@ -1834,7 +1876,7 @@ bool asCParser::FindIdentifierAfterScope(sToken& identifierToken)
 	{
 		t2 = t3;
 		GetToken(&t3);
-		if (t3.type == ttScope)
+		if (t3.type == ttScope || (t3.type == ttDot && IsNameSpaceIdentifier(t2)))
 			GetToken(&t3);
 		else
 			break;
@@ -2111,7 +2153,8 @@ bool asCParser::IsFunctionCall(bool isTemplate)
 		GetToken(&t1);
 	GetToken(&t2);
 
-	while( t1.type == ttIdentifier && t2.type == ttScope )
+	// ORGLIN: a namespace separator may be '::' or, for a registered namespace, '.'.
+	while( t1.type == ttIdentifier && (t2.type == ttScope || (t2.type == ttDot && IsNameSpaceIdentifier(t1))) )
 	{
 		GetToken(&t1);
 		GetToken(&t2);

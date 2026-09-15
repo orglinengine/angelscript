@@ -187,6 +187,15 @@ protected:
 	asCScriptNode *ParseToken(int token);
 	asCScriptNode *ParseOneOf(int *tokens, int num);
 
+	// ORGLIN: dot scope (ADR-0010 slice 2). A registered namespace (e.g. `Math`) may
+	// be written with '.' as its scope operator — `Math.min(x, y)` — as well as `::`.
+	// IsNameSpaceIdentifier reports whether an identifier names a registered
+	// namespace; ParseScopeOperator consumes the separator and presents the authored
+	// '.' to the rest of the pipeline as the ttScope token '::' would produce, so the
+	// AST, compiler and name resolution are unchanged.
+	bool           IsNameSpaceIdentifier(const sToken &t);
+	asCScriptNode *ParseScopeOperator();
+
 	asCString ExpectedToken(const char *token);
 	asCString ExpectedTokens(const char *token1, const char *token2);
 	asCString ExpectedOneOf(int *tokens, int count);
