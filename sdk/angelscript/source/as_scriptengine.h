@@ -496,6 +496,7 @@ public:
 		bool   allowMultilineStrings;
 		bool   allowImplicitHandleTypes;
 		bool   optionalStatementTerminator;	// ORGLIN: line break may end a statement
+		bool   implicitHandleClasses;		// ORGLIN: script classes are implicit-handle
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;

@@ -195,6 +195,9 @@ enum asEEngineProp
 	// instead of requiring a ';'. The authored .scr is then the compiled source,
 	// so debugger/LSP positions stay honest (ADR-0010 slice 1).
 	asEP_OPTIONAL_STATEMENT_TERMINATOR      = 41,
+	// ORGLIN: script classes are implicit-handle types, so `class X` behaves as
+	// `class @X` without an `@` in the authored source (ADR-0010 slice 3).
+	asEP_IMPLICIT_HANDLE_CLASSES            = 42,
 
 	asEP_LAST_PROPERTY
 };

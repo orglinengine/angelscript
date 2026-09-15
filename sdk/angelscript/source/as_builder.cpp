@@ -2523,6 +2523,13 @@ int asCBuilder::RegisterClass(asCScriptNode *node, asCScriptCode *file, asSNameS
 		if (node->tokenType == ttHandle)
 			st->flags |= asOBJ_IMPLICIT_HANDLE;
 
+		// ORGLIN: with asEP_IMPLICIT_HANDLE_CLASSES every script class is an
+		// implicit-handle type, so `class X` behaves as `class @X` without needing
+		// the `@` in the source (ADR-0010 slice 3). This is the same flag the `@`
+		// form sets above; it only changes what a *plain* `class X` compiles to.
+		if (engine->ep.implicitHandleClasses)
+			st->flags |= asOBJ_IMPLICIT_HANDLE;
+
 		st->size = sizeof(asCScriptObject);
 		st->name = name;
 		st->nameSpace = ns;
