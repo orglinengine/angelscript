@@ -1747,6 +1747,14 @@ int asCScriptEngine::RegisterInterface(const char *name)
 		return ConfigError(asOUT_OF_MEMORY, "RegisterInterface", name, 0);
 
 	st->flags = asOBJ_REF | asOBJ_SCRIPT_OBJECT | asOBJ_SHARED;
+
+	// ORGLIN: with asEP_IMPLICIT_HANDLE_CLASSES every reference type in the
+	// authoring surface is an implicit-handle type, so an interface-typed
+	// declaration needs no explicit `@` either (`System MySetup()`, `UIHandler h`).
+	// RegisterInterface has no flag parameter, so the property is applied here.
+	if( ep.implicitHandleClasses )
+		st->flags |= asOBJ_IMPLICIT_HANDLE;
+
 	st->size = 0; // Cannot be instantiated
 	st->name = name;
 	st->nameSpace = defaultNamespace;
