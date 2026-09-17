@@ -48,6 +48,7 @@ enum eScriptNode
 {
 	snUndefined,
 	snScript,
+	snMetadata,   // ORGLIN: [Tag(args)] declaration metadata (raw text, no brackets)
 	snFunction,
 	snConstant,
 	snDataType,

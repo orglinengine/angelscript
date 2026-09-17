@@ -126,6 +126,7 @@ protected:
 	asCScriptNode *ParseNamespace();
 	asCScriptNode *ParseUsing();
 	asCScriptNode *ParseFunction(bool isMethod = false);
+	asCScriptNode *ParseMetadata();   // ORGLIN: [Tag(args)] declaration metadata
 	asCScriptNode *ParseFuncDef();
 	asCScriptNode *ParseClass();
 	asCScriptNode *ParseMixin();

@@ -9,7 +9,11 @@
 //  0 = off
 //  1 = on
 #ifndef AS_PROCESS_METADATA
-#define AS_PROCESS_METADATA 1
+// ORGLIN: the PARSER owns declaration metadata now. This add-on's text pass used to
+// blank the annotations before the compiler could see them - it must stay OFF, or the
+// two mechanisms fight (and the add-on attributes by scanning text, which breaks on
+// this fork's semicolon-free authoring).
+#define AS_PROCESS_METADATA 0
 #endif
 
 // TODO: Implement flags for turning on/off include directives and conditional programming

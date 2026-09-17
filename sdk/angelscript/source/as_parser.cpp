@@ -2671,6 +2671,52 @@ asCScriptNode *asCParser::ParseImport()
 	return node;
 }
 
+// ORGLIN: declaration metadata. `[Tag(args)]` written before a declaration becomes
+// an snMetadata node whose token span covers the raw text BETWEEN the brackets. The
+// tag vocabulary is the APPLICATION's business - the language only carries the text.
+// Parsed only where a declaration can begin, so it can never be confused with a
+// bracket list literal; the builder attaches it to the declaration that follows.
+asCScriptNode *asCParser::ParseMetadata()
+{
+	asCScriptNode *node = CreateNode(snMetadata);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	if( t.type != ttOpenBracket )
+	{
+		Error(ExpectedToken("["), &t);
+		return node;
+	}
+
+	// Count nested brackets so a stray ']' inside the annotation cannot end it early.
+	int depth = 1;
+	size_t first = 0, last = 0;
+	while( depth > 0 )
+	{
+		GetToken(&t);
+		if( t.type == ttEnd )
+		{
+			Error(ExpectedToken("]"), &t);
+			break;
+		}
+		if( t.type == ttOpenBracket )
+			depth++;
+		else if( t.type == ttCloseBracket )
+			depth--;
+		else if( depth > 0 )
+		{
+			if( first == 0 ) first = t.pos;
+			last = t.pos + t.length;
+		}
+	}
+
+	if( last > first )
+		node->UpdateSourcePos(first, last - first);
+
+	return node;
+}
+
 // BNF:0: SCRIPT        ::= (IMPORT | ENUM | TYPEDEF | CLASS | MIXIN | INTERFACE | FUNCDEF | VIRTPROP | VAR | FUNC | NAMESPACE | USING | ';')*
 asCScriptNode *asCParser::ParseScript(bool inBlock)
 {
@@ -2684,6 +2730,18 @@ asCScriptNode *asCParser::ParseScript(bool inBlock)
 		{
 			sToken tStart;
 			GetToken(&tStart);
+
+			// ORGLIN: declaration metadata ([Tag(args)]) belongs to the declaration
+			// that follows it. Parsed ONLY here, where a declaration must begin, so a
+			// bracket list literal can never be mistaken for metadata. The builder
+			// collects it and attaches it to that declaration.
+			if( tStart.type == ttOpenBracket )
+			{
+				RewindTo(&tStart);   // ORGLIN: let ParseMetadata consume the '['
+				node->AddChildLast(ParseMetadata());
+				if( isSyntaxError ) return node;
+				continue;
+			}
 
 			// Optimize by skipping tokens 'shared', 'external', 'final', 'abstract' so they don't have to be checked in every condition
 			sToken t1 = tStart;
@@ -3806,8 +3864,13 @@ asCScriptNode *asCParser::ParseClass()
 	RewindTo(&t);
 	while( t.type != ttEndStatementBlock && t.type != ttEnd )
 	{
-		// Is it a property or a method?
-		if (t.type == ttFuncDef)
+		// ORGLIN: declaration metadata ([Tag(args)]) - see ParseScript. Recorded as a
+		// child of the class node, immediately before the member it belongs to.
+		if( t.type == ttOpenBracket )
+		{
+			node->AddChildLast(ParseMetadata());
+		}
+		else if (t.type == ttFuncDef)
 			node->AddChildLast(ParseFuncDef());
 		else if( IsFuncDecl(true) )
 			node->AddChildLast(ParseFunction(true));

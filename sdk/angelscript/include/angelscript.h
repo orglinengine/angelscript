@@ -1171,6 +1171,13 @@ public:
 	virtual asDWORD          GetAccessMask() const = 0;
 	virtual void            *GetAuxiliary() const = 0;
 
+	// Metadata - ORGLIN: the annotations written before this declaration, e.g.
+	// [Tick(5)], as RAW TEXT without the enclosing brackets. The SYNTAX and the
+	// attribution are the language's concern; what the tags MEAN is the
+	// application's - the engine owns its tag vocabulary, not the language.
+	virtual asUINT           GetMetadataCount() const = 0;
+	virtual const char      *GetMetadata(asUINT index) const = 0;
+
 	// Function signature
 	virtual asITypeInfo     *GetObjectType() const = 0;
 	virtual const char      *GetObjectName() const = 0;

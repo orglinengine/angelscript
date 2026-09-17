@@ -732,6 +732,9 @@ void asCBuilder::ParseScripts()
 
 			asCScriptNode *node = decl->node->firstChild->next;
 
+			// ORGLIN: bound the leak - declaration metadata never crosses a class boundary.
+			metadataPending.SetLength(0);
+
 			// Skip list of classes and interfaces
 			while( node && node->nodeType == snIdentifier )
 				node = node->next;
@@ -739,6 +742,16 @@ void asCBuilder::ParseScripts()
 			while( node )
 			{
 				asCScriptNode *next = node->next;
+
+				// ORGLIN: declaration metadata ([Tag(args)]) - see the script-level walk.
+				if( node->nodeType == snMetadata )
+				{
+					metadataPending.PushLast(asCString(&decl->script->code[node->tokenPos], node->tokenLength));
+					node->DisconnectParent();
+					node->Destroy(engine);
+					node = next;
+					continue;
+				}
 				if( node->nodeType == snFunction )
 				{
 					node->DisconnectParent();
@@ -960,6 +973,17 @@ void asCBuilder::RegisterNonTypesFromScript(asCScriptNode *node, asCScriptCode *
 	while( node )
 	{
 		asCScriptNode *next = node->next;
+		// ORGLIN: declaration metadata ([Tag(args)]). The parser records it as a sibling
+		// immediately before its declaration, so the association is STRUCTURAL (walk
+		// order) - never a text scan of the source. Held until the next one registers.
+		if( node->nodeType == snMetadata )
+		{
+			metadataPending.PushLast(asCString(&script->code[node->tokenPos], node->tokenLength));
+			node->DisconnectParent();
+			node->Destroy(engine);
+			node = next;
+			continue;
+		}
 		if( node->nodeType == snNamespace )
 		{
 			// Determine the name of the namespace
@@ -4466,6 +4490,12 @@ int asCBuilder::CreateVirtualFunction(asCScriptFunction *func, int idx)
 	vf->vfTableIdx       = idx;
 	vf->traits           = func->traits;
 
+	// ORGLIN: carry the declaration metadata onto the object the builder actually
+	// EXPOSES. A class method's callable function is this VIRTUAL one, so metadata
+	// left on the source function would be invisible to reflection (and the engine
+	// reads cadence tags through reflection).
+	vf->metadata         = func->metadata;
+
 	// Clear the shared trait since the virtual function should not have that
 	vf->SetShared(false);
 
@@ -5174,7 +5204,26 @@ int asCBuilder::RegisterScriptFunctionFromNode(asCScriptNode *node, asCScriptCod
 
 	GetParsedFunctionDetails(node, file, objType, name, returnType, parameterNames, parameterTypes, inOutFlags, defaultArgs, funcTraits, ns);
 
-	return RegisterScriptFunction(node, file, objType, isInterface, isGlobalFunction, ns, isExistingShared, isMixin, name, returnType, parameterNames, parameterTypes, inOutFlags, defaultArgs, funcTraits, decl);
+	// NOT the funcId: RegisterScriptFunction returns a STATUS (RegisterLambda fetches
+	// the created function from the `functions` array instead). Bracket the call so
+	// the new description is provably the last one.
+	const asUINT funcsBefore = functions.GetLength();
+	const int r = RegisterScriptFunction(node, file, objType, isInterface, isGlobalFunction, ns, isExistingShared, isMixin, name, returnType, parameterNames, parameterTypes, inOutFlags, defaultArgs, funcTraits, decl);
+
+	// ORGLIN: attach the declaration metadata ([Tag(args)]) the parser recorded as
+	// siblings immediately before this declaration, then consume it so it cannot leak
+	// onto the next one. THIS is the single point every script function passes
+	// through - a class method, a global function, an interface method - so the
+	// attribution is structural and needs no text scan of the source.
+	if( r >= 0 && functions.GetLength() > funcsBefore && metadataPending.GetLength() > 0 )
+	{
+		asCScriptFunction *fn = engine->scriptFunctions[functions[functions.GetLength()-1]->funcId];
+		for( asUINT m = 0; m < metadataPending.GetLength(); m++ )
+			fn->AddMetadata(metadataPending[m].AddressOf(), metadataPending[m].GetLength());
+	}
+	metadataPending.SetLength(0);
+
+	return r;
 }
 
 asCScriptFunction *asCBuilder::RegisterLambda(asCScriptNode *node, asCScriptCode *file, asCScriptFunction *funcDef, const asCString &name, asSNameSpace *ns, bool isShared)

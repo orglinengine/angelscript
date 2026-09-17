@@ -312,6 +312,15 @@ public:
 
 	asCArray<asPWORD>            userData;
 
+	// ORGLIN: declaration metadata ([Tag(args)]) - RAW TEXT without the enclosing
+	// brackets. The tag VOCABULARY belongs to the application, not to the language;
+	// the language only carries the text and says which declaration it sits on.
+	asCArray<asCString>          metadata;
+
+	void AddMetadata(const char *text, size_t length) { metadata.PushLast(asCString(text, length)); }
+	asUINT GetMetadataCount() const { return metadata.GetLength(); }
+	const char *GetMetadata(asUINT index) const { return index < metadata.GetLength() ? metadata[index].AddressOf() : 0; }
+
 	// Function signature
 	asCString                    name;
 	asCDataType                  returnType;

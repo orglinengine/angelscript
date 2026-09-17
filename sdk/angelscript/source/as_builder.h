@@ -258,6 +258,7 @@ protected:
 
 	asCArray<asCScriptCode *>                         scripts;
 	asCArray<sFunctionDescription *>                  functions;
+	asCArray<asCString>                               metadataPending;   // ORGLIN: [Tag(args)] awaiting its declaration
 	asCSymbolTable<sGlobalVariableDescription>        globVariables;
 	asCArray<sClassDeclaration *>                     classDeclarations;
 	asCArray<sClassDeclaration *>                     interfaceDeclarations;
