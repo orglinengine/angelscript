@@ -95,7 +95,8 @@ enum eScriptNode
 	snListPattern,
 	snNamedArgument,
 	snScope,
-	snTryCatch
+	snTryCatch,
+	snDictionaryKey  // ORGLIN (ADR-0011): the key of a `{ key = value }` list entry
 };
 
 struct sToken

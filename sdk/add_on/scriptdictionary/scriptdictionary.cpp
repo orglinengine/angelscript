@@ -1278,6 +1278,12 @@ void RegisterScriptDictionary_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("dictionaryValue", "void opConv(?&out)", asFUNCTIONPR(CScriptDictValue_opCast, (void *, int, CScriptDictValue*), void), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionaryValue", "int64 opConv()", asFUNCTIONPR(CScriptDictValue_opConvInt, (CScriptDictValue*), asINT64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionaryValue", "double opConv()", asFUNCTIONPR(CScriptDictValue_opConvDouble, (CScriptDictValue*), double), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	// ORGLIN EXPERIMENT: the IMPLICIT forms, so a dict value behaves like the value it
+	// holds in an expression — `d["k"] + 1`, `int v = d["k"]`. Without these the
+	// author must write `int(d["k"])` everywhere, which makes dictionary reads feel
+	// unlike every other type.
+	r = engine->RegisterObjectMethod("dictionaryValue", "int64 opImplConv()", asFUNCTIONPR(CScriptDictValue_opConvInt, (CScriptDictValue*), asINT64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("dictionaryValue", "double opImplConv()", asFUNCTIONPR(CScriptDictValue_opConvDouble, (CScriptDictValue*), double), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
 	// ORGLIN: dictionary is an implicit-handle type so scripts author it without
 	// `@` (dictionary x, not dictionary @x) and nesting dict writes work.

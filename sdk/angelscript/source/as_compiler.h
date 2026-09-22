@@ -317,6 +317,10 @@ protected:
 
 	void CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);
 	int  CompileInitListElement(asSListPatternNode *&patternNode, asCScriptNode *&valueNode, int bufferTypeId, short bufferVar, asUINT &bufferSize, asCByteCode &byteCode, int &elementsInSubList);
+	int  CompileDictionaryKey(asCScriptNode *keyNode, asCByteCode *bc);
+	static bool IsDictionaryList(asCScriptNode *listNode);
+	bool InferArrayElementType(asCScriptNode *listNode, asCDataType &elemType);
+	eTokenType LiteralTokenOf(asCScriptNode *node);
 	int  CompileAnonymousInitList(asCScriptNode *listNode, asCExprContext *ctx, const asCDataType &dt);
 
 	int  CallDefaultConstructor(const asCDataType &type, int offset, bool isObjectOnHeap, asCByteCode *bc, asCScriptNode *node, EVarGlobOrMem isVarGlobOrMem = asVGM_VARIABLE, bool derefDest = false);

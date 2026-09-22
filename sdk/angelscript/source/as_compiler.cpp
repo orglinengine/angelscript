@@ -1788,7 +1788,16 @@ int asCCompiler::PrepareArgument(asCDataType *paramType, asCExprContext *ctx, as
 
 		// If value assign is disabled for reference types, then make
 		// sure to always pass the handle to ? parameters
-		if( builder->engine->ep.disallowValueAssignForRefType &&
+		//
+		// ORGLIN: an IMPLICIT-HANDLE type (dictionary, array<T>) can never be
+		// value-assigned, so it must also be passed as a HANDLE to a `?` parameter.
+		// Without this the compiler falls through and tries to make a temporary copy
+		// of the argument, which fails for these types (their opAssign is removed by
+		// the implicit-handle registration) and forces the author to write `@`.
+		// Scoped to implicit-handle types so no other ref type changes behaviour.
+		bool implicitHandleArg = ctx->type.dataType.GetTypeInfo() &&
+			(ctx->type.dataType.GetTypeInfo()->flags & asOBJ_IMPLICIT_HANDLE);
+		if( (implicitHandleArg || builder->engine->ep.disallowValueAssignForRefType) &&
 			ctx->type.dataType.GetTypeInfo() && (ctx->type.dataType.GetTypeInfo()->flags & asOBJ_REF) && !(ctx->type.dataType.GetTypeInfo()->flags & asOBJ_SCOPED) )
 		{
 			param.MakeHandle(true);
@@ -3433,6 +3442,47 @@ bool asCCompiler::CompileInitialization(asCScriptNode *node, asCByteCode *bc, co
 	}
 	else if( node && node->nodeType == snInitList )
 	{
+		// ORGLIN (ADR-0011): a `{ ... }` literal initialising an `any` is a
+		// DICTIONARY wrapped into the `any`. Compiling the literal against
+		// `dictionary` produces a dictionary HANDLE, but `any` is a wrapper type, so
+		// the handle must go through the ordinary conversion to become the `any`
+		// (that is the addon's own value-taking constructor). Doing it here rather
+		// than in CompileInitList keeps the wrapping on the engine's normal path.
+		bool anyDest = engine->ep.dictionaryLiterals &&
+			node->tokenType == ttStartStatementBlock &&
+			type.GetTypeInfo() && type.GetTypeInfo()->GetName() &&
+			strcmp(type.GetTypeInfo()->GetName(), "any") == 0;
+
+		if( anyDest )
+		{
+			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			if( dictType == 0 )
+			{
+				Error(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, node);
+				return false;
+			}
+
+			// Compile the literal as a `dictionary` expression, then convert that
+			// expression to the `any` — the conversion is what constructs the `any`
+			// around the dictionary. From there it is an ordinary "initialize this
+			// variable from this expression", which is what
+			// CompileInitializationWithAssignment is for, so the temporary/global/
+			// member bookkeeping is the engine's own rather than re-derived here.
+			asCExprContext literal(engine);
+			asCDataType dictDt = asCDataType::CreateObjectHandle(
+				CastToObjectType(reinterpret_cast<asCTypeInfo*>(dictType)), false);
+			CompileAnonymousInitList(node, &literal, dictDt);
+
+			asCExprContext anyExpr(engine);
+			anyExpr.type = literal.type;
+			anyExpr.bc.AddCode(&literal.bc);
+
+			ImplicitConversion(&anyExpr, type, node, asIC_IMPLICIT_CONV, true, true);
+
+			return CompileInitializationWithAssignment(bc, type, node, offset,
+				constantValue, isVarGlobOrMem, node, &anyExpr);
+		}
+
 		asCExprValue ti;
 		ti.Set(type);
 		ti.isVariable = (isVarGlobOrMem == 0);
@@ -3873,6 +3923,83 @@ bool asCCompiler::CompileInitializationWithAssignment(asCByteCode* bc, const asC
 
 void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem)
 {
+	// ORGLIN (ADR-0011): the literal's DELIMITER decides what it is.
+	//
+	//   `[ ... ]` is an ARRAY, `{ ... }` is a DICTIONARY.
+	//
+	// The brace form used to be a second spelling of a list literal, which made
+	// the two ambiguous exactly where the destination cannot name a shape: reading
+	// `{ k = 1 }` as a one-entry dictionary and as a list holding an assignment are
+	// both valid, and nothing in the destination can choose. Deciding by delimiter
+	// removes that at the source.
+	//
+	// The choice is made HERE, and it is made for the WHOLE literal, because this
+	// function is the single point every spelling funnels through — a declaration
+	// (`any a = { ... }`), an assignment (`d = { ... }`), a call argument
+	// (`T({ k = 1 })`) and a nested value all end up in CompileInitList. Deciding
+	// per ELEMENT instead would be wrong: the element loop sees one `key = value`
+	// entry at a time, so `{ k = 1, j = 2 }` would become two one-entry
+	// dictionaries rather than one two-entry dictionary.
+	//
+	// A brace literal therefore compiles against `dictionary`, whose own list
+	// factory already parses the `[key, value]` shape the parser desugars pairs
+	// into. Everything below — the buffer, the store into `var`, globals/members —
+	// is unchanged; only the type the literal is matched against is.
+	//
+	// Special case: an EMPTY `{}` uses this same path so it is a dictionary too
+	// (under the old rules it lowercased to an empty array, since an empty list has
+	// no elements to decide from).
+	if( node && node->nodeType == snInitList && node->tokenType == ttStartStatementBlock &&
+		engine->ep.dictionaryLiterals )
+	{
+		// ORGLIN (ADR-0011): a `{ ... }` literal at a destination that cannot name
+		// a shape is a DICTIONARY. That is a `?` slot, which simply holds whatever
+		// it is given. (The `any` holder is the same idea but it is a WRAPPER, so
+		// it is routed through the assignment path in CompileInitialization, where
+		// the ordinary conversion can build the `any` around the dictionary.)
+		if( var->dataType.GetTokenType() == ttQuestion )
+		{
+			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			if( dictType )
+				var->dataType = asCDataType::CreateObjectHandle(
+					CastToObjectType(reinterpret_cast<asCTypeInfo*>(dictType)), false);
+		}
+	}
+
+	// ORGLIN (ADR-0011): `{ ... }` is the DICTIONARY spelling, and it is the ONLY
+	// one. A brace list of plain values (`array<int> a = {1, 2, 3}`) is therefore
+	// refused rather than quietly accepted as a second array syntax — that legacy
+	// spelling is exactly what made a `?` destination ambiguous, and retiring it is
+	// the point of this change. `[ ... ]` is the array spelling, so an array
+	// literal is also refused where a dictionary is wanted. Checked here because
+	// this is where the literal's final type is known, for every spelling.
+	if( node && node->nodeType == snInitList && engine->ep.dictionaryLiterals )
+	{
+		// '[' is the array spelling; '{' is the dictionary spelling.
+		bool braceLiteral = node->tokenType == ttStartStatementBlock;
+
+		asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+		bool dictionaryDest = dictType != 0 && var->dataType.GetTypeInfo() == dictType;
+
+		bool canNameShape = !(var->dataType.GetTokenType() == ttQuestion ||
+			(var->dataType.GetTypeInfo() && var->dataType.GetTypeInfo()->GetName() &&
+			 strcmp(var->dataType.GetTypeInfo()->GetName(), "any") == 0));
+
+		if( braceLiteral && canNameShape && !dictionaryDest )
+		{
+			// A brace list of plain values (`array<int> a = {1, 2, 3}`) is retired:
+			// it is the one thing that used to make a `?` destination ambiguous.
+			Error("Initialization lists cannot be used with an array — use `[ ... ]` for an array, `{ ... }` is a dictionary", node);
+			return;
+		}
+
+		if( !braceLiteral && dictionaryDest )
+		{
+			Error("Initialization lists cannot be used with a dictionary — use `{ ... }` for a dictionary, `[ ... ]` is an array", node);
+			return;
+		}
+	}
+
 	// Check if the type supports initialization lists
 	if( var->dataType.GetTypeInfo() == 0 ||
 		var->dataType.GetBehaviour() == 0 ||
@@ -4183,12 +4310,176 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 
 		asCDataType dt = reinterpret_cast<asSListPatternDataTypeNode*>(patternNode)->dataType;
 
-		if( valueNode->nodeType == snAssignment || valueNode->nodeType == snInitList )
+		if( valueNode->nodeType == snAssignment || valueNode->nodeType == snInitList || valueNode->nodeType == snDictionaryKey )
 		{
 			asCExprContext lctx(engine);
 			asCExprContext rctx(engine);
 
-			if( valueNode->nodeType == snAssignment )
+			// ORGLIN (ADR-0011): a NESTED `{ ... }` inside a `{ key = value }`
+			// dictionary literal is itself a dictionary, e.g.
+			//   dictionary d = { hp = 10, pos = { x = 1, y = 2 } }
+			// The entry only reaches this `?` slot because the pattern cannot name
+			// the type of an arbitrary list element; a nested literal whose entries
+			// are `key = value` pairs is unambiguous though, so resolve it here.
+			// Two spellings exist for the same value: the expression grammar wraps a
+			// value in an assignment node, while a list used directly appears bare.
+			asCScriptNode *nestedList = 0;
+			asCDataType inferredArrayElem;
+			bool untypedListInQuestionSlot = false;
+			if( engine->ep.dictionaryLiterals && dt.GetTokenType() == ttQuestion )
+			{
+				// A list literal written as a value is wrapped by the expression
+				// grammar (ASSIGNMENT > CONDITION > EXPRESSION > EXPRTERM >
+				// EXPRVALUE > INITLIST), so descend those single-child wrappers to
+				// reach the list itself. A non-list value descends to something else
+				// and is left alone.
+				asCScriptNode *candidate = valueNode;
+				while( candidate && candidate->nodeType != snInitList &&
+					   candidate->firstChild && candidate->firstChild->next == 0 &&
+					   (candidate->nodeType == snAssignment || candidate->nodeType == snCondition ||
+						candidate->nodeType == snExpression || candidate->nodeType == snExprTerm ||
+						candidate->nodeType == snExprValue || candidate->nodeType == snScope) )
+					candidate = candidate->firstChild;
+
+				if( candidate && candidate->nodeType == snInitList )
+				{
+					if( IsDictionaryList(candidate) )
+						nestedList = candidate;
+					else if( !InferArrayElementType(candidate, inferredArrayElem) )
+					{
+						// A LIST that is not a dictionary literal, and whose element
+						// type could not be derived (e.g. an empty `[]`, or mixed
+						// element types). The array's type cannot come from a `?`
+						// slot, so this is a clean error — without the guard the
+						// untyped list would reach the type-id lookup and trip an
+						// assertion (which HANGS under a debugger on Windows).
+						untypedListInQuestionSlot = true;
+					}
+				}
+			}
+
+			if( untypedListInQuestionSlot )
+			{
+				asCString str;
+				str.Format(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, "?");
+				Error(str.AddressOf(), valueNode);
+				rctx.type.SetDummy();
+				dt = rctx.type.dataType;
+			}
+			else if( inferredArrayElem.IsValid() )
+			{
+				// ORGLIN (ADR-0011): an ARRAY LITERAL as a dictionary value, e.g.
+				//   dictionary d = { a = [1, 2, 3] }
+				// The `?` slot cannot name the type, so it is derived from the
+				// literal's own elements (InferArrayElementType). The list is then
+				// compiled as a real `array<T>` temporary and its type id inlined in
+				// the buffer, exactly like the typed path below.
+				asCDataType arrDt = inferredArrayElem;
+				if( arrDt.MakeArray(engine, 0) < 0 || !arrDt.IsValid() )
+				{
+					asCString str;
+					str.Format(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, "?");
+					Error(str.AddressOf(), valueNode);
+					rctx.type.SetDummy();
+					dt = rctx.type.dataType;
+				}
+				else
+				{
+					// Place the type id in the buffer so the list factory can read it.
+					if( bufferSize & 0x3 )
+						bufferSize += 4 - (bufferSize & 0x3);
+
+					bcInit.InstrSHORT_DW_DW(asBC_SetListType, bufferVar, bufferSize, engine->GetTypeIdFromDataType(arrDt));
+					bufferSize += 4;
+
+					// Allocate a temporary variable that will be initialized with the
+					// list, then push it for the element assignment.
+					int offset = AllocateVariable(arrDt, true);
+
+					rctx.type.Set(arrDt);
+					rctx.type.isVariable = true;
+					rctx.type.isTemporary = true;
+					rctx.type.stackOffset = offset;
+
+					// The innermost list node is the array literal itself.
+					asCScriptNode *listNode = valueNode;
+					while( listNode && listNode->nodeType != snInitList &&
+						   listNode->firstChild && listNode->firstChild->next == 0 &&
+						   (listNode->nodeType == snAssignment || listNode->nodeType == snCondition ||
+							listNode->nodeType == snExpression || listNode->nodeType == snExprTerm ||
+							listNode->nodeType == snExprValue || listNode->nodeType == snScope) )
+						listNode = listNode->firstChild;
+
+					CompileInitList(&rctx.type, listNode, &rctx.bc, 0);
+
+					// Put the object on the stack. It is a reference that we place there.
+					rctx.bc.InstrSHORT(asBC_PSF, (short)offset);
+					rctx.type.dataType.MakeReference(true);
+
+					dt = arrDt;
+				}
+			}
+			else if( nestedList )
+			{
+				asCObjectType *dictObj = CastToObjectType(reinterpret_cast<asCTypeInfo*>(engine->GetTypeInfoByName("dictionary")));
+				if( dictObj == 0 )
+				{
+					asCString str;
+					str.Format(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, "?");
+					Error(str.AddressOf(), valueNode);
+					rctx.type.SetDummy();
+					dt = rctx.type.dataType;
+				}
+				else
+				{
+					// `dictionary` is an implicit-handle type, so the element type is
+					// the handle form — the same shape an `array<dictionary>` element
+					// has, which is why this mirrors the typed path below.
+					asCDataType dictDt = asCDataType::CreateObjectHandle(dictObj, false);
+
+					// Place the type id in the buffer so the list factory can read the
+					// value back (a `?` slot carries its own inline type id).
+					if( bufferSize & 0x3 )
+						bufferSize += 4 - (bufferSize & 0x3);
+
+					bcInit.InstrSHORT_DW_DW(asBC_SetListType, bufferVar, bufferSize, engine->GetTypeIdFromDataType(dictDt));
+					bufferSize += 4;
+
+					// Allocate a temporary variable that will be initialized with the
+					// nested list, then push it for the element assignment.
+					int offset = AllocateVariable(dictDt, true);
+
+					rctx.type.Set(dictDt);
+					rctx.type.isVariable = true;
+					rctx.type.isTemporary = true;
+					rctx.type.stackOffset = offset;
+
+					CompileInitList(&rctx.type, nestedList, &rctx.bc, 0);
+
+					// Put the object on the stack. It is a reference that we place there.
+					rctx.bc.InstrSHORT(asBC_PSF, (short)offset);
+					rctx.type.dataType.MakeReference(true);
+
+					dt = dictDt;
+				}
+			}
+			else if( valueNode->nodeType == snDictionaryKey )
+			{
+				// ORGLIN (ADR-0011): the KEY half of a `{ key = value }` entry. The
+				// parser already desugared the entry into the list factory's own
+				// [key, value] element shape, so this slot is an ordinary string
+				// element — it is only built here rather than through an expression
+				// because a bare-word key has no expression to compile. `dt` is the
+				// pattern's own key type (string), so the size/alignment and the
+				// assignment below are the same code the quoted spelling uses.
+				if( CompileDictionaryKey(valueNode, &rctx.bc) < 0 )
+					return -1;
+
+				rctx.type.Set(engine->stringType);
+				rctx.type.isConstant = true;
+				rctx.type.isRefSafe = true;
+			}
+			else if( valueNode->nodeType == snAssignment )
 			{
 				// Compile the assignment expression
 				CompileAssignment(valueNode, &rctx);
@@ -4469,6 +4760,222 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 	else
 		asASSERT( false );
 
+	return 0;
+}
+
+// ORGLIN (ADR-0011): derive the element type of an ARRAY LITERAL from its own
+// contents, so `dictionary d = { a = [1, 2, 3] }` works.
+//
+// A dictionary value slot is a `?`, which cannot name a type, so the array's
+// element type has to come from somewhere else. It comes from the literal: the
+// first element is compiled and its type used. Only a NARROW set is accepted —
+// numbers, bool and string — plus a nested list (giving `array<array<T>>`). That
+// covers the authored data shapes this exists for (caveini's `variables={ x=[1,2,3] }`)
+// while keeping the inference predictable: it never guesses a script class or a
+// handle from a single element, and anything it cannot decide is a clean error
+// rather than a silent, possibly-wrong type.
+//
+// Returns false when no element type can be decided (an empty literal, or mixed
+// element types), which the caller reports as "cannot be used with ?".
+bool asCCompiler::InferArrayElementType(asCScriptNode *listNode, asCDataType &elemType)
+{
+	if( listNode == 0 || listNode->nodeType != snInitList )
+		return false;
+
+	asCScriptNode *first = listNode->firstChild;
+	if( first == 0 )
+		return false;  // `[]` — nothing to infer from
+
+	// A nested list element makes this an array of arrays; recurse for the innermost
+	// element type and re-apply the array layer for each level.
+	if( first->nodeType == snInitList )
+	{
+		// A `{ key = value }` list is a DICTIONARY literal, so `[ { a = 1 }, ... ]`
+		// infers `array<dictionary>` — the record-list shape, and the one an author
+		// most often wants. Any other nested list is an array of arrays.
+		if( IsDictionaryList(first) )
+		{
+			asCObjectType *dictObj = CastToObjectType(reinterpret_cast<asCTypeInfo*>(engine->GetTypeInfoByName("dictionary")));
+			if( dictObj == 0 )
+				return false;
+			elemType = asCDataType::CreateObjectHandle(dictObj, false);
+			return true;
+		}
+
+		asCDataType inner;
+		if( !InferArrayElementType(first, inner) )
+			return false;
+		if( inner.MakeArray(engine, 0) < 0 )
+			return false;
+		elemType = inner;
+		return true;
+	}
+
+	// Scalar element: derive the type from the element's own literal token.
+	//
+	// Running the full expression compiler here in "probe" mode was tried and
+	// abandoned: a list element is an snAssignment wrapping an snCondition chain,
+	// and invoking the assignment compiler on it re-enters the expression path with
+	// nodes that are not valid at that entry point, tripping internal asserts. The
+	// elements this inference exists for are literal data, so reading the token is
+	// both sufficient and deterministic. Anything else (a function call, a member
+	// access) is left to the normal path, which reports a proper error.
+	switch( LiteralTokenOf(first) )
+	{
+	case ttIntConstant:
+	case ttBitsConstant:
+	{
+		// A numeric literal list may mix ints and floats (`[1, 2.5]`), and the
+		// literal's own token alone does not reveal that. Scan the elements and pick
+		// the WIDEST numeric type present, so `[1, 2.5, 3]` becomes array<double>
+		// (matching what the typed form `array<double> a = [1, 2.5, 3]` already does)
+		// rather than array<int> with a lossy conversion.
+		bool anyFloat = false;
+		bool anyDouble = false;
+		for( asCScriptNode *el = first; el; el = el->next )
+		{
+			eTokenType t = LiteralTokenOf(el);
+			if( t == ttDoubleConstant ) anyDouble = true;
+			else if( t == ttFloatConstant ) anyFloat = true;
+			else if( t != ttIntConstant && t != ttBitsConstant )
+				return false;  // a non-numeric element: not this inference's job
+		}
+
+		if( anyDouble )      elemType = asCDataType::CreatePrimitive(ttDouble, false);
+		else if( anyFloat )  elemType = asCDataType::CreatePrimitive(ttFloat, false);
+		else                 elemType = asCDataType::CreatePrimitive(ttInt, false);
+		return true;
+	}
+	case ttFloatConstant:  elemType = asCDataType::CreatePrimitive(ttFloat, false);  return true;
+	case ttDoubleConstant: elemType = asCDataType::CreatePrimitive(ttDouble, false); return true;
+	case ttTrue:
+	case ttFalse:          elemType = asCDataType::CreatePrimitive(ttBool, false);   return true;
+	case ttStringConstant:
+		// `engine->stringType` carries const/ref qualifiers; an array element type
+		// must be a plain value type, so strip them.
+		elemType = engine->stringType;
+		elemType.MakeReference(false);
+		elemType.MakeReadOnly(false);
+		elemType.MakeHandle(false);
+		return true;
+	default:               return false;
+	}
+}
+
+// ORGLIN (ADR-0011): the literal token of a list element, or ttUnrecognizedToken
+// when the element is not a plain literal. The node chain for an entry is
+// ASSIGNMENT > CONDITION > EXPRESSION > EXPRTERM > EXPRVALUE > CONSTANT, so descend
+// the single-child wrappers to reach the constant.
+eTokenType asCCompiler::LiteralTokenOf(asCScriptNode *node)
+{
+	while( node && node->firstChild && node->firstChild->next == 0 &&
+		   (node->nodeType == snAssignment || node->nodeType == snCondition ||
+			node->nodeType == snExpression || node->nodeType == snExprTerm ||
+			node->nodeType == snExprValue || node->nodeType == snScope) )
+		node = node->firstChild;
+
+	if( node == 0 )
+		return ttUnrecognizedToken;
+
+	// A string literal is an snConstant whose children are the string parts.
+	if( node->nodeType == snConstant && node->tokenType == ttStringConstant )
+		return ttStringConstant;
+	if( node->nodeType == snConstant && (node->tokenType == ttTrue || node->tokenType == ttFalse) )
+		return node->tokenType;
+	if( node->nodeType == snConstant )
+		return node->tokenType;
+
+	return ttUnrecognizedToken;
+}
+
+// ORGLIN (ADR-0011): true when an snInitList was written as a `{ key = value }`
+// dictionary literal. The parser desugars every pair entry into a nested list
+// whose first child is an snDictionaryKey, so the marker it leaves behind is what
+// distinguishes a dictionary literal from an ordinary list of values — which is
+// exactly the information the compiler needs to resolve a `?` element slot.
+// ORGLIN (ADR-0011): true when an snInitList is a DICTIONARY literal — i.e. a
+// `{ key = value }` list. The parser desugars every pair entry into a nested list
+// whose first child is an snDictionaryKey, so that marker is what distinguishes a
+// dictionary literal from an ordinary list of values. This is only ever asked
+// about a WHOLE literal (a nested literal used as a value, or the literal being
+// assigned): deciding per ELEMENT would turn `{ k = 1, j = 2 }` into two
+// one-entry dictionaries instead of one two-entry dictionary.
+bool asCCompiler::IsDictionaryList(asCScriptNode *listNode)
+{
+	if( listNode == 0 || listNode->nodeType != snInitList )
+		return false;
+
+	for( asCScriptNode *child = listNode->firstChild; child; child = child->next )
+		if( child->nodeType == snInitList && child->firstChild &&
+			child->firstChild->nodeType == snDictionaryKey )
+			return true;
+
+	return false;
+}
+
+// ORGLIN (ADR-0011): build the KEY half of a `{ key = value }` list entry.
+//
+// A quoted key (`{ "a-b" = 1 }`) takes the ordinary string-constant path, so
+// escapes and encoding are handled by the existing code. A bare-word key
+// (`{ a = 1 }`) has no expression to compile — the dictionary's storage map is
+// string-keyed, so the key IS the literal text of the word, exactly equivalent to
+// quoting it. Both paths leave a string literal pointer on the stack and push it
+// into the compiler's constant list for cleanup, which is what the list-factory
+// buffer expects for its string element.
+int asCCompiler::CompileDictionaryKey(asCScriptNode *keyNode, asCByteCode *bc)
+{
+	if( engine->stringFactory == 0 )
+	{
+		Error(TXT_STRINGS_NOT_RECOGNIZED, keyNode);
+		return -1;
+	}
+
+	asCString key;
+	if( keyNode->tokenType == ttStringConstant )
+	{
+		// Quoted: reuse the constant parser so escapes behave identically.
+		asCScriptNode *strNode = keyNode->firstChild ? keyNode->firstChild : keyNode;
+
+		asCString cat;
+		if( strNode->tokenType == ttMultilineStringConstant )
+		{
+			if( !engine->ep.allowMultilineStrings )
+				Error(TXT_MULTILINE_STRINGS_NOT_ALLOWED, strNode);
+			cat.Assign(&script->code[strNode->tokenPos + 1], strNode->tokenLength - 2);
+		}
+		else if( strNode->tokenType == ttHeredocStringConstant )
+		{
+			cat.Assign(&script->code[strNode->tokenPos + 3], strNode->tokenLength - 6);
+			// Heredoc de-indentation is a larger piece of processing; keep it out of
+			// this path rather than half-implementing it. Backticks in a key are
+			// vanishingly rare and the quoted form still covers arbitrary text.
+			Error(TXT_STRINGS_NOT_RECOGNIZED, strNode);
+			return -1;
+		}
+		else
+		{
+			cat.Assign(&script->code[strNode->tokenPos + 1], strNode->tokenLength - 2);
+		}
+
+		ProcessStringConstant(cat, strNode);
+		key = cat;
+	}
+	else
+	{
+		// Bare word: the key is the literal text of the identifier.
+		key.Assign(&script->code[keyNode->tokenPos], keyNode->tokenLength);
+	}
+
+	void *strPtr = const_cast<void*>(engine->stringFactory->GetStringConstant(key.AddressOf(), (asUINT)key.GetLength()));
+	if( strPtr == 0 )
+	{
+		Error(TXT_NULL_POINTER_ACCESS, keyNode);
+		return -1;
+	}
+
+	usedStringConstants.PushLast(strPtr);
+
+	bc->InstrPTR(asBC_PGA, strPtr);
 	return 0;
 }
 
@@ -7909,6 +8416,59 @@ asUINT asCCompiler::ImplicitConversion(asCExprContext *ctx, const asCDataType &t
 
 	if (ctx->IsAnonymousInitList())
 	{
+		// ORGLIN (ADR-0011): the literal's DELIMITER decides what it is.
+		//
+		//   `[ ... ]` is an ARRAY, `{ ... }` is a DICTIONARY. The brace form used
+		//   to be a second spelling of a list literal, which made the two
+		//   ambiguous exactly at a `?` destination: `{ k = 1 }` reads as a
+		//   dictionary of one key OR as a list holding an assignment, and nothing
+		//   in the destination can tell them apart. Deciding by delimiter removes
+		//   the ambiguity at its source, so a `?` destination always has an answer:
+		//     `any a = [1, "two"]` -> array<any>;  `any a = { k = 1 }` -> dictionary.
+		//
+		// The decision has to be made for the WHOLE literal and here, because this
+		// is the one place both spellings converge — assignment (`any a = ...`,
+		// `d = { ... }`) and a call argument (`T({ k = 1 })`). It cannot be made
+		// per element: the element loop sees one `key = value` entry at a time, so
+		// deciding there would turn `{ k = 1, j = 2 }` into two one-entry
+		// dictionaries instead of one two-entry dictionary.
+		//
+		// Compiling a brace literal against `dictionary` (rather than `?)` makes
+		// the entries match the addon's own `{string, ?}` pattern. The result is a
+		// dictionary handle, which then converts onward to the `?` destination by
+		// the ordinary rules (that is why this recurses instead of returning).
+		// Both destinations that cannot name a shape land here: a `?` slot, and the
+		// registered `any` holder. The declaration spelling (`any a = { ... }`) and
+		// a call argument (`T({ k = 1 })`) both reach this branch, so the decision
+		// does not have to be repeated per call site.
+		bool destinationCannotNameShape = to.GetTokenType() == ttQuestion;
+		if( !destinationCannotNameShape && to.GetTypeInfo() &&
+			to.GetTypeInfo()->GetName() && strcmp(to.GetTypeInfo()->GetName(), "any") == 0 )
+			destinationCannotNameShape = true;
+
+		if( engine->ep.dictionaryLiterals && destinationCannotNameShape &&
+			ctx->exprNode && ctx->exprNode->nodeType == snInitList &&
+			ctx->exprNode->tokenType == ttStartStatementBlock )
+		{
+			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			if( dictType )
+			{
+				asCDataType dictDt = asCDataType::CreateObjectHandle(
+					CastToObjectType(reinterpret_cast<asCTypeInfo*>(dictType)), false);
+
+				if( generateCode )
+					CompileAnonymousInitList(ctx->exprNode, ctx, dictDt);
+				else
+				{
+					ctx->type.dataType = dictDt;
+					ctx->isAnonymousInitList = false;  // it is a dictionary now
+				}
+
+				// The literal is consumed; convert the dictionary to the destination.
+				return ImplicitConversion(ctx, to, node, convType, generateCode, allowObjectConstruct);
+			}
+		}
+
 		if (to.GetBehaviour() && to.GetBehaviour()->listFactory)
 		{
 			if (generateCode)

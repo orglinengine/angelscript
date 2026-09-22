@@ -4233,6 +4233,15 @@ asCScriptNode *asCParser::ParseStatementBlock()
 // stays snInitList, which is what the compiler and byte-code generator dispatch on,
 // so nothing downstream changes. `close` is matched to `open`, so `[1, 2}` is an
 // error rather than silently accepted.
+//
+// ORGLIN (ADR-0011): with asEP_DICTIONARY_LITERALS an entry inside a `{ ... }` list
+// may be written as a `key = value` PAIR, e.g. `{ a = 1, b = 2 }`, instead of the
+// list factory's own `{a, 1}` element shape. The parser DESUGARS the pair into that
+// shape at parse time (one snInitList child holding the key and the value), so the
+// compiler and the dictionary addon see exactly the input they already handle and
+// no downstream stage needs to know the sugar exists. That is the whole reason the
+// rewrite lives here rather than in the addon: the shape produced is the addon's
+// documented contract, and the pattern machinery that consumes it is untouched.
 asCScriptNode *asCParser::ParseInitList()
 {
 	asCScriptNode *node = CreateNode(snInitList);
@@ -4258,6 +4267,12 @@ asCScriptNode *asCParser::ParseInitList()
 		return node;
 	}
 
+	// ORGLIN (ADR-0011): remember WHICH delimiter was written. '[' is an array
+	// literal and '{' is a dictionary literal, and that is what lets a `?`
+	// destination — where the type cannot be inferred from the elements — decide
+	// between them without ambiguity. (tokenType is not otherwise used on an
+	// snInitList; it is the node's own spare marker.)
+	node->tokenType = openType;
 	node->UpdateSourcePos(t1.pos, t1.length);
 
 	GetToken(&t1);
@@ -4276,26 +4291,14 @@ asCScriptNode *asCParser::ParseInitList()
 			GetToken(&t1);
 			if( t1.type == ttListSeparator )
 			{
-				// A leading comma still represents an empty element for legacy
-				// brace lists. In bracket literals it is only the separator before
-				// a conventional trailing comma, so do not add an element yet.
-				if( openType != ttOpenBracket )
-				{
-					node->AddChildLast(CreateNode(snUndefined));
-					node->lastChild->UpdateSourcePos(t1.pos, 1);
-				}
-
+				// ORGLIN (ADR-0011): a comma is only ever a SEPARATOR. The bracket
+				// literal's conventional trailing comma (`[1, 2,]`) is two elements
+				// and a leading one (`[, 1]`) is a plain syntax error — the legacy
+				// brace-list rule that manufactured an EMPTY element here is gone,
+				// since `{ ... }` is a dictionary and has no positional elements.
 				GetToken(&t1);
 				if( t1.type == closeType )
 				{
-					// Legacy brace lists preserve their historical empty trailing
-					// element. Bracket literals use the conventional trailing-comma
-					// spelling, so `[1, 2,]` has two elements, not three.
-					if( openType != ttOpenBracket )
-					{
-						node->AddChildLast(CreateNode(snUndefined));
-						node->lastChild->UpdateSourcePos(t1.pos, 1);
-					}
 					node->UpdateSourcePos(t1.pos, t1.length);
 					return node;
 				}
@@ -4303,9 +4306,11 @@ asCScriptNode *asCParser::ParseInitList()
 			}
 			else if( t1.type == closeType )
 			{
-				// No expression
-				node->AddChildLast(CreateNode(snUndefined));
-				node->lastChild->UpdateSourcePos(t1.pos, 1);
+				// No expression. This is reached when a comma is followed by the
+				// closing delimiter, i.e. a TRAILING comma — the conventional spelling,
+				// so it contributes no element (`[1, 2,]` is two, not three). It is not
+				// reached for a bracket literal at all, since the separator branch above
+				// consumes the trailing comma.
 				node->UpdateSourcePos(t1.pos, t1.length);
 
 				// Statement block is finished
@@ -4338,7 +4343,7 @@ asCScriptNode *asCParser::ParseInitList()
 			else
 			{
 				RewindTo(&t1);
-				node->AddChildLast(ParseAssignment());
+				node->AddChildLast(ParseInitListElement(openType));
 				if( isSyntaxError ) return node;
 
 
@@ -4362,6 +4367,88 @@ asCScriptNode *asCParser::ParseInitList()
 		}
 	}
 	UNREACHABLE_RETURN;
+}
+
+// ORGLIN (ADR-0011): one entry of a list literal. Normally this is just an
+// ASSIGN expression. With asEP_DICTIONARY_LITERALS, inside a `{ ... }` list a
+// `key = value` entry is the ONE-ASSIGNMENT signature the dictionary list
+// pattern's own element already has, so it is wrapped in a nested snInitList
+// holding [key, value] — the exact `{key, value}` shape the addon expects.
+//
+// `openType` tells the sugar apart from an ordinary assignment list: the pair
+// form is only allowed in a brace list, because `[a = 1]` (a bracket list) is an
+// array literal, where a `key = value` pair means nothing.
+asCScriptNode *asCParser::ParseInitListElement(eTokenType openType)
+{
+	asCScriptNode *node = ParseAssignment();
+	if( isSyntaxError ) return node;
+
+	if( !engine->ep.dictionaryLiterals || openType != ttStartStatementBlock )
+		return node;
+
+	// The pair form is only a pair when the entry IS a single `key = value`
+	// assignment: an snAssignment node holds [lhs, operator, rhs], so anything
+	// else (`key += v`, a chained `a = b = c`, a plain expression) keeps its
+	// existing meaning. This is what keeps the sugar additive to the grammar.
+	asCScriptNode *lhs = node->firstChild;
+	if( node->nodeType != snAssignment || lhs == 0 )
+		return node;
+
+	asCScriptNode *opNode = lhs->next;
+	if( opNode == 0 || opNode->next == 0 || opNode->next->next != 0 )
+		return node;
+	if( opNode->tokenType != ttAssignment )
+		return node;
+
+	// The lhs is wrapped by the expression grammar (CONDITION > EXPRESSION >
+	// EXPRTERM > EXPRVALUE), so unwrap those single-child chains to reach the
+	// access/value node the key is actually written as.
+	while( lhs->firstChild && lhs->firstChild->next == 0 &&
+		   (lhs->nodeType == snCondition || lhs->nodeType == snExpression ||
+			lhs->nodeType == snExprTerm || lhs->nodeType == snExprValue ||
+			lhs->nodeType == snScope) )
+		lhs = lhs->firstChild;
+
+	// `a.b` and `a[i]` carry a post-op sibling; only a bare key has none.
+	if( lhs->next != 0 )
+		return node;
+
+	// An snConstant is a value, not a lvalue — only the string-constant spelling
+	// of a key reaches the unwrapped node as one.
+	bool isQuotedKey = false;
+	const asCScriptNode *keyToken = 0;
+	if( lhs->nodeType == snConstant && lhs->tokenType == ttStringConstant &&
+		lhs->firstChild && lhs->firstChild->next == 0 )
+	{
+		keyToken = lhs->firstChild;
+		isQuotedKey = true;
+	}
+	else
+	{
+		// A variable access must be a BARE identifier: only the bare `a` can be a key.
+		if( lhs->nodeType != snVariableAccess || lhs->firstChild == 0 ||
+			lhs->firstChild->next != 0 || lhs->firstChild->nodeType != snIdentifier )
+			return node;
+
+		keyToken = lhs->firstChild;
+	}
+
+	asCScriptNode *keyNode = CreateNode(snDictionaryKey);
+	asCScriptNode *pair = CreateNode(snInitList);
+	if( keyNode == 0 || pair == 0 ) return node;
+
+	// The key node records the AUTHORED token (type + source position) rather than
+	// a fabricated one: a bare word becomes the same string its quoted spelling
+	// would give, and the position still points at the real key so diagnostics
+	// stay accurate. The text -> string conversion happens in the compiler, which
+	// owns string-constant creation.
+	keyNode->tokenType = isQuotedKey ? ttStringConstant : ttIdentifier;
+	keyNode->UpdateSourcePos(keyToken->tokenPos, keyToken->tokenLength);
+
+	pair->AddChildLast(keyNode);
+	pair->AddChildLast(opNode->next);
+	pair->UpdateSourcePos(node->tokenPos, node->tokenLength);
+	return pair;
 }
 
 // BNF:1: VAR           ::= ('private'|'protected')? TYPE IDENTIFIER (( '=' (INITLIST | EXPR)) | ARGLIST)? (',' IDENTIFIER (( '=' (INITLIST | EXPR)) | ARGLIST)?)* ';'

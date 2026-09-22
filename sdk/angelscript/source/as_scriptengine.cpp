@@ -345,6 +345,11 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.bracketListLiterals = value ? true : false;
 		break;
 
+	// ORGLIN: `{ key = value }` list literal entries (ADR-0011).
+	case asEP_DICTIONARY_LITERALS:
+		ep.dictionaryLiterals = value ? true : false;
+		break;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		ep.buildWithoutLineCues = value ? true : false;
 		break;
@@ -561,6 +566,10 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_BRACKET_LIST_LITERALS:
 		return ep.bracketListLiterals;
 
+	// ORGLIN: dictionary list literal entries.
+	case asEP_DICTIONARY_LITERALS:
+		return ep.dictionaryLiterals;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		return ep.buildWithoutLineCues;
 
@@ -703,6 +712,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.optionalStatementTerminator   = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.implicitHandleClasses         = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.bracketListLiterals           = false;	// ORGLIN: off by default (language stays unchanged)
+		ep.dictionaryLiterals            = false;	// ORGLIN: off by default (language stays unchanged)
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
 		ep.buildWithoutLineCues          = false;

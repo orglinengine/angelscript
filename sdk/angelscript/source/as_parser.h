@@ -131,6 +131,7 @@ protected:
 	asCScriptNode *ParseClass();
 	asCScriptNode *ParseMixin();
 	asCScriptNode *ParseInitList();
+	asCScriptNode *ParseInitListElement(eTokenType openType);
 	asCScriptNode *ParseInterface();
 	asCScriptNode *ParseInterfaceMethod();
 	asCScriptNode *ParseVirtualPropertyDecl(bool isMethod, bool isInterface);

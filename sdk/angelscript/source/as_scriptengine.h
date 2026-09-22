@@ -498,6 +498,7 @@ public:
 		bool   optionalStatementTerminator;	// ORGLIN: line break may end a statement
 		bool   implicitHandleClasses;		// ORGLIN: script classes are implicit-handle
 		bool   bracketListLiterals;			// ORGLIN: `[ ... ]` allowed as a list literal
+		bool   dictionaryLiterals;			// ORGLIN: `{ key = value }` list literal entries
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;

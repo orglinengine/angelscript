@@ -201,6 +201,11 @@ enum asEEngineProp
 	// ORGLIN: `[ ... ]` is accepted as a list literal where `{ ... }` is today
 	// (ADR-0011), e.g. `array<int> a = [1, 2, 3]`.
 	asEP_BRACKET_LIST_LITERALS              = 43,
+	// ORGLIN: inside a `{ ... }` list literal, `key = value` pairs are accepted
+	// and desugared into the list factory's own [key, value] element shape
+	// (ADR-0011), e.g. `dictionary d = { a = 1, b = 2 }`. Purely additive: the
+	// upstream pair spelling `{ {"a", 1} }` keeps working.
+	asEP_DICTIONARY_LITERALS                = 44,
 
 	asEP_LAST_PROPERTY
 };
