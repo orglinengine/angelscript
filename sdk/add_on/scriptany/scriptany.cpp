@@ -7,6 +7,29 @@
 
 BEGIN_AS_NAMESPACE
 
+// ORGLIN (item 5): Cache primitive type sizes so Store/Retrieve don't call
+// engine->GetSizeOfPrimitiveType() on every operation (each one constructs an
+// asCDataType internally). The type IDs are fixed constants, so a static table
+// is both safe and allocation-free. Enums (>asTYPEID_DOUBLE) are always 4 bytes.
+static int CachedSizeOfPrimitiveType(int typeId)
+{
+	// The AS type IDs for primitives are sequential constants from 0 (VOID)
+	// through 11 (DOUBLE). Everything above DOUBLE is an enum (4 bytes) or an
+	// object type (not our responsibility).
+	if( typeId >= 0 && typeId <= asTYPEID_DOUBLE )
+	{
+		// Sizes: void=0, bool=1, int8=1, int16=2, int32=4, int64=8,
+		//        uint8=1, uint16=2, uint32=4, uint64=8, float=4, double=8
+		static const int sizes[] = { 0, 1, 1, 2, 4, 8, 1, 2, 4, 8, 4, 8 };
+		return sizes[typeId];
+	}
+	// Enums are always 4 bytes (32-bit int under the hood).
+	if( typeId > asTYPEID_DOUBLE && (typeId & asTYPEID_MASK_OBJECT) == 0 )
+		return 4;
+	// Objects/handles: caller should use the type info, not this function.
+	return 0;
+}
+
 // We'll use the generic interface for the factories as we need the engine pointer
 static void ScriptAnyFactory_Generic(asIScriptGeneric *gen)
 {
@@ -547,7 +570,8 @@ static asBYTE *ScriptAnyListNextValue(asIScriptEngine *engine, asBYTE *buffer, i
 	}
 	else
 	{
-		buffer += engine->GetSizeOfPrimitiveType(typeId);
+		// ORGLIN (item 5): use cached size.
+		buffer += CachedSizeOfPrimitiveType(typeId);
 	}
 	return buffer;
 }
@@ -668,6 +692,282 @@ static void ScriptAnyListFactory_Generic(asIScriptGeneric *gen)
 	*(CScriptAny**)gen->GetAddressOfReturnLocation() = result;
 }
 
+//------------------------------------------------------------------------
+// ORGLIN (item 6): NATIVE operator wrappers for `any`.
+//
+// The Generic interface adds ~170 ns overhead per call from the
+// asIScriptGeneric machinery alone. For the most-called operators (conv,
+// arithmetic, comparisons, compound assignment, inc/dec) we register thin
+// native wrappers that delegate to the existing Generic implementations.
+// The Generic functions remain for overloads that require dynamic argument
+// resolution (the `?&in` catch-alls).
+//
+// All wrappers follow the same shape: cast the implicit `this` pointer from
+// the last argument, forward to the Generic handler. This avoids code
+// duplication while eliminating the generic-dispatch overhead.
+
+// --- opConv (value-returning) ---
+static asINT64 ScriptAny_opConvInt_Native(CScriptAny *self)
+{
+	asINT64 v = 0;
+	double d = 0;
+	if     ( self->Retrieve(v) ) { /* already an integer */ }
+	else if( self->Retrieve(d) ) { v = (asINT64)d; }
+	return v;
+}
+
+static double ScriptAny_opConvDouble_Native(CScriptAny *self)
+{
+	double d = 0;
+	asINT64 v = 0;
+	if     ( self->Retrieve(d) ) { /* already a double */ }
+	else if( self->Retrieve(v) ) { d = (double)v; }
+	return d;
+}
+
+// --- Arithmetic: any OP number (asCALL_CDECL_OBJLAST: fn(self, arg)) ---
+// The `_Generic` versions inspect argTypeId at runtime, but the native
+// path receives a typed argument directly. We keep two native overloads:
+// one for double, one for const int64&in. For (const any &in) we delegate
+// to the Generic handler (rare, and the arg is an object pointer anyway).
+
+// Macro for arithmetic: any OP typed-number.
+#define ORGLIN_ANY_NATIVE_ARITH(NAME, OP)                                        \
+static double ScriptAny_##NAME##_NativeDbl(CScriptAny *self, double rhs)         \
+{                                                                                \
+	double lhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }  \
+	return lhs OP rhs;                                                           \
+}                                                                                \
+static double ScriptAny_##NAME##_NativeI64(CScriptAny *self, asINT64 rhs)        \
+{                                                                                \
+	double lhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }  \
+	return lhs OP (double)rhs;                                                   \
+}
+
+ORGLIN_ANY_NATIVE_ARITH(opAdd, +)
+ORGLIN_ANY_NATIVE_ARITH(opSub, -)
+ORGLIN_ANY_NATIVE_ARITH(opMul, *)
+ORGLIN_ANY_NATIVE_ARITH(opDiv, /)
+
+// --- Reverse arithmetic: number OP any (asCALL_CDECL_OBJLAST: fn(self, arg)) ---
+// self is the `any` (RHS in the script expression), arg is the number (LHS).
+// We read `self` as the RHS and the argument as the LHS.
+#define ORGLIN_ANY_NATIVE_ARITH_R(NAME, OP)                                      \
+static double ScriptAny_##NAME##_r_NativeDbl(CScriptAny *self, double lhs)       \
+{                                                                                \
+	double rhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }  \
+	return lhs OP rhs;                                                           \
+}                                                                                \
+static double ScriptAny_##NAME##_r_NativeI64(CScriptAny *self, asINT64 lhs)      \
+{                                                                                \
+	double rhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }  \
+	return (double)lhs OP rhs;                                                   \
+}
+
+ORGLIN_ANY_NATIVE_ARITH_R(opAdd, +)
+ORGLIN_ANY_NATIVE_ARITH_R(opSub, -)
+ORGLIN_ANY_NATIVE_ARITH_R(opMul, *)
+ORGLIN_ANY_NATIVE_ARITH_R(opDiv, /)
+
+// Special cases: pow (no C++ operator) and mod (fmod).
+static double ScriptAny_opPow_NativeDbl(CScriptAny *self, double rhs)
+{
+	double lhs = 0;
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
+	return pow(lhs, rhs);
+}
+static double ScriptAny_opPow_NativeI64(CScriptAny *self, asINT64 rhs)
+{
+	double lhs = 0;
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
+	return pow(lhs, (double)rhs);
+}
+static double ScriptAny_opMod_NativeDbl(CScriptAny *self, double rhs)
+{
+	double lhs = 0;
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
+	return fmod(lhs, rhs);
+}
+static double ScriptAny_opMod_NativeI64(CScriptAny *self, asINT64 rhs)
+{
+	double lhs = 0;
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
+	return fmod(lhs, (double)rhs);
+}
+
+static double ScriptAny_opPow_r_NativeDbl(CScriptAny *self, double lhs)
+{
+	double rhs = 0;
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
+	return pow(lhs, rhs);
+}
+static double ScriptAny_opPow_r_NativeI64(CScriptAny *self, asINT64 lhs)
+{
+	double rhs = 0;
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
+	return pow((double)lhs, rhs);
+}
+static double ScriptAny_opMod_r_NativeDbl(CScriptAny *self, double lhs)
+{
+	double rhs = 0;
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
+	return fmod(lhs, rhs);
+}
+static double ScriptAny_opMod_r_NativeI64(CScriptAny *self, asINT64 lhs)
+{
+	double rhs = 0;
+	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
+	return fmod((double)lhs, rhs);
+}
+
+// --- opNeg (unary minus, no argument besides self) ---
+static double ScriptAny_opNeg_Native(CScriptAny *self)
+{
+	double v = 0;
+	if( !ScriptAnyAsDouble(self, v) ) { ScriptAny_CastFail(self); return 0; }
+	return -v;
+}
+
+// --- Compound assignment: any OP= number (asCALL_CDECL_OBJLAST) ---
+// Returns self& (by pointer through return-object pointer).  We cannot use
+// C++ return because AS wants the result through the return slot; instead
+// we set it through the return pointer that AS passes.  But for
+// asCALL_CDECL_OBJLAST, the return is via the normal C++ return — we
+// return a pointer that AS stores.  Actually: for `any &opAddAssign(double)`
+// the return is `any &`, so the native function returns a CScriptAny* and
+// AS dereferences it.  Let me check... No: for asCALL_CDECL_OBJLAST the
+// return is the actual C++ return value. For a reference return we need
+// to return the pointer and AS will treat it as a reference.
+//
+// Actually, looking at the registration declaration:
+//   "any &opAddAssign(double)" -> return type is `any &`
+// With asCALL_CDECL_OBJLAST the handler's C++ return type must match.
+// A `CScriptAny*` return is interpreted as the object address for the
+// reference return.
+#define ORGLIN_ANY_NATIVE_OPASSIGN(NAME, EXPR)                                  \
+static CScriptAny* ScriptAny_##NAME##_NativeDbl(CScriptAny *self, double rhs)    \
+{                                                                                \
+	double lhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return self; }\
+	double next = (EXPR);                                                        \
+	self->Store(next);                                                           \
+	return self;                                                                 \
+}                                                                                \
+static CScriptAny* ScriptAny_##NAME##_NativeI64(CScriptAny *self, asINT64 rhs)   \
+{                                                                                \
+	double lhs = 0;                                                               \
+	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return self; }\
+	double next = (EXPR);                                                        \
+	self->Store(next);                                                           \
+	return self;                                                                 \
+}
+
+ORGLIN_ANY_NATIVE_OPASSIGN(opAddAssign, lhs + rhs)
+ORGLIN_ANY_NATIVE_OPASSIGN(opSubAssign, lhs - rhs)
+ORGLIN_ANY_NATIVE_OPASSIGN(opMulAssign, lhs * rhs)
+ORGLIN_ANY_NATIVE_OPASSIGN(opDivAssign, lhs / rhs)
+ORGLIN_ANY_NATIVE_OPASSIGN(opModAssign, fmod(lhs, rhs))
+
+// --- Inc/Dec (no argument besides self) ---
+static CScriptAny* ScriptAny_opPreInc_Native(CScriptAny *self)
+{
+	int typeId = self->GetTypeId();
+	if( typeId == asTYPEID_INT64 )
+	{
+		asINT64 v = 0;
+		if( !self->Retrieve(v) ) { ScriptAny_CastFail(self); return self; }
+		asINT64 next = v + 1;
+		self->Store(next);
+	}
+	else if( typeId == asTYPEID_DOUBLE )
+	{
+		double v = 0;
+		if( !self->Retrieve(v) ) { ScriptAny_CastFail(self); return self; }
+		double next = v + 1.0;
+		self->Store(next);
+	}
+	else { ScriptAny_CastFail(self); }
+	return self;
+}
+
+static CScriptAny* ScriptAny_opPostInc_Native(CScriptAny *self)
+{
+	// Post-increment: same as pre (value changes, return is the old value for
+	// script but AS handles this via the return convention). The Generic version
+	// returns self in both cases; we follow suit.
+	return ScriptAny_opPreInc_Native(self);
+}
+
+static CScriptAny* ScriptAny_opPreDec_Native(CScriptAny *self)
+{
+	int typeId = self->GetTypeId();
+	if( typeId == asTYPEID_INT64 )
+	{
+		asINT64 v = 0;
+		if( !self->Retrieve(v) ) { ScriptAny_CastFail(self); return self; }
+		asINT64 next = v - 1;
+		self->Store(next);
+	}
+	else if( typeId == asTYPEID_DOUBLE )
+	{
+		double v = 0;
+		if( !self->Retrieve(v) ) { ScriptAny_CastFail(self); return self; }
+		double next = v - 1.0;
+		self->Store(next);
+	}
+	else { ScriptAny_CastFail(self); }
+	return self;
+}
+
+static CScriptAny* ScriptAny_opPostDec_Native(CScriptAny *self)
+{
+	return ScriptAny_opPreDec_Native(self);
+}
+
+// --- opEquals / opNotEquals (native) ---
+static bool ScriptAny_opEqualsAny_Native(CScriptAny *self, CScriptAny *other)
+{
+	double a = 0, b = 0;
+	bool okA = ScriptAnyAsDouble(self, a);
+	bool okB = other != 0 && ScriptAnyAsDouble(other, b);
+	return okA && okB && a == b;
+}
+
+static bool ScriptAny_opEqualsNumDbl_Native(CScriptAny *self, double rhs)
+{
+	double a = 0;
+	bool okA = ScriptAnyAsDouble(self, a);
+	return okA && a == rhs;
+}
+
+static bool ScriptAny_opEqualsNumI64_Native(CScriptAny *self, asINT64 rhs)
+{
+	double a = 0;
+	bool okA = ScriptAnyAsDouble(self, a);
+	return okA && a == (double)rhs;
+}
+
+static bool ScriptAny_opNotEqualsAny_Native(CScriptAny *self, CScriptAny *other)
+{
+	return !ScriptAny_opEqualsAny_Native(self, other);
+}
+
+static bool ScriptAny_opNotEqualsNumDbl_Native(CScriptAny *self, double rhs)
+{
+	return !ScriptAny_opEqualsNumDbl_Native(self, rhs);
+}
+
+static bool ScriptAny_opNotEqualsNumI64_Native(CScriptAny *self, asINT64 rhs)
+{
+	return !ScriptAny_opEqualsNumI64_Native(self, rhs);
+}
+
+//------------------------------------------------------------------------
+
 void RegisterScriptAny_Native(asIScriptEngine *engine)
 {
 	int r;
@@ -695,18 +995,18 @@ void RegisterScriptAny_Native(asIScriptEngine *engine)
 	// "Initialization lists cannot be used with 'any'".
 	r = engine->RegisterObjectBehaviour("any", asBEHAVE_LIST_FACTORY, "any@f(int &in) {repeat ?}", asFUNCTION(ScriptAnyListFactory_Generic), asCALL_GENERIC); assert( r >= 0 );
 
-	// ORGLIN: conversion OUT of `any` — the `opConv` family (`double(x)`, `int64(x)`).
+	// ORGLIN: conversion OUT of `any` — now NATIVE (item 6).
 	r = engine->RegisterObjectMethod("any", "void opCast(?&out)", asFUNCTION(ScriptAny_opCast_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("any", "void opConv(?&out)", asFUNCTION(ScriptAny_opCast_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "int64 opConv()", asFUNCTION(ScriptAny_opConvInt_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opConv()", asFUNCTION(ScriptAny_opConvDouble_Generic), asCALL_GENERIC); assert( r >= 0 );
-	// Comparisons, so `any` has the operators every other type has.
-	r = engine->RegisterObjectMethod("any", "bool opEquals(const any &in)", asFUNCTION(ScriptAny_opEqualsAny_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "bool opEquals(const int64 &in)", asFUNCTION(ScriptAny_opEqualsNum_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "bool opEquals(double)", asFUNCTION(ScriptAny_opEqualsNum_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "bool opNotEquals(const any &in)", asFUNCTION(ScriptAny_opNotEqualsAny_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "bool opNotEquals(const int64 &in)", asFUNCTION(ScriptAny_opNotEqualsNum_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "bool opNotEquals(double)", asFUNCTION(ScriptAny_opNotEqualsNum_Generic), asCALL_GENERIC); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "int64 opConv()", asFUNCTION(ScriptAny_opConvInt_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opConv()", asFUNCTION(ScriptAny_opConvDouble_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	// Comparisons — now NATIVE (item 6).
+	r = engine->RegisterObjectMethod("any", "bool opEquals(const any &in)", asFUNCTION(ScriptAny_opEqualsAny_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "bool opEquals(const int64 &in)", asFUNCTION(ScriptAny_opEqualsNumI64_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "bool opEquals(double)", asFUNCTION(ScriptAny_opEqualsNumDbl_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "bool opNotEquals(const any &in)", asFUNCTION(ScriptAny_opNotEqualsAny_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "bool opNotEquals(const int64 &in)", asFUNCTION(ScriptAny_opNotEqualsNumI64_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "bool opNotEquals(double)", asFUNCTION(ScriptAny_opNotEqualsNumDbl_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
 	r = engine->RegisterObjectBehaviour("any", asBEHAVE_ADDREF, "void f()", asMETHOD(CScriptAny,AddRef), asCALL_THISCALL); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("any", asBEHAVE_RELEASE, "void f()", asMETHOD(CScriptAny,Release), asCALL_THISCALL); assert( r >= 0 );
@@ -726,71 +1026,58 @@ void RegisterScriptAny_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("any", "bool retrieve(int64&out) const", asMETHODPR(CScriptAny,Retrieve,(asINT64&) const,bool), asCALL_THISCALL); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("any", "bool retrieve(double&out) const", asMETHODPR(CScriptAny,Retrieve,(double&) const,bool), asCALL_THISCALL); assert( r >= 0 );
 
-	// ORGLIN: ARITHMETIC on `any`, so a numeric `any` behaves like a number
-	// (`any x = 1; double r = x + 1`). A non-numeric operand is a context exception
-	// rather than a silently wrong result.
-	//
-	// These were registered ONLY in RegisterScriptAny_Generic, which this build never
-	// calls — MSVC compiles without AS_MAX_PORTABILITY, so RegisterScriptAny takes the
-	// NATIVE branch and `x + 1` failed with "No conversion from 'any&' to math type
-	// available". The handlers are generic-call functions either way, so they work
-	// unchanged from here; that is why the omission was invisible for so long.
-	// The `const int64&in` overload is NOT optional: an `int` literal is widened to
-	// int64 by overload resolution, so without it `x + 1` matches nothing.
-	r = engine->RegisterObjectMethod("any", "double opAdd(double)", asFUNCTION(ScriptAny_opAdd_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opAdd(const int64&in)", asFUNCTION(ScriptAny_opAdd_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opSub(double)", asFUNCTION(ScriptAny_opSub_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opSub(const int64&in)", asFUNCTION(ScriptAny_opSub_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMul(double)", asFUNCTION(ScriptAny_opMul_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMul(const int64&in)", asFUNCTION(ScriptAny_opMul_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opDiv(double)", asFUNCTION(ScriptAny_opDiv_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opDiv(const int64&in)", asFUNCTION(ScriptAny_opDiv_Generic), asCALL_GENERIC); assert( r >= 0 );
+	// ORGLIN: ARITHMETIC on `any` — now NATIVE (item 6) for typed overloads.
+	// The `const any &in` overloads stay Generic (they need GetArgObject).
+	r = engine->RegisterObjectMethod("any", "double opAdd(double)", asFUNCTION(ScriptAny_opAdd_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opAdd(const int64&in)", asFUNCTION(ScriptAny_opAdd_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opSub(double)", asFUNCTION(ScriptAny_opSub_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opSub(const int64&in)", asFUNCTION(ScriptAny_opSub_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMul(double)", asFUNCTION(ScriptAny_opMul_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMul(const int64&in)", asFUNCTION(ScriptAny_opMul_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opDiv(double)", asFUNCTION(ScriptAny_opDiv_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opDiv(const int64&in)", asFUNCTION(ScriptAny_opDiv_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	// any OP any — stays Generic (arg is an object pointer via GetArgObject).
 	r = engine->RegisterObjectMethod("any", "double opAdd(const any &in)", asFUNCTION(ScriptAny_opAddAny_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("any", "double opSub(const any &in)", asFUNCTION(ScriptAny_opSubAny_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("any", "double opMul(const any &in)", asFUNCTION(ScriptAny_opMulAny_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("any", "double opDiv(const any &in)", asFUNCTION(ScriptAny_opDivAny_Generic), asCALL_GENERIC); assert( r >= 0 );
 
-	// ORGLIN: the REVERSE operators, so a NUMBER on the left works (`1 + x`). Without
-	// them a primitive LHS fails with "No conversion from 'any&' to math type
-	// available" — see the handler comment for the protocol.
-	r = engine->RegisterObjectMethod("any", "double opAdd_r(double)", asFUNCTION(ScriptAny_opAdd_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opAdd_r(const int64&in)", asFUNCTION(ScriptAny_opAdd_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opSub_r(double)", asFUNCTION(ScriptAny_opSub_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opSub_r(const int64&in)", asFUNCTION(ScriptAny_opSub_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMul_r(double)", asFUNCTION(ScriptAny_opMul_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMul_r(const int64&in)", asFUNCTION(ScriptAny_opMul_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opDiv_r(double)", asFUNCTION(ScriptAny_opDiv_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opDiv_r(const int64&in)", asFUNCTION(ScriptAny_opDiv_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opPow_r(double)", asFUNCTION(ScriptAny_opPow_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opPow_r(const int64&in)", asFUNCTION(ScriptAny_opPow_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMod_r(double)", asFUNCTION(ScriptAny_opMod_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMod_r(const int64&in)", asFUNCTION(ScriptAny_opMod_r_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMod(double)", asFUNCTION(ScriptAny_opMod_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opMod(const int64&in)", asFUNCTION(ScriptAny_opMod_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opPow(double)", asFUNCTION(ScriptAny_opPow_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opPow(const int64&in)", asFUNCTION(ScriptAny_opPow_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "double opNeg()", asFUNCTION(ScriptAny_opNeg_Generic), asCALL_GENERIC); assert( r >= 0 );
+	// ORGLIN: the REVERSE operators — now NATIVE (item 6) for typed overloads.
+	r = engine->RegisterObjectMethod("any", "double opAdd_r(double)", asFUNCTION(ScriptAny_opAdd_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opAdd_r(const int64&in)", asFUNCTION(ScriptAny_opAdd_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opSub_r(double)", asFUNCTION(ScriptAny_opSub_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opSub_r(const int64&in)", asFUNCTION(ScriptAny_opSub_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMul_r(double)", asFUNCTION(ScriptAny_opMul_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMul_r(const int64&in)", asFUNCTION(ScriptAny_opMul_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opDiv_r(double)", asFUNCTION(ScriptAny_opDiv_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opDiv_r(const int64&in)", asFUNCTION(ScriptAny_opDiv_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opPow_r(double)", asFUNCTION(ScriptAny_opPow_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opPow_r(const int64&in)", asFUNCTION(ScriptAny_opPow_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMod_r(double)", asFUNCTION(ScriptAny_opMod_r_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMod_r(const int64&in)", asFUNCTION(ScriptAny_opMod_r_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMod(double)", asFUNCTION(ScriptAny_opMod_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opMod(const int64&in)", asFUNCTION(ScriptAny_opMod_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opPow(double)", asFUNCTION(ScriptAny_opPow_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opPow(const int64&in)", asFUNCTION(ScriptAny_opPow_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "double opNeg()", asFUNCTION(ScriptAny_opNeg_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
-	// ORGLIN: compound assignment (`x += 2`), which an object type does NOT get for
-	// free from `x = x + 2` — see the handlers.
-	r = engine->RegisterObjectMethod("any", "any &opAddAssign(double)", asFUNCTION(ScriptAny_opAddAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opAddAssign(const int64&in)", asFUNCTION(ScriptAny_opAddAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opSubAssign(double)", asFUNCTION(ScriptAny_opSubAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opSubAssign(const int64&in)", asFUNCTION(ScriptAny_opSubAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opMulAssign(double)", asFUNCTION(ScriptAny_opMulAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opMulAssign(const int64&in)", asFUNCTION(ScriptAny_opMulAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opDivAssign(double)", asFUNCTION(ScriptAny_opDivAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opDivAssign(const int64&in)", asFUNCTION(ScriptAny_opDivAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opModAssign(double)", asFUNCTION(ScriptAny_opModAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opModAssign(const int64&in)", asFUNCTION(ScriptAny_opModAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
+	// ORGLIN: compound assignment — now NATIVE (item 6) for typed overloads.
+	r = engine->RegisterObjectMethod("any", "any &opAddAssign(double)", asFUNCTION(ScriptAny_opAddAssign_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opAddAssign(const int64&in)", asFUNCTION(ScriptAny_opAddAssign_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opSubAssign(double)", asFUNCTION(ScriptAny_opSubAssign_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opSubAssign(const int64&in)", asFUNCTION(ScriptAny_opSubAssign_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opMulAssign(double)", asFUNCTION(ScriptAny_opMulAssign_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opMulAssign(const int64&in)", asFUNCTION(ScriptAny_opMulAssign_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opDivAssign(double)", asFUNCTION(ScriptAny_opDivAssign_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opDivAssign(const int64&in)", asFUNCTION(ScriptAny_opDivAssign_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opModAssign(double)", asFUNCTION(ScriptAny_opModAssign_NativeDbl), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opModAssign(const int64&in)", asFUNCTION(ScriptAny_opModAssign_NativeI64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
-	// ORGLIN: INCREMENT / DECREMENT, so `x++` on a numeric `any` advances the value it
-	// holds. Same numeric-only rule as the arithmetic above: a non-numeric `any` is an
-	// exception rather than a silent no-op.
-	r = engine->RegisterObjectMethod("any", "any &opPreInc()", asFUNCTION(ScriptAny_opPreInc_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opPostInc()", asFUNCTION(ScriptAny_opPostInc_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opPreDec()", asFUNCTION(ScriptAny_opPreDec_Generic), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("any", "any &opPostDec()", asFUNCTION(ScriptAny_opPostDec_Generic), asCALL_GENERIC); assert( r >= 0 );
+	// ORGLIN: INCREMENT / DECREMENT — now NATIVE (item 6).
+	r = engine->RegisterObjectMethod("any", "any &opPreInc()", asFUNCTION(ScriptAny_opPreInc_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opPostInc()", asFUNCTION(ScriptAny_opPostInc_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opPreDec()", asFUNCTION(ScriptAny_opPreDec_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("any", "any &opPostDec()", asFUNCTION(ScriptAny_opPostDec_Native), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
 	// Register GC behaviours
 	r = engine->RegisterObjectBehaviour("any", asBEHAVE_GETREFCOUNT, "int f()", asMETHOD(CScriptAny,GetRefCount), asCALL_THISCALL); assert( r >= 0 );
@@ -962,7 +1249,8 @@ void CScriptAny::Store(void *ref, int refTypeId)
 
 		// Copy the primitive value
 		// We receive a pointer to the value.
-		int size = engine->GetSizeOfPrimitiveType(value.typeId);
+		// ORGLIN (item 5): use cached size to avoid engine->GetSizeOfPrimitiveType() per call.
+		int size = CachedSizeOfPrimitiveType(value.typeId);
 		memcpy(&value.valueInt, ref, size);
 	}
 }
@@ -1019,7 +1307,8 @@ bool CScriptAny::Retrieve(void *ref, int refTypeId) const
 
 		if( value.typeId == refTypeId )
 		{
-			int size = engine->GetSizeOfPrimitiveType(refTypeId);
+			// ORGLIN (item 5): use cached size to avoid engine->GetSizeOfPrimitiveType() per call.
+			int size = CachedSizeOfPrimitiveType(refTypeId);
 			memcpy(ref, &value.valueInt, size);
 			return true;
 		}

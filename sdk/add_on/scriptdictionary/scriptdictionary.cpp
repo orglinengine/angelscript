@@ -5,6 +5,21 @@
 
 BEGIN_AS_NAMESPACE
 
+// ORGLIN (item 5): Cache primitive type sizes so Set/Get/constructor don't call
+// engine->GetSizeOfPrimitiveType() on every operation. The type IDs are fixed
+// constants, so a static table is both safe and allocation-free.
+static int CachedSizeOfPrimitiveType(int typeId)
+{
+	if( typeId >= 0 && typeId <= asTYPEID_DOUBLE )
+	{
+		static const int sizes[] = { 0, 1, 1, 2, 4, 8, 1, 2, 4, 8, 4, 8 };
+		return sizes[typeId];
+	}
+	if( typeId > asTYPEID_DOUBLE && (typeId & asTYPEID_MASK_OBJECT) == 0 )
+		return 4;
+	return 0;
+}
+
 using namespace std;
 
 //------------------------------------------------------------------------
@@ -187,7 +202,8 @@ CScriptDictionary::CScriptDictionary(asBYTE *buffer)
 		}
 		else
 		{
-			buffer += engine->GetSizeOfPrimitiveType(typeId);
+			// ORGLIN (item 5): use cached size.
+			buffer += CachedSizeOfPrimitiveType(typeId);
 		}
 	}
 }
@@ -715,7 +731,8 @@ void CScriptDictValue::Set(void *value, int typeId)
 	{
 		// Copy the primitive value
 		// We receive a pointer to the value.
-		int size = m_engine->GetSizeOfPrimitiveType(typeId);
+		// ORGLIN (item 5): use cached size.
+		int size = CachedSizeOfPrimitiveType(typeId);
 		memcpy(&m_valueInt, value, size);
 	}
 }
@@ -790,7 +807,8 @@ bool CScriptDictValue::Get(void *value, int typeId) const
 	{
 		if( m_typeId == typeId )
 		{
-			int size = m_engine->GetSizeOfPrimitiveType(typeId);
+			// ORGLIN (item 5): use cached size.
+			int size = CachedSizeOfPrimitiveType(typeId);
 			memcpy(value, &m_valueInt, size);
 			return true;
 		}
@@ -897,7 +915,8 @@ bool CScriptDictValue::Get(void *value, int typeId) const
 			{
 				// Compare only the bytes that were actually set
 				asQWORD zero = 0;
-				int size = m_engine->GetSizeOfPrimitiveType(m_typeId);
+				// ORGLIN (item 5): use cached size.
+				int size = CachedSizeOfPrimitiveType(m_typeId);
 				*(bool*)value = memcmp(&m_valueInt, &zero, size) == 0 ? false : true;
 			}
 			return true;
