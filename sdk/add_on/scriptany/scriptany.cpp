@@ -698,13 +698,32 @@ static void ScriptAnyListFactory_Generic(asIScriptGeneric *gen)
 // The Generic interface adds ~170 ns overhead per call from the
 // asIScriptGeneric machinery alone. For the most-called operators (conv,
 // arithmetic, comparisons, compound assignment, inc/dec) we register thin
-// native wrappers that delegate to the existing Generic implementations.
-// The Generic functions remain for overloads that require dynamic argument
-// resolution (the `?&in` catch-alls).
+// native wrappers.
 //
-// All wrappers follow the same shape: cast the implicit `this` pointer from
-// the last argument, forward to the Generic handler. This avoids code
-// duplication while eliminating the generic-dispatch overhead.
+// ⚠ ORGLIN BUG FIX (2026-09-24): every wrapper here takes the IMPLICIT OBJECT
+// POINTER **LAST**, because that is where `asCALL_CDECL_OBJLAST` puts it — the
+// engine appends the object pointer AFTER the declared parameters
+// (`as_callfunc_x64_msvc.cpp`: `allArgBuffer[paramSize++] = (asQWORD)obj` in the
+// OBJLAST branch, after the parameter loop). Upstream's own registrations show
+// the same shape: `AddAssignStringToString(const string &in, string &dest)` for
+// `string &opAddAssign(const string &in)` and
+// `CScriptDictValue_opAssign(double, CScriptDictValue*)` for
+// `dictionaryValue &opAssign(double)`.
+//
+// These wrappers were originally written `(CScriptAny *self, ...)` with
+// `asCALL_CDECL_OBJLAST`. That does not type-error — both are pointers — it just
+// passes them swapped. So `self` was really the number and the declared operand
+// was really the `any`: `ScriptAnyAsDouble(self, ...)` read a double's bytes as a
+// CScriptAny and called Retrieve on it. Every native overload read a garbage type
+// id, reported "any does not hold a value compatible with the requested type",
+// returned 0 with an exception set, and `opAssign(any&in)` in particular wrote
+// through a bogus `this`. That is the crash `script_smoke` hit in
+// CheckAnyOperators/CheckAnyTypeFull, and why ++/+=/%/** "did not work".
+//
+// The parameter ORDER is now `(..., CScriptAny *self)` throughout. For the
+// reverse (number-on-the-left) operators the declared operand is the LHS and
+// `self` is the RHS, exactly as before — only the position changed.
+//------------------------------------------------------------------------
 
 // --- opConv (value-returning) ---
 static asINT64 ScriptAny_opConvInt_Native(CScriptAny *self)
@@ -725,21 +744,23 @@ static double ScriptAny_opConvDouble_Native(CScriptAny *self)
 	return d;
 }
 
-// --- Arithmetic: any OP number (asCALL_CDECL_OBJLAST: fn(self, arg)) ---
-// The `_Generic` versions inspect argTypeId at runtime, but the native
-// path receives a typed argument directly. We keep two native overloads:
-// one for double, one for const int64&in. For (const any &in) we delegate
-// to the Generic handler (rare, and the arg is an object pointer anyway).
-
-// Macro for arithmetic: any OP typed-number.
+// --- Arithmetic: `any OP number` — declared `opAdd(double)` / `opAdd(const
+// int64&in)`, then the object pointer, so the wrapper's parameter order is
+// (number, self). ---
+// ⚠ ORGLIN: the `const int64&in` overload takes a C++ REFERENCE, not a value.
+// An `&in` parameter is passed as a POINTER (`ScriptWeakRefConstruct(asITypeInfo
+// *type, ...)` for `"void f(int&in)"` upstream, `GetArgAddress()` in the generic
+// API), so a by-value `asINT64` parameter would receive the ADDRESS truncated to
+// 64 bits and the arithmetic would run on a pointer. The by-value `double`
+// overload is genuinely by value and stays so.
 #define ORGLIN_ANY_NATIVE_ARITH(NAME, OP)                                        \
-static double ScriptAny_##NAME##_NativeDbl(CScriptAny *self, double rhs)         \
+static double ScriptAny_##NAME##_NativeDbl(double rhs, CScriptAny *self)         \
 {                                                                                \
 	double lhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }  \
 	return lhs OP rhs;                                                           \
 }                                                                                \
-static double ScriptAny_##NAME##_NativeI64(CScriptAny *self, asINT64 rhs)        \
+static double ScriptAny_##NAME##_NativeI64(const asINT64 &rhs, CScriptAny *self)\
 {                                                                                \
 	double lhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }  \
@@ -751,17 +772,17 @@ ORGLIN_ANY_NATIVE_ARITH(opSub, -)
 ORGLIN_ANY_NATIVE_ARITH(opMul, *)
 ORGLIN_ANY_NATIVE_ARITH(opDiv, /)
 
-// --- Reverse arithmetic: number OP any (asCALL_CDECL_OBJLAST: fn(self, arg)) ---
-// self is the `any` (RHS in the script expression), arg is the number (LHS).
-// We read `self` as the RHS and the argument as the LHS.
+// --- Reverse arithmetic: `number OP any` (`opAdd_r` and friends) ---
+// The declared operand is the number and it is the LHS of the expression; `self`
+// is the `any` on the right, so it is read as the RHS.
 #define ORGLIN_ANY_NATIVE_ARITH_R(NAME, OP)                                      \
-static double ScriptAny_##NAME##_r_NativeDbl(CScriptAny *self, double lhs)       \
+static double ScriptAny_##NAME##_r_NativeDbl(double lhs, CScriptAny *self)       \
 {                                                                                \
 	double rhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }  \
 	return lhs OP rhs;                                                           \
 }                                                                                \
-static double ScriptAny_##NAME##_r_NativeI64(CScriptAny *self, asINT64 lhs)      \
+static double ScriptAny_##NAME##_r_NativeI64(const asINT64 &lhs, CScriptAny *self)\
 {                                                                                \
 	double rhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }  \
@@ -774,57 +795,57 @@ ORGLIN_ANY_NATIVE_ARITH_R(opMul, *)
 ORGLIN_ANY_NATIVE_ARITH_R(opDiv, /)
 
 // Special cases: pow (no C++ operator) and mod (fmod).
-static double ScriptAny_opPow_NativeDbl(CScriptAny *self, double rhs)
+static double ScriptAny_opPow_NativeDbl(double rhs, CScriptAny *self)
 {
 	double lhs = 0;
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
 	return pow(lhs, rhs);
 }
-static double ScriptAny_opPow_NativeI64(CScriptAny *self, asINT64 rhs)
+static double ScriptAny_opPow_NativeI64(const asINT64 &rhs, CScriptAny *self)
 {
 	double lhs = 0;
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
 	return pow(lhs, (double)rhs);
 }
-static double ScriptAny_opMod_NativeDbl(CScriptAny *self, double rhs)
+static double ScriptAny_opMod_NativeDbl(double rhs, CScriptAny *self)
 {
 	double lhs = 0;
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
 	return fmod(lhs, rhs);
 }
-static double ScriptAny_opMod_NativeI64(CScriptAny *self, asINT64 rhs)
+static double ScriptAny_opMod_NativeI64(const asINT64 &rhs, CScriptAny *self)
 {
 	double lhs = 0;
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return 0; }
 	return fmod(lhs, (double)rhs);
 }
 
-static double ScriptAny_opPow_r_NativeDbl(CScriptAny *self, double lhs)
+static double ScriptAny_opPow_r_NativeDbl(double lhs, CScriptAny *self)
 {
 	double rhs = 0;
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
 	return pow(lhs, rhs);
 }
-static double ScriptAny_opPow_r_NativeI64(CScriptAny *self, asINT64 lhs)
+static double ScriptAny_opPow_r_NativeI64(const asINT64 &lhs, CScriptAny *self)
 {
 	double rhs = 0;
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
 	return pow((double)lhs, rhs);
 }
-static double ScriptAny_opMod_r_NativeDbl(CScriptAny *self, double lhs)
+static double ScriptAny_opMod_r_NativeDbl(double lhs, CScriptAny *self)
 {
 	double rhs = 0;
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
 	return fmod(lhs, rhs);
 }
-static double ScriptAny_opMod_r_NativeI64(CScriptAny *self, asINT64 lhs)
+static double ScriptAny_opMod_r_NativeI64(const asINT64 &lhs, CScriptAny *self)
 {
 	double rhs = 0;
 	if( !ScriptAnyAsDouble(self, rhs) ) { ScriptAny_CastFail(self); return 0; }
 	return fmod((double)lhs, rhs);
 }
 
-// --- opNeg (unary minus, no argument besides self) ---
+// --- opNeg (unary minus, no declared parameter — only the object pointer) ---
 static double ScriptAny_opNeg_Native(CScriptAny *self)
 {
 	double v = 0;
@@ -832,24 +853,18 @@ static double ScriptAny_opNeg_Native(CScriptAny *self)
 	return -v;
 }
 
-// --- Compound assignment: any OP= number (asCALL_CDECL_OBJLAST) ---
-// Returns self& (by pointer through return-object pointer).  We cannot use
-// C++ return because AS wants the result through the return slot; instead
-// we set it through the return pointer that AS passes.  But for
-// asCALL_CDECL_OBJLAST, the return is via the normal C++ return — we
-// return a pointer that AS stores.  Actually: for `any &opAddAssign(double)`
-// the return is `any &`, so the native function returns a CScriptAny* and
-// AS dereferences it.  Let me check... No: for asCALL_CDECL_OBJLAST the
-// return is the actual C++ return value. For a reference return we need
-// to return the pointer and AS will treat it as a reference.
+// --- Compound assignment: `any OP= number` ---
+// Declared `any &opAddAssign(double)`: the operand first, `self` last.
 //
-// Actually, looking at the registration declaration:
-//   "any &opAddAssign(double)" -> return type is `any &`
-// With asCALL_CDECL_OBJLAST the handler's C++ return type must match.
-// A `CScriptAny*` return is interpreted as the object address for the
-// reference return.
+// The `any &` return is a REFERENCE, and AngelScript returns a reference as a
+// plain pointer in the return register (`as_callfunc.cpp`: for
+// `returnType.IsReference()` it sets `hostReturnInMemory = false` and
+// `hostReturnSize = sizeof(void*)/4`) — there is NO hidden return pointer. So the
+// handler returns the object address as a pointer, which is what `return self`
+// does. (`ScriptObject_Assignment` is the same shape: it takes the operand and
+// `self`, and returns `*self`.)
 #define ORGLIN_ANY_NATIVE_OPASSIGN(NAME, EXPR)                                  \
-static CScriptAny* ScriptAny_##NAME##_NativeDbl(CScriptAny *self, double rhs)    \
+static CScriptAny* ScriptAny_##NAME##_NativeDbl(double rhs, CScriptAny *self)    \
 {                                                                                \
 	double lhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return self; }\
@@ -857,7 +872,8 @@ static CScriptAny* ScriptAny_##NAME##_NativeDbl(CScriptAny *self, double rhs)   
 	self->Store(next);                                                           \
 	return self;                                                                 \
 }                                                                                \
-static CScriptAny* ScriptAny_##NAME##_NativeI64(CScriptAny *self, asINT64 rhs)   \
+static CScriptAny* ScriptAny_##NAME##_NativeI64(const asINT64 &rhs,             \
+                                                CScriptAny *self)        \
 {                                                                                \
 	double lhs = 0;                                                               \
 	if( !ScriptAnyAsDouble(self, lhs) ) { ScriptAny_CastFail(self); return self; }\
@@ -872,7 +888,9 @@ ORGLIN_ANY_NATIVE_OPASSIGN(opMulAssign, lhs * rhs)
 ORGLIN_ANY_NATIVE_OPASSIGN(opDivAssign, lhs / rhs)
 ORGLIN_ANY_NATIVE_OPASSIGN(opModAssign, fmod(lhs, rhs))
 
-// --- Inc/Dec (no argument besides self) ---
+// --- Inc/Dec (`x++`, `--x`) ---
+// No declared parameter, so the object pointer is the only argument — the order
+// was already right here; the bug was only in the operators that take an operand.
 static CScriptAny* ScriptAny_opPreInc_Native(CScriptAny *self)
 {
 	int typeId = self->GetTypeId();
@@ -896,9 +914,8 @@ static CScriptAny* ScriptAny_opPreInc_Native(CScriptAny *self)
 
 static CScriptAny* ScriptAny_opPostInc_Native(CScriptAny *self)
 {
-	// Post-increment: same as pre (value changes, return is the old value for
-	// script but AS handles this via the return convention). The Generic version
-	// returns self in both cases; we follow suit.
+	// Post-increment: same as pre. AngelScript handles the "old value is the
+	// expression result" part itself; the wrapper only performs the step.
 	return ScriptAny_opPreInc_Native(self);
 }
 
@@ -929,7 +946,7 @@ static CScriptAny* ScriptAny_opPostDec_Native(CScriptAny *self)
 }
 
 // --- opEquals / opNotEquals (native) ---
-static bool ScriptAny_opEqualsAny_Native(CScriptAny *self, CScriptAny *other)
+static bool ScriptAny_opEqualsAny_Native(CScriptAny *other, CScriptAny *self)
 {
 	double a = 0, b = 0;
 	bool okA = ScriptAnyAsDouble(self, a);
@@ -937,33 +954,33 @@ static bool ScriptAny_opEqualsAny_Native(CScriptAny *self, CScriptAny *other)
 	return okA && okB && a == b;
 }
 
-static bool ScriptAny_opEqualsNumDbl_Native(CScriptAny *self, double rhs)
+static bool ScriptAny_opEqualsNumDbl_Native(double rhs, CScriptAny *self)
 {
 	double a = 0;
 	bool okA = ScriptAnyAsDouble(self, a);
 	return okA && a == rhs;
 }
 
-static bool ScriptAny_opEqualsNumI64_Native(CScriptAny *self, asINT64 rhs)
+static bool ScriptAny_opEqualsNumI64_Native(const asINT64 &rhs, CScriptAny *self)
 {
 	double a = 0;
 	bool okA = ScriptAnyAsDouble(self, a);
 	return okA && a == (double)rhs;
 }
 
-static bool ScriptAny_opNotEqualsAny_Native(CScriptAny *self, CScriptAny *other)
+static bool ScriptAny_opNotEqualsAny_Native(CScriptAny *other, CScriptAny *self)
 {
-	return !ScriptAny_opEqualsAny_Native(self, other);
+	return !ScriptAny_opEqualsAny_Native(other, self);
 }
 
-static bool ScriptAny_opNotEqualsNumDbl_Native(CScriptAny *self, double rhs)
+static bool ScriptAny_opNotEqualsNumDbl_Native(double rhs, CScriptAny *self)
 {
-	return !ScriptAny_opEqualsNumDbl_Native(self, rhs);
+	return !ScriptAny_opEqualsNumDbl_Native(rhs, self);
 }
 
-static bool ScriptAny_opNotEqualsNumI64_Native(CScriptAny *self, asINT64 rhs)
+static bool ScriptAny_opNotEqualsNumI64_Native(const asINT64 &rhs, CScriptAny *self)
 {
-	return !ScriptAny_opEqualsNumI64_Native(self, rhs);
+	return !ScriptAny_opEqualsNumI64_Native(rhs, self);
 }
 
 //------------------------------------------------------------------------
