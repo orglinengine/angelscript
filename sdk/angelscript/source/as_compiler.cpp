@@ -100,6 +100,8 @@ asCCompiler::asCCompiler(asCScriptEngine *_engine) : byteCode(_engine)
 	isCompilingDefaultArg      = false;
 	isProcessingDeferredParams = false;
 	noCodeOutput               = 0;
+	m_initTargetValues.SetLength(0);
+	m_initTargetNodes.SetLength(0);
 }
 
 asCCompiler::~asCCompiler()
@@ -147,6 +149,8 @@ void asCCompiler::Reset(asCBuilder *in_builder, asCScriptCode *in_script, asCScr
 	byteCode.ClearAll();
 	m_initializedProperties.SetLength(0);
 	m_propertyAccessCount.EraseAll();
+	m_initTargetValues.SetLength(0);
+	m_initTargetNodes.SetLength(0);
 }
 
 int asCCompiler::CompileDefaultCopyConstructor(asCBuilder* in_builder, asCScriptCode* in_script, asCScriptNode* in_node, asCScriptFunction* in_outFunc, sClassDeclaration* in_classDecl)
@@ -3440,6 +3444,13 @@ bool asCCompiler::CompileInitialization(asCScriptNode *node, asCByteCode *bc, co
 					asDELETE(namedArgs[n].ctx, asCExprContext);
 		}
 	}
+	else if( node && node->nodeType == snInitBlock )
+	{
+		// ORGLIN (ADR-0032): `Expr { name = value, ... }` — a constructing expression
+		// followed by a block that configures the object it produced. The block's value is
+		// that same object.
+		return CompileInitializerBlock(node, bc, type, errNode, offset, constantValue, isVarGlobOrMem);
+	}
 	else if( node && node->nodeType == snInitList )
 	{
 		// ORGLIN (ADR-0011): a `{ ... }` literal initialising an `any` is a
@@ -3919,6 +3930,124 @@ bool asCCompiler::CompileInitializationWithAssignment(asCByteCode* bc, const asC
 	}
 
 	return isConstantExpression;
+}
+
+// ORGLIN (ADR-0032): `Expr { name = value, ... }` — a constructing expression followed by a
+// block that configures the object it produced. The block evaluates to that same object.
+//
+// The base is built first, then each entry is compiled as a member assignment on it. A
+// local destination IS the target, so the object is built in place. A global or class-member
+// destination is built in a hidden local first — the entries need an addressable lvalue —
+// and the local is then written to the real destination by the ordinary assignment path.
+// That keeps this function small and leaves global/member bookkeeping to the code that
+// already handles all three destination kinds.
+bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem)
+{
+	asASSERT(node->nodeType == snInitBlock);
+
+	bool direct = (isVarGlobOrMem == asVGM_VARIABLE);
+	int targetOffset = direct ? offset : AllocateVariable(type, true);
+
+	// Build the object. A block is never a constant expression, so no constant value is read.
+	CompileInitialization(node->firstChild, bc, type, errNode, targetOffset, 0, asVGM_VARIABLE, 0);
+
+	// The lvalue every entry's member access starts from. It is always a local — the real
+	// variable for a local declaration, the hidden temp otherwise — so `PSF offset` addresses
+	// it exactly the way a local object variable is addressed (see CompileVariableAccess).
+	asCExprValue target;
+	target.SetVariable(type, targetOffset, !direct);
+	target.isLValue = true;
+	if( IsVariableOnHeap(targetOffset) || type.IsObjectHandle() )
+		target.dataType.MakeReference(true);
+	if( !type.IsObjectHandle() )
+		target.isRefSafe = true;
+
+	m_initTargetValues.PushLast(&target);
+	m_initTargetNodes.PushLast(0);
+
+	CompileInitializerEntries(node, bc);
+
+	m_initTargetValues.PopLast();
+	m_initTargetNodes.PopLast();
+
+	if( direct )
+		return false;
+
+	// Write the configured object into the real destination, then release the temp.
+	asCExprContext tempExpr(engine);
+	tempExpr.bc.InstrSHORT(asBC_PSF, (short)targetOffset);
+	tempExpr.type.SetVariable(type, targetOffset, false);
+	if( IsVariableOnHeap(targetOffset) || type.IsObjectHandle() )
+		tempExpr.type.dataType.MakeReference(true);
+
+	bool ok = CompileInitializationWithAssignment(bc, type, errNode, offset, constantValue, isVarGlobOrMem, node, &tempExpr);
+	ReleaseTemporaryVariable(targetOffset, bc);
+	return ok;
+}
+
+// ORGLIN (ADR-0032): compile a block's entries, in order, against the innermost target frame
+// (pushed by CompileInitializerBlock or by a nested entry below).
+void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc)
+{
+	asCScriptNode *entry = block->firstChild->next;  // firstChild is the base expression
+	while( entry )
+	{
+		if( entry->nodeType == snAssignment )
+		{
+			asCScriptNode *lhsNode = entry->firstChild;
+			asCScriptNode *opNode  = lhsNode ? lhsNode->next : 0;
+			asCScriptNode *rhsNode = opNode ? opNode->next : 0;
+
+			if( rhsNode && rhsNode->nodeType == snInitBlock )
+			{
+				// A NESTED block: build the child, bind it to the member, and make that
+				// member the target for the child's own entries.
+				asCExprContext lctx(engine), rctx(engine);
+				int lr = CompileCondition(lhsNode, &lctx);
+				int rr = CompileAssignment(rhsNode->firstChild, &rctx);
+				if( lr >= 0 && rr >= 0 )
+				{
+					asCExprContext assigned(engine);
+					DoAssignment(&assigned, &lctx, &rctx, lhsNode, rhsNode->firstChild,
+								 opNode ? opNode->tokenType : ttAssignment, opNode);
+					FinishInitializerEntry(&assigned, entry, bc);
+				}
+
+				m_initTargetValues.PushLast(0);
+				m_initTargetNodes.PushLast(lhsNode);
+				CompileInitializerEntries(rhsNode, bc);
+				m_initTargetValues.PopLast();
+				m_initTargetNodes.PopLast();
+			}
+			else
+			{
+				asCExprContext e(engine);
+				if( CompileAssignment(entry, &e) >= 0 )
+					FinishInitializerEntry(&e, entry, bc);
+			}
+		}
+		else
+			Error("Unsupported initializer entry", entry);
+		entry = entry->next;
+	}
+}
+
+// ORGLIN (ADR-0032): an entry behaves like an expression STATEMENT — its result is discarded,
+// so the value it left on the stack is popped and its temporaries released. Without this the
+// optimiser trips over an unbalanced stack.
+void asCCompiler::FinishInitializerEntry(asCExprContext *e, asCScriptNode *node, asCByteCode *bc)
+{
+	if( !hasCompileErrors )
+		if( ProcessPropertyGetAccessor(e, node) < 0 )
+			return;
+
+	if( !e->type.dataType.IsPrimitive() )
+		e->bc.Instr(asBC_PopPtr);
+
+	ReleaseTemporaryVariable(e->type, &e->bc);
+	ProcessDeferredParams(e);
+	e->bc.OptimizeLocally(tempVariableOffsets);
+	bc->AddCode(&e->bc);
 }
 
 void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem)
@@ -12540,6 +12669,35 @@ int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx
 		asCString name(&script->code[vnode->tokenPos], vnode->tokenLength);
 
 		return CompileVariableAccess(name, scope, ctx, node);
+	}
+	else if( vnode->nodeType == snInitTarget )
+	{
+		// ORGLIN (ADR-0032): the object the innermost initializer block is configuring. Each
+		// entry is `<target>.name = value`, so this plays the role of the local variable at
+		// the base of an ordinary member access.
+		asUINT n = m_initTargetValues.GetLength();
+		if( n == 0 )
+		{
+			Error("Initializer target used outside an initializer block", node);
+			ctx->type.SetDummy();
+			return -1;
+		}
+		asCScriptNode *targetNode = m_initTargetNodes[n-1];
+		if( targetNode )
+		{
+			// A nested block's target is the member expression it was bound to (e.g.
+			// `outer.backdrop`), which itself names the target BELOW it. Resolving it with
+			// the current frame popped is what makes nesting recurse correctly.
+			m_initTargetValues.PopLast();
+			m_initTargetNodes.PopLast();
+			int r = CompileCondition(targetNode, ctx);
+			m_initTargetValues.PushLast(0);
+			m_initTargetNodes.PushLast(targetNode);
+			return r;
+		}
+		asCExprValue *target = m_initTargetValues[n-1];
+		ctx->bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
+		ctx->type = *target;
 	}
 	else if( vnode->nodeType == snConstant )
 	{

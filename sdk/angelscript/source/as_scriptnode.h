@@ -96,7 +96,9 @@ enum eScriptNode
 	snNamedArgument,
 	snScope,
 	snTryCatch,
-	snDictionaryKey  // ORGLIN (ADR-0011): the key of a `{ key = value }` list entry
+	snDictionaryKey,  // ORGLIN (ADR-0011): the key of a `{ key = value }` list entry
+	snInitBlock,      // ORGLIN (ADR-0032): `Expr { name = value, ... }` — children: [base, entry...]
+	snInitTarget      // ORGLIN (ADR-0032): leaf value meaning "the object a block is initializing"
 };
 
 struct sToken

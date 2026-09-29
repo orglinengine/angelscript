@@ -499,6 +499,7 @@ public:
 		bool   implicitHandleClasses;		// ORGLIN: script classes are implicit-handle
 		bool   bracketListLiterals;			// ORGLIN: `[ ... ]` allowed as a list literal
 		bool   dictionaryLiterals;			// ORGLIN: `{ key = value }` list literal entries
+		bool   initializerBlocks;				// ORGLIN: `{ ... }` initializer block after a constructor
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;

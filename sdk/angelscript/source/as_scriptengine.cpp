@@ -350,6 +350,11 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.dictionaryLiterals = value ? true : false;
 		break;
 
+	// ORGLIN: the initializer block — `Expr(args) { k = v }` (ADR-0031 §2.4, ADR-0032).
+	case asEP_INITIALIZER_BLOCKS:
+		ep.initializerBlocks = value ? true : false;
+		break;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		ep.buildWithoutLineCues = value ? true : false;
 		break;
@@ -570,6 +575,10 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_DICTIONARY_LITERALS:
 		return ep.dictionaryLiterals;
 
+	// ORGLIN: initializer blocks.
+	case asEP_INITIALIZER_BLOCKS:
+		return ep.initializerBlocks;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		return ep.buildWithoutLineCues;
 
@@ -713,6 +722,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.implicitHandleClasses         = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.bracketListLiterals           = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.dictionaryLiterals            = false;	// ORGLIN: off by default (language stays unchanged)
+		ep.initializerBlocks             = false;	// ORGLIN: off by default (language stays unchanged)
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
 		ep.buildWithoutLineCues          = false;

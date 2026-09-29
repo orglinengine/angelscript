@@ -207,6 +207,12 @@ enum asEEngineProp
 	// upstream pair spelling `{ {"a", 1} }` keeps working.
 	asEP_DICTIONARY_LITERALS                = 44,
 
+	// ORGLIN: the INITIALIZER BLOCK — the `{ ... }` that immediately follows a
+	// constructing expression, e.g. `backdrop = ColorRect(...) { visible = false }`.
+	// It constructs the object, then applies the block's entries to it (ADR-0031 §2.4,
+	// ADR-0032). Off by default: the language stays unchanged unless asked for.
+	asEP_INITIALIZER_BLOCKS                 = 45,
+
 	asEP_LAST_PROPERTY
 };
 

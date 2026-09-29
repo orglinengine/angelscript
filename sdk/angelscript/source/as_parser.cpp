@@ -3961,7 +3961,8 @@ int asCParser::ParseVarInit(asCScriptCode *in_script, asCScriptNode *in_init)
 			(t.type == ttOpenBracket && engine->ep.bracketListLiterals) )
 			scriptNode = ParseInitList();
 		else
-			scriptNode = ParseAssignment();
+			// ORGLIN (ADR-0032): the initializer may be followed by an initializer block.
+			scriptNode = ParseBindingValue();
 	}
 	else if( t.type == ttOpenParenthesis)
 	{
@@ -4451,6 +4452,191 @@ asCScriptNode *asCParser::ParseInitListElement(eTokenType openType)
 	return pair;
 }
 
+// ORGLIN (ADR-0032): a constructing expression may be followed by an INITIALIZER BLOCK —
+// `Expr { name = value, ... }` — in a binding position (a declaration initializer, a
+// nested entry). The block configures the object the expression produced and evaluates to
+// that same object, so the whole thing is a value.
+//
+// Each entry is compiled as an ordinary member assignment on that object. The parser
+// rewrites the entry's left-hand side from a bare `name` into `<target>.name`, where
+// `<target>` is a snInitTarget leaf the compiler binds to the object being initialized
+// (see asCCompiler::CompileExpressionValue). The rewrite reuses the AUTHORED name token,
+// so diagnostics and the LSP land on the name the author wrote — which is the whole
+// reason this construct lives in the parser/compiler and not in a text pre-pass.
+asCScriptNode *asCParser::ParseBindingValue()
+{
+	asCScriptNode *expr = ParseAssignment();
+	if( isSyntaxError ) return expr;
+
+	// The gate (ADR-0010): off by default, turned on by script::applyLanguageProperties.
+	if( !engine->ep.initializerBlocks )
+		return expr;
+
+	sToken t;
+	GetToken(&t);
+	RewindTo(&t);
+	if( t.type != ttStartStatementBlock )
+		return expr;
+
+	// `{` begins a block here only when the expression is a CONSTRUCTING one. A bare
+	// variable followed by `{` is left untouched, so an ordinary block statement is not
+	// silently swallowed (ADR-0032 §2.9 item 1).
+	if( !IsConstructingExpression(expr) )
+		return expr;
+
+	return ParseInitBlock(expr);
+}
+
+// ORGLIN (ADR-0032): the `{ ... }` body of an initializer block.
+asCScriptNode *asCParser::ParseInitBlock(asCScriptNode *base)
+{
+	asCScriptNode *node = CreateNode(snInitBlock);
+	if( node == 0 ) return 0;
+
+	node->AddChildLast(base);
+
+	sToken t;
+	GetToken(&t);
+	if( t.type != ttStartStatementBlock )
+	{
+		Error(ExpectedToken("{"), &t);
+		Error(InsteadFound(t), &t);
+		return node;
+	}
+	node->UpdateSourcePos(t.pos, t.length);
+
+	GetToken(&t);
+	if( t.type == ttEndStatementBlock )
+	{
+		// An empty block is legal — a type with no members is a no-op (ADR-0032 §2.10).
+		node->UpdateSourcePos(t.pos, t.length);
+		return node;
+	}
+	RewindTo(&t);
+
+	for(;;)
+	{
+		node->AddChildLast(ParseInitBlockEntry());
+		if( isSyntaxError ) return node;
+
+		GetToken(&t);
+		if( t.type == ttListSeparator )
+			continue;
+		else if( t.type == ttEndStatementBlock )
+		{
+			node->UpdateSourcePos(t.pos, t.length);
+			return node;
+		}
+		else
+		{
+			// `,` is mandatory, exactly like a dictionary literal — one separator rule
+			// everywhere (ADR-0032 §2.1).
+			Error(ExpectedTokens("}", ","), &t);
+			Error(InsteadFound(t), &t);
+			return node;
+		}
+	}
+	UNREACHABLE_RETURN;
+}
+
+// ORGLIN (ADR-0032): one entry of an initializer block: `name = value`, where `value` may
+// itself be a nested initializer block. Anything else is a clear diagnostic rather than a
+// silent mis-parse.
+asCScriptNode *asCParser::ParseInitBlockEntry()
+{
+	sToken start;
+	GetToken(&start);
+	RewindTo(&start);
+
+	// `name`
+	asCScriptNode *ident = ParseIdentifier();
+	if( isSyntaxError ) return ident;
+
+	// `=`
+	sToken op;
+	GetToken(&op);
+	if( op.type != ttAssignment )
+	{
+		Error("An initializer entry must be written as `name = value`", &start);
+		Error(InsteadFound(op), &op);
+		return ident;
+	}
+
+	// `value` — an ordinary expression, or a nested initializer block.
+	asCScriptNode *value = ParseBindingValue();
+	if( isSyntaxError ) return value;
+
+	// Build `EXPRTERM > [ EXPRVALUE > INIT_TARGET, EXPRPOSTOP('.') > name ]` — the exact
+	// shape the parser produces for `obj.name`, so the compiler reuses its ordinary member
+	// access for the entry and only the base is new.
+	asCScriptNode *targetLeaf = CreateNode(snInitTarget);
+	asCScriptNode *targetValue = CreateNode(snExprValue);
+	asCScriptNode *postOp = CreateNode(snExprPostOp);
+	asCScriptNode *term = CreateNode(snExprTerm);
+	asCScriptNode *expr = CreateNode(snExpression);
+	asCScriptNode *cond = CreateNode(snCondition);
+	asCScriptNode *opNode = CreateNode(snExprOperator);
+	asCScriptNode *newEntry = CreateNode(snAssignment);
+	if( targetLeaf == 0 || targetValue == 0 || postOp == 0 || term == 0 ||
+		expr == 0 || cond == 0 || opNode == 0 || newEntry == 0 )
+		return ident;
+
+	targetLeaf->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
+	targetValue->AddChildLast(targetLeaf);
+	targetValue->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
+
+	postOp->tokenType = ttDot;
+	postOp->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
+	postOp->AddChildLast(ident);
+
+	term->AddChildLast(targetValue);
+	term->AddChildLast(postOp);
+	expr->AddChildLast(term);
+	cond->AddChildLast(expr);
+
+	opNode->tokenType = ttAssignment;
+	opNode->UpdateSourcePos(op.pos, op.length);
+
+	newEntry->AddChildLast(cond);
+	newEntry->AddChildLast(opNode);
+	newEntry->AddChildLast(value);
+	newEntry->UpdateSourcePos(start.pos, start.length);
+
+	return newEntry;
+}
+
+// ORGLIN (ADR-0032): true when an expression produces a constructed object — i.e. it ends
+// in a call (`T(...)`, `f(...)`, `obj.method(...)`). This is what tells an initializer
+// block apart from a bare block statement that merely follows an expression.
+bool asCParser::IsConstructingExpression(asCScriptNode *expr)
+{
+	// expr is an snAssignment from ParseAssignment; a plain expression has one child.
+	asCScriptNode *n = expr;
+	while( n->firstChild && n->firstChild->next == 0 &&
+		   (n->nodeType == snAssignment || n->nodeType == snCondition || n->nodeType == snExpression) )
+		n = n->firstChild;
+
+	if( n->nodeType != snExprTerm || n->firstChild == 0 )
+		return false;
+
+	asCScriptNode *v = n->firstChild;
+	if( v->nodeType == snExprValue )
+		v = v->firstChild;
+	if( v == 0 )
+		return false;
+
+	if( v->nodeType == snFunctionCall || v->nodeType == snConstructCall )
+		return true;
+
+	// `obj.method(...)`: the call is a post-op on the value node.
+	for( asCScriptNode *p = v->next; p; p = p->next )
+		if( p->nodeType == snExprPostOp && p->firstChild &&
+			p->firstChild->nodeType == snFunctionCall )
+			return true;
+
+	return false;
+}
+
 // BNF:1: VAR           ::= ('private'|'protected')? TYPE IDENTIFIER (( '=' (INITLIST | EXPR)) | ARGLIST)? (',' IDENTIFIER (( '=' (INITLIST | EXPR)) | ARGLIST)?)* ';'
 asCScriptNode *asCParser::ParseDeclaration(bool isClassProp, bool isGlobalVar)
 {
@@ -4511,7 +4697,9 @@ asCScriptNode *asCParser::ParseDeclaration(bool isClassProp, bool isGlobalVar)
 				}
 				else
 				{
-					node->AddChildLast(ParseAssignment());
+					// ORGLIN (ADR-0032): the initializer may be followed by an
+					// initializer block, `Type name = Expr { ... }`.
+					node->AddChildLast(ParseBindingValue());
 					if( isSyntaxError ) return node;
 				}
 			}
@@ -4610,6 +4798,17 @@ asCScriptNode *asCParser::ParseExpressionStatement()
 	if( isSyntaxError ) return node;
 
 	GetToken(&t);
+	// ORGLIN (ADR-0032): a `{` after a constructing expression in a STATEMENT position is a
+	// misplaced initializer block, not a block statement (there is no receiver to attach to
+	// and no name to be reached by). Say so plainly, instead of letting it parse as a block
+	// and then failing on an undeclared name inside it.
+	if( t.type == ttStartStatementBlock && engine->ep.initializerBlocks &&
+		IsConstructingExpression(node->firstChild) )
+	{
+		Error("An initializer block is only allowed where a value is bound "
+			  "(a declaration initializer or an entry), not as a standalone statement", &t);
+		return node;
+	}
 	// ORGLIN: a line break (or the enclosing '}') also terminates the statement
 	// (see OptionalStatementTerminatorIsNewLine).
 	if( t.type == ttEndStatement )

@@ -316,6 +316,10 @@ protected:
 	int  CompileOverloadedDualOperator2(asCScriptNode *node, const char *methodName, asCExprContext *l, asCExprContext *r, bool leftToRight, asCExprContext *out, bool specificReturn = false, const asCDataType &returnType = asCDataType::CreatePrimitive(ttVoid, false));
 
 	void CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);
+	// ORGLIN (ADR-0032): `Expr { name = value, ... }` and the entries within it.
+	bool CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem);
+	void CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc);
+	void FinishInitializerEntry(asCExprContext *e, asCScriptNode *node, asCByteCode *bc);
 	int  CompileInitListElement(asSListPatternNode *&patternNode, asCScriptNode *&valueNode, int bufferTypeId, short bufferVar, asUINT &bufferSize, asCByteCode &byteCode, int &elementsInSubList);
 	int  CompileDictionaryKey(asCScriptNode *keyNode, asCByteCode *bc);
 	static bool IsDictionaryList(asCScriptNode *listNode);
@@ -496,6 +500,14 @@ protected:
 	bool isCompilingDefaultArg;
 	bool isProcessingDeferredParams;
 	int  noCodeOutput;
+
+	// ORGLIN (ADR-0032): the object each in-scope initializer block's entries are applied to,
+	// one frame per nesting level. A frame is EITHER a local value (the declaration's slot, or
+	// a hidden temp — `m_initTargetValues`) OR a member EXPRESSION the block was bound to by a
+	// nested entry (`m_initTargetNodes`), which is compiled against the frame below it. An
+	// `snInitTarget` leaf resolves to the innermost frame, so nesting is pure recursion.
+	asCArray<asCExprValue *>  m_initTargetValues;
+	asCArray<asCScriptNode *> m_initTargetNodes;
 };
 
 END_AS_NAMESPACE

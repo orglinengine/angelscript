@@ -132,6 +132,12 @@ protected:
 	asCScriptNode *ParseMixin();
 	asCScriptNode *ParseInitList();
 	asCScriptNode *ParseInitListElement(eTokenType openType);
+	// ORGLIN (ADR-0032): initializer blocks — `Expr { name = value, ... }` after a
+	// constructing expression, in a binding position.
+	asCScriptNode *ParseBindingValue();
+	asCScriptNode *ParseInitBlock(asCScriptNode *base);
+	asCScriptNode *ParseInitBlockEntry();
+	bool IsConstructingExpression(asCScriptNode *expr);
 	asCScriptNode *ParseInterface();
 	asCScriptNode *ParseInterfaceMethod();
 	asCScriptNode *ParseVirtualPropertyDecl(bool isMethod, bool isInterface);
