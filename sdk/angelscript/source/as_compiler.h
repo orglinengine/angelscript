@@ -318,6 +318,7 @@ protected:
 	void CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);
 	// ORGLIN (ADR-0032): `Expr { name = value, ... }` and the entries within it.
 	bool CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem);
+	int  CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode);
 	void CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc);
 	void FinishInitializerEntry(asCExprContext *e, asCScriptNode *node, asCByteCode *bc);
 	int  CompileInitListElement(asSListPatternNode *&patternNode, asCScriptNode *&valueNode, int bufferTypeId, short bufferVar, asUINT &bufferSize, asCByteCode &byteCode, int &elementsInSubList);

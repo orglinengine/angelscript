@@ -137,6 +137,7 @@ protected:
 	asCScriptNode *ParseBindingValue();
 	asCScriptNode *ParseInitBlock(asCScriptNode *base);
 	asCScriptNode *ParseInitBlockEntry();
+	asCScriptNode *BuildInitTargetMember(asCScriptNode *member);
 	bool IsConstructingExpression(asCScriptNode *expr);
 	asCScriptNode *ParseInterface();
 	asCScriptNode *ParseInterfaceMethod();

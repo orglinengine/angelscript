@@ -2114,10 +2114,12 @@ asCScriptNode *asCParser::ParseArgList(bool withParenthesis)
 				if( engine->ep.alterSyntaxNamedArgs == 1 && t2.type == ttAssignment )
 					Warning(TXT_NAMED_ARGS_WITH_OLD_SYNTAX, &t2);
 
-				named->AddChildLast(ParseAssignment());
+				// ORGLIN (ADR-0032): an argument value may be an initializer block.
+				named->AddChildLast(ParseBindingValue());
 			}
 			else
-				node->AddChildLast(ParseAssignment());
+				// ORGLIN (ADR-0032): an argument value may be an initializer block.
+				node->AddChildLast(ParseBindingValue());
 
 			if( isSyntaxError ) return node;
 
@@ -2209,7 +2211,8 @@ asCScriptNode *asCParser::ParseAssignment()
 		node->AddChildLast(ParseAssignOperator());
 		if( isSyntaxError ) return node;
 
-		node->AddChildLast(ParseAssignment());
+		// ORGLIN (ADR-0032): the right-hand side may be an initializer block.
+		node->AddChildLast(ParseBindingValue());
 		if( isSyntaxError ) return node;
 	}
 
@@ -4521,7 +4524,18 @@ asCScriptNode *asCParser::ParseInitBlock(asCScriptNode *base)
 
 		GetToken(&t);
 		if( t.type == ttListSeparator )
+		{
+			// ORGLIN (ADR-0032): a TRAILING comma contributes nothing, exactly as in the
+			// dictionary and list literals — one separator rule everywhere.
+			GetToken(&t);
+			if( t.type == ttEndStatementBlock )
+			{
+				node->UpdateSourcePos(t.pos, t.length);
+				return node;
+			}
+			RewindTo(&t);
 			continue;
+		}
 		else if( t.type == ttEndStatementBlock )
 		{
 			node->UpdateSourcePos(t.pos, t.length);
@@ -4539,9 +4553,45 @@ asCScriptNode *asCParser::ParseInitBlock(asCScriptNode *base)
 	UNREACHABLE_RETURN;
 }
 
-// ORGLIN (ADR-0032): one entry of an initializer block: `name = value`, where `value` may
-// itself be a nested initializer block. Anything else is a clear diagnostic rather than a
-// silent mis-parse.
+// ORGLIN (ADR-0032): build `EXPRTERM > [ EXPRVALUE > INIT_TARGET, EXPRPOSTOP('.') > member ]`,
+// wrapped as CONDITION > EXPRESSION — the exact shape the parser produces for `obj.member`, so
+// the compiler reuses its ordinary member access and only the BASE is new. `member` is the
+// authored name (or call) node; its position keeps diagnostics on what the author wrote.
+asCScriptNode *asCParser::BuildInitTargetMember(asCScriptNode *member)
+{
+	if( member == 0 ) return 0;
+
+	asCScriptNode *targetLeaf = CreateNode(snInitTarget);
+	asCScriptNode *targetValue = CreateNode(snExprValue);
+	asCScriptNode *postOp = CreateNode(snExprPostOp);
+	asCScriptNode *term = CreateNode(snExprTerm);
+	asCScriptNode *expr = CreateNode(snExpression);
+	asCScriptNode *cond = CreateNode(snCondition);
+	if( targetLeaf == 0 || targetValue == 0 || postOp == 0 || term == 0 ||
+		expr == 0 || cond == 0 )
+		return member;
+
+	targetLeaf->UpdateSourcePos(member->tokenPos, member->tokenLength);
+	targetValue->AddChildLast(targetLeaf);
+	targetValue->UpdateSourcePos(member->tokenPos, member->tokenLength);
+
+	postOp->tokenType = ttDot;
+	postOp->UpdateSourcePos(member->tokenPos, member->tokenLength);
+	postOp->AddChildLast(member);
+
+	term->AddChildLast(targetValue);
+	term->AddChildLast(postOp);
+	expr->AddChildLast(term);
+	cond->AddChildLast(expr);
+	return cond;
+}
+
+// ORGLIN (ADR-0032): one entry of an initializer block. Two forms:
+//
+//   name = value     — assign a member (the value may itself be a nested block)
+//   call(args)       — a CALL on the receiver, e.g. `focus()` / `setSplitOffset(232.0)`
+//
+// Anything else is a clear diagnostic rather than a silent mis-parse.
 asCScriptNode *asCParser::ParseInitBlockEntry()
 {
 	sToken start;
@@ -4552,12 +4602,35 @@ asCScriptNode *asCParser::ParseInitBlockEntry()
 	asCScriptNode *ident = ParseIdentifier();
 	if( isSyntaxError ) return ident;
 
-	// `=`
 	sToken op;
 	GetToken(&op);
+
+	// `call(args)` — the entry is a statement, not an assignment. It compiles to
+	// `target.call(args)`, which is an ordinary call expression.
+	if( op.type == ttOpenParenthesis )
+	{
+		RewindTo(&op);
+
+		asCScriptNode *call = CreateNode(snFunctionCall);
+		if( call == 0 ) return ident;
+		call->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
+		call->AddChildLast(ident);
+		call->AddChildLast(ParseArgList());
+		if( isSyntaxError ) return call;
+
+		asCScriptNode *newEntry = CreateNode(snAssignment);
+		if( newEntry == 0 ) return call;
+
+		// A call entry is an assignment node with a single child, which is exactly how the
+		// compiler reads an expression that is not an assignment.
+		newEntry->AddChildLast(BuildInitTargetMember(call));
+		newEntry->UpdateSourcePos(start.pos, start.length);
+		return newEntry;
+	}
+
 	if( op.type != ttAssignment )
 	{
-		Error("An initializer entry must be written as `name = value`", &start);
+		Error("An initializer entry must be written as `name = value` or `name(args)`", &start);
 		Error(InsteadFound(op), &op);
 		return ident;
 	}
@@ -4566,33 +4639,12 @@ asCScriptNode *asCParser::ParseInitBlockEntry()
 	asCScriptNode *value = ParseBindingValue();
 	if( isSyntaxError ) return value;
 
-	// Build `EXPRTERM > [ EXPRVALUE > INIT_TARGET, EXPRPOSTOP('.') > name ]` — the exact
-	// shape the parser produces for `obj.name`, so the compiler reuses its ordinary member
-	// access for the entry and only the base is new.
-	asCScriptNode *targetLeaf = CreateNode(snInitTarget);
-	asCScriptNode *targetValue = CreateNode(snExprValue);
-	asCScriptNode *postOp = CreateNode(snExprPostOp);
-	asCScriptNode *term = CreateNode(snExprTerm);
-	asCScriptNode *expr = CreateNode(snExpression);
-	asCScriptNode *cond = CreateNode(snCondition);
+	asCScriptNode *cond = BuildInitTargetMember(ident);
+	if( cond == ident ) return ident;
+
 	asCScriptNode *opNode = CreateNode(snExprOperator);
 	asCScriptNode *newEntry = CreateNode(snAssignment);
-	if( targetLeaf == 0 || targetValue == 0 || postOp == 0 || term == 0 ||
-		expr == 0 || cond == 0 || opNode == 0 || newEntry == 0 )
-		return ident;
-
-	targetLeaf->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
-	targetValue->AddChildLast(targetLeaf);
-	targetValue->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
-
-	postOp->tokenType = ttDot;
-	postOp->UpdateSourcePos(ident->tokenPos, ident->tokenLength);
-	postOp->AddChildLast(ident);
-
-	term->AddChildLast(targetValue);
-	term->AddChildLast(postOp);
-	expr->AddChildLast(term);
-	cond->AddChildLast(expr);
+	if( opNode == 0 || newEntry == 0 ) return ident;
 
 	opNode->tokenType = ttAssignment;
 	opNode->UpdateSourcePos(op.pos, op.length);
@@ -5317,7 +5369,7 @@ asCScriptNode *asCParser::ParseReturn()
 
 	RewindTo(&t);
 
-	node->AddChildLast(ParseAssignment());
+	node->AddChildLast(ParseBindingValue());
 	if( isSyntaxError ) return node;
 
 	GetToken(&t);

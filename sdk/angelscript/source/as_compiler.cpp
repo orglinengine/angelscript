@@ -2535,8 +2535,14 @@ int asCCompiler::CompileArgumentList(asCScriptNode *node, asCArray<asCExprContex
 
 		asCExprContext expr(engine);
 		expr.exprNode = asgNode;
-		int r = CompileAssignment(asgNode, &expr);
-		if( r < 0 ) anyErrors = true;
+    int r;
+    // ORGLIN (ADR-0032): an argument may be a block. Its type comes from its own base, so it
+    // needs no knowledge of the parameter it will be matched against.
+    if( asgNode->nodeType == snInitBlock )
+      r = CompileInitBlockValue(asgNode, &expr, asgNode);
+    else
+      r = CompileAssignment(asgNode, &expr);
+    if( r < 0 ) anyErrors = true;
 
 		asCExprContext *ctx = asNEW(asCExprContext)(engine);
 		if( ctx == 0 )
@@ -3954,8 +3960,13 @@ bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, 
 	// The lvalue every entry's member access starts from. It is always a local — the real
 	// variable for a local declaration, the hidden temp otherwise — so `PSF offset` addresses
 	// it exactly the way a local object variable is addressed (see CompileVariableAccess).
+	//
+	// It is described as a plain VARIABLE even when it is really a temporary we own: an entry
+	// compiles to a member access on it, and a member access inherits `isTemporary` from its
+	// base, which would make the entry's own cleanup release the TARGET (and then our release
+	// below would assert). The block owns the temporary; the entries must not.
 	asCExprValue target;
-	target.SetVariable(type, targetOffset, !direct);
+	target.SetVariable(type, targetOffset, false);
 	target.isLValue = true;
 	if( IsVariableOnHeap(targetOffset) || type.IsObjectHandle() )
 		target.dataType.MakeReference(true);
@@ -3983,6 +3994,51 @@ bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, 
 	bool ok = CompileInitializationWithAssignment(bc, type, errNode, offset, constantValue, isVarGlobOrMem, node, &tempExpr);
 	ReleaseTemporaryVariable(targetOffset, bc);
 	return ok;
+}
+
+// ORGLIN (ADR-0032): a block where the DESTINATION type is not known up front — a `return`, a
+// call argument, an assignment right-hand side. The base expression's own type gives the
+// object's type, and the object is parked in a temporary so the entries have an addressable
+// lvalue. That temporary IS the value of the whole expression, so the caller treats it like
+// any other temporary object (and releases it as usual).
+int asCCompiler::CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode)
+{
+	asASSERT(block->nodeType == snInitBlock);
+
+	asCExprContext base(engine);
+	int r = CompileAssignment(block->firstChild, &base);
+	if( r < 0 )
+	{
+		ctx->type.SetDummy();
+		return r;
+	}
+
+	if( !base.type.dataType.IsObject() && !base.type.dataType.IsFuncdef() )
+	{
+		Error("An initializer block requires an object type", errNode);
+		ctx->type.SetDummy();
+		return -1;
+	}
+
+	PrepareTemporaryVariable(block, &base);
+	ctx->bc.AddCode(&base.bc);
+
+	// The block owns the temporary; the entries must NOT release it. A member access inherits
+	// `isTemporary` from its base, and that would free the target underneath us.
+	asCExprValue target = base.type;
+	target.isTemporary = false;
+	target.isLValue = true;
+
+	m_initTargetValues.PushLast(&target);
+	m_initTargetNodes.PushLast(0);
+	CompileInitializerEntries(block, &ctx->bc);
+	m_initTargetValues.PopLast();
+	m_initTargetNodes.PopLast();
+
+	// The temporary is the expression's value: base.bc already left a reference to it on the
+	// stack, and every entry is balanced around that.
+	ctx->type = base.type;
+	return 0;
 }
 
 // ORGLIN (ADR-0032): compile a block's entries, in order, against the innermost target frame
@@ -6766,7 +6822,12 @@ void asCCompiler::CompileReturnStatement(asCScriptNode *rnode, asCByteCode *bc)
 	{
 		// Compile the expression
 		asCExprContext expr(engine);
-		int r = CompileAssignment(rnode->firstChild, &expr);
+        int r;
+        // ORGLIN (ADR-0032): the returned value may be a block.
+        if( rnode->firstChild->nodeType == snInitBlock )
+            r = CompileInitBlockValue(rnode->firstChild, &expr, rnode);
+        else
+            r = CompileAssignment(rnode->firstChild, &expr);
 		if( r < 0 ) return;
 
 		if( ProcessPropertyGetAccessor(&expr, rnode) < 0 )
@@ -10963,11 +11024,25 @@ int asCCompiler::CompileAssignment(asCScriptNode *expr, asCExprContext *ctx)
 	{
 		// Compile the two expression terms
 		asCExprContext lctx(engine), rctx(engine);
-		int rr = CompileAssignment(lexpr->next->next, &rctx);
-		int lr = CompileCondition(lexpr, &lctx);
+		asCScriptNode *rhsNode = lexpr->next->next;
+		int lr, rr;
+
+		// ORGLIN (ADR-0032): a block as the right-hand side. Its object type comes from its
+		// own base expression, so the left side is compiled FIRST here (the ordinary order
+		// compiles the right side first because the left side's type is what it needs).
+		if( rhsNode && rhsNode->nodeType == snInitBlock )
+		{
+			lr = CompileCondition(lexpr, &lctx);
+			rr = lr >= 0 ? CompileInitBlockValue(rhsNode, &rctx, rhsNode) : -1;
+		}
+		else
+		{
+			rr = CompileAssignment(rhsNode, &rctx);
+			lr = CompileCondition(lexpr, &lctx);
+		}
 
 		if( lr >= 0 && rr >= 0 )
-			return DoAssignment(ctx, &lctx, &rctx, lexpr, lexpr->next->next, lexpr->next->tokenType, lexpr->next);
+			return DoAssignment(ctx, &lctx, &rctx, lexpr, rhsNode, lexpr->next->tokenType, lexpr->next);
 
 		// Since the operands failed, the assignment was not computed
 		ctx->type.SetDummy();
