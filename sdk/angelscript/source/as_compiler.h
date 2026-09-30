@@ -320,6 +320,18 @@ protected:
 	bool CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem);
 	int  CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode);
 	void CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc);
+	// ORGLIN (ADR-0032): after an anonymous entry's object is built, call the enclosing
+	// target's registered initializer finalizer (= addChild for UI controls) on it. Returns
+	// true when the attach was emitted and finalized here, false when the caller must finalize.
+	bool EmitInitializerAttach(asCScriptNode *node, asCExprContext *child, asCByteCode *bc);
+	// ORGLIN (ADR-0032): for a call entry `name(args)` inside a block, return the call node when
+	// `name` is NOT a member of the innermost target type — it is then an ANONYMOUS construction
+	// entry, compiled as a bare GLOBAL call and attached. Return 0 for an ordinary method-call
+	// entry (`target.name(args)`), which is left to the normal path.
+	// ORGLIN (ADR-0032): compile a BLOCK-LESS call entry `name(args)`. A member of the target
+	// compiles as `target.name(args)`; anything else is an ANONYMOUS construction entry, built
+	// detached and attached by the target's finalizer. Returns true when it handled the entry.
+	bool CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc);
 	void FinishInitializerEntry(asCExprContext *e, asCScriptNode *node, asCByteCode *bc);
 	int  CompileInitListElement(asSListPatternNode *&patternNode, asCScriptNode *&valueNode, int bufferTypeId, short bufferVar, asUINT &bufferSize, asCByteCode &byteCode, int &elementsInSubList);
 	int  CompileDictionaryKey(asCScriptNode *keyNode, asCByteCode *bc);

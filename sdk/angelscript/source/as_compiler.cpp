@@ -4041,6 +4041,126 @@ int asCCompiler::CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx
 	return 0;
 }
 
+// ORGLIN (ADR-0032): after an ANONYMOUS entry's object is built, attach it to the enclosing
+// block's target by calling that target type's registered initializer finalizer — for the UI
+// controls this is `addChild`. The receiver is the current target frame; the only argument is
+// the freshly built child. Returns true when the call was emitted (the entry's result is then
+// finalized here), false when the target type registered no finalizer (the caller finalizes
+// the child itself; it simply stays unattached, so the construct stays type-general).
+bool asCCompiler::EmitInitializerAttach(asCScriptNode *node, asCExprContext *child, asCByteCode *bc)
+{
+	asUINT n = m_initTargetValues.GetLength();
+	if( n == 0 || child == 0 )
+		return false;
+
+	asCExprValue *target = m_initTargetValues[n-1];
+	if( target == 0 || !target->dataType.IsObject() )
+		return false;
+
+	asCObjectType *parent = CastToObjectType(target->dataType.GetTypeInfo());
+	if( parent == 0 || parent->initializerFinalizerId == 0 )
+		return false;
+
+	int funcId = parent->initializerFinalizerId;
+	asCScriptFunction *descr = builder->GetFunctionDescription(funcId);
+	if( descr == 0 || descr->parameterTypes.GetLength() != 1 )
+		return false;
+
+	// The receiver is the block's target. `PSF offset` addresses it exactly as a local object
+	// variable is addressed (a handle target needs the extra Dereference->RDSPtr), so the
+	// target's OWN reference-ness is kept — forcing it here would drop that load.
+	asCExprContext recv(engine);
+	recv.bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
+	recv.type = *target;
+	recv.exprNode = node;
+
+	asCArray<asCExprContext *> args;
+	args.PushLast(child);
+
+	MakeFunctionCall(&recv, funcId, parent, args, node);
+
+	// The call is a statement: its result (addChild returns the child handle) is discarded, so
+	// pop the value and release the temporary the return value was stored in.
+	FinishInitializerEntry(&recv, node, bc);
+	return true;
+}
+
+// ORGLIN (ADR-0032): a call entry `name(args)` (no block). If `name` is a MEMBER of the
+// innermost target type it is an ordinary method-call entry: compile it as `target.name(args)`.
+// Otherwise it is an ANONYMOUS construction entry: build the bare GLOBAL call detached, apply
+// nothing, and attach it with the target's finalizer. Returns false when the entry is not a
+// bare call at all (so the caller falls back to the ordinary path).
+bool asCCompiler::CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc)
+{
+	if( entry == 0 || entry->nodeType != snAssignment || entry->firstChild == 0 ||
+		entry->firstChild->next != 0 )
+		return false;   // not a single-child (bare expression) assignment
+
+	asCScriptNode *cond = entry->firstChild;   // the parser made this the CONDITION
+	if( cond->nodeType != snCondition )
+		return false;
+
+	// Walk to the TERM: CONDITION > EXPRESSION > EXPRTERM.
+	asCScriptNode *n = cond;
+	while( n->firstChild && n->firstChild->next == 0 &&
+		   (n->nodeType == snCondition || n->nodeType == snExpression) )
+		n = n->firstChild;
+	if( n->nodeType != snExprTerm || n->firstChild == 0 )
+		return false;
+
+	asCScriptNode *base = n->firstChild;
+	// The term's first child may be the call directly or wrapped in an `snExprValue`.
+	if( base->nodeType == snExprValue && base->firstChild && base->firstChild->next == 0 )
+		base = base->firstChild;
+	if( base->nodeType != snFunctionCall || base->firstChild == 0 ||
+		base->firstChild->nodeType != snIdentifier )
+		return false;
+
+	asCString name(&script->code[base->firstChild->tokenPos], base->firstChild->tokenLength);
+
+	bool isMember = false;
+	asCExprValue *target = 0;
+	asCObjectType *ot = 0;
+	asUINT m = m_initTargetValues.GetLength();
+	if( m > 0 )
+	{
+		target = m_initTargetValues[m-1];
+		if( target && target->dataType.IsObject() )
+		{
+			ot = CastToObjectType(target->dataType.GetTypeInfo());
+			for( asUINT i = 0; ot && i < ot->methods.GetLength(); i++ )
+				if( engine->scriptFunctions[ot->methods[i]]->name == name )
+				{
+					isMember = true;
+					break;
+				}
+		}
+	}
+
+	if( isMember )
+	{
+		// Ordinary method-call entry: compile `target.name(args)` by calling the function on the
+		// target receiver — the same path an ordinary `obj.method(...)` postfix call takes.
+		asCExprContext recv(engine);
+		recv.bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
+		recv.type = *target;
+		recv.exprNode = base;
+		if( CompileFunctionCall(base, &recv, ot, target->dataType.IsObjectConst()) >= 0 )
+			FinishInitializerEntry(&recv, entry, bc);
+		return true;
+	}
+
+	// Anonymous construction entry: bare GLOBAL call, built detached and attached. There are
+	// no entries of its own (no block), so compile the call directly.
+	asCExprContext e(engine);
+	if( CompileCondition(cond, &e) >= 0 )
+	{
+		if( !EmitInitializerAttach(entry, &e, bc) )
+			FinishInitializerEntry(&e, entry, bc);
+	}
+	return true;
+}
+
 // ORGLIN (ADR-0032): compile a block's entries, in order, against the innermost target frame
 // (pushed by CompileInitializerBlock or by a nested entry below).
 void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc)
@@ -4077,8 +4197,31 @@ void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *b
 			}
 			else
 			{
-				asCExprContext e(engine);
-				if( CompileAssignment(entry, &e) >= 0 )
+				// ORGLIN (ADR-0032): a call entry `name(args)` is handled here — a member of the
+				// target compiles as a method call, anything else is an anonymous construction
+				// entry that is built detached and attached. Anything that is not a bare call
+				// falls through to the ordinary assignment path.
+				if( !CompileInitCallEntry(entry, bc) )
+				{
+					asCExprContext e(engine);
+					if( CompileAssignment(entry, &e) >= 0 )
+						FinishInitializerEntry(&e, entry, bc);
+				}
+			}
+		}
+		else if( entry->nodeType == snInitBlock )
+		{
+			// ORGLIN (ADR-0032 §2.2 form 3): an ANONYMOUS entry — `kind(args) { ... }`, whose
+			// base the parser left as a BARE `kind(args)` call. The call builds the object
+			// DETACHED; the block's entries are applied to it; then the enclosing target's
+			// registered initializer FINALIZER (`addChild` for UI controls) attaches it. The
+			// object is never a member of the parent — it is only a member while its own block
+			// is applied. Order = structure: the calls run in source order, so children land in
+			// that order.
+			asCExprContext e(engine);
+			if( CompileInitBlockValue(entry, &e, entry) >= 0 )
+			{
+				if( !EmitInitializerAttach(entry, &e, bc) )
 					FinishInitializerEntry(&e, entry, bc);
 			}
 		}

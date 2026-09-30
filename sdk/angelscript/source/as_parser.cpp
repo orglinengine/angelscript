@@ -4618,19 +4618,82 @@ asCScriptNode *asCParser::ParseInitBlockEntry()
 		call->AddChildLast(ParseArgList());
 		if( isSyntaxError ) return call;
 
+		// ORGLIN (ADR-0032 §2.2 form 3): `kind(args) { ... }` — an ANONYMOUS entry. It
+		// compiles to `target.kind(args)` with the block applied to the object that call
+		// returned, so the nesting IS the structure and the parent is never named.
+		//
+		// The authored identifier is REUSED as the member name, so the compiler resolves it
+		// as an ordinary method on the target — which is why this needs no synthesized name.
+		// The object is built by that method, i.e. already parented and rooted, so nothing
+		// is ever constructed detached.
+		sToken after;
+		GetToken(&after);
+		RewindTo(&after);
+		if( after.type == ttStartStatementBlock )
+		{
+			// ORGLIN (ADR-0032 §2.2 form 3): an ANONYMOUS entry `kind(args) { ... }`. The call
+			// builds the object DETACHED — a kind is NOT a member of its parent, so the object
+			// only becomes a child when the compiler attaches it via the target type's
+			// registered initializer finalizer (ADR-0032). The base is the BARE call wrapped in
+			// the ordinary expression chain (CONDITION > EXPRESSION > EXPRTERM > EXPRVALUE >
+			// call) and then as a single-child `snAssignment`, which is the language's
+			// "expression that is not an assignment" that CompileInitBlockValue hands to
+			// CompileAssignment.
+			asCScriptNode *callValue = CreateNode(snExprValue);
+			asCScriptNode *callTerm  = CreateNode(snExprTerm);
+			asCScriptNode *callExpr  = CreateNode(snExpression);
+			asCScriptNode *cond      = CreateNode(snCondition);
+			asCScriptNode *base      = CreateNode(snAssignment);
+			if( callValue == 0 || callTerm == 0 || callExpr == 0 || cond == 0 || base == 0 )
+				return call;
+			callValue->AddChildLast(call);
+			callValue->UpdateSourcePos(start.pos, start.length);
+			callTerm->AddChildLast(callValue);
+			callTerm->UpdateSourcePos(start.pos, start.length);
+			callExpr->AddChildLast(callTerm);
+			callExpr->UpdateSourcePos(start.pos, start.length);
+			cond->AddChildLast(callExpr);
+			cond->UpdateSourcePos(start.pos, start.length);
+			base->AddChildLast(cond);
+			base->UpdateSourcePos(start.pos, start.length);
+			asCScriptNode *block = ParseInitBlock(base);
+			if( isSyntaxError ) return block;
+			block->UpdateSourcePos(start.pos, start.length);
+			return block;
+		}
+
 		asCScriptNode *newEntry = CreateNode(snAssignment);
 		if( newEntry == 0 ) return call;
 
-		// A call entry is an assignment node with a single child, which is exactly how the
-		// compiler reads an expression that is not an assignment.
-		newEntry->AddChildLast(BuildInitTargetMember(call));
+		// ORGLIN (ADR-0032): a call entry stays the BARE `name(args)` wrapped in the ordinary
+		// expression chain — the compiler decides whether `name` is a member of the target (an
+		// ordinary method call, `target.name(args)`) or not (an anonymous construction entry,
+		// built detached and attached). Emitting `target.name(args)` here would make the member
+		// case the only possible one.
+		asCScriptNode *callValue = CreateNode(snExprValue);
+		asCScriptNode *callTerm  = CreateNode(snExprTerm);
+		asCScriptNode *callExpr  = CreateNode(snExpression);
+		asCScriptNode *callCond  = CreateNode(snCondition);
+		if( callValue == 0 || callTerm == 0 || callExpr == 0 || callCond == 0 )
+			return call;
+		callValue->AddChildLast(call);
+		callValue->UpdateSourcePos(start.pos, start.length);
+		callTerm->AddChildLast(callValue);
+		callTerm->UpdateSourcePos(start.pos, start.length);
+		callExpr->AddChildLast(callTerm);
+		callExpr->UpdateSourcePos(start.pos, start.length);
+		callCond->AddChildLast(callExpr);
+		callCond->UpdateSourcePos(start.pos, start.length);
+
+		newEntry->AddChildLast(callCond);
 		newEntry->UpdateSourcePos(start.pos, start.length);
 		return newEntry;
 	}
 
 	if( op.type != ttAssignment )
 	{
-		Error("An initializer entry must be written as `name = value` or `name(args)`", &start);
+		Error("An initializer entry must be written as `name = value`, `name(args)` or "
+			  "`kind(args) { ... }`", &start);
 		Error(InsteadFound(op), &op);
 		return ident;
 	}
@@ -4671,20 +4734,36 @@ bool asCParser::IsConstructingExpression(asCScriptNode *expr)
 	if( n->nodeType != snExprTerm || n->firstChild == 0 )
 		return false;
 
-	asCScriptNode *v = n->firstChild;
-	if( v->nodeType == snExprValue )
-		v = v->firstChild;
-	if( v == 0 )
-		return false;
+	// The TERM's children are the base value followed by one node per postfix operation.
+	// The walk must stay at THIS level: descending into the value node to look for the
+	// call would step inside it and see no siblings at all, which is exactly the bug that
+	// made every `obj.method(...) { ... }` — i.e. every UI builder call — fail to parse.
+	asCScriptNode *base = n->firstChild;
 
-	if( v->nodeType == snFunctionCall || v->nodeType == snConstructCall )
+	// `T(...)` / `f(...)` — the call IS the value.
+	if( base->nodeType == snFunctionCall || base->nodeType == snConstructCall )
 		return true;
 
-	// `obj.method(...)`: the call is a post-op on the value node.
-	for( asCScriptNode *p = v->next; p; p = p->next )
+	// `obj.method(...)` — the call is a POST-OP SIBLING of the base value.
+	for( asCScriptNode *p = base; p; p = p->next )
 		if( p->nodeType == snExprPostOp && p->firstChild &&
 			p->firstChild->nodeType == snFunctionCall )
 			return true;
+
+	// A call wrapped one level down (`snExprValue > snConstructCall`), or a postfix call
+	// whose post-op sits inside the value node.
+	if( base->nodeType == snExprValue )
+	{
+		asCScriptNode *inner = base->firstChild;
+		if( inner == 0 )
+			return false;
+		if( inner->nodeType == snFunctionCall || inner->nodeType == snConstructCall )
+			return true;
+		for( asCScriptNode *p = inner; p; p = p->next )
+			if( p->nodeType == snExprPostOp && p->firstChild &&
+				p->firstChild->nodeType == snFunctionCall )
+				return true;
+	}
 
 	return false;
 }

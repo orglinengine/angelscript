@@ -728,6 +728,10 @@ public:
 	virtual int            RegisterObjectBehaviour(const char *obj, asEBehaviours behaviour, const char *declaration, const asSFuncPtr &funcPointer, asDWORD callConv, void *auxiliary = 0, int compositeOffset = 0, bool isCompositeIndirect = false) = 0;
 	virtual int            RegisterInterface(const char *name) = 0;
 	virtual int            RegisterInterfaceMethod(const char *intf, const char *declaration) = 0;
+	// ORGLIN (ADR-0032): the method an ANONYMOUS initializer-block entry's object is attached
+	// with — the compiler calls it with the enclosing target as receiver and the new child as
+	// the sole argument (for the UI controls: `addChild`). `decl` names the method explicitly.
+	virtual int            RegisterObjectTypeInitializerFinalizer(const char *typeName, const char *decl) = 0;
 	virtual asUINT         GetObjectTypeCount() const = 0;
 	virtual asITypeInfo   *GetObjectTypeByIndex(asUINT index) const = 0;
 

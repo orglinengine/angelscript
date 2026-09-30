@@ -154,6 +154,11 @@ public:
 
 	asSTypeBehaviour beh;
 
+	// ORGLIN (ADR-0032): a function id the initializer-block compiler calls to attach an
+	// ANONYMOUS entry's object to the enclosing block's target. 0 = the type has no such
+	// behaviour (the object is not auto-attached). Set by RegisterObjectTypeInitializerFinalizer.
+	int                          initializerFinalizerId;
+
 	// Used for template types
 	asCArray<asCDataType> templateSubTypes;   // increases refCount for typeinfo held in datatype
 	bool                  acceptValueSubType;

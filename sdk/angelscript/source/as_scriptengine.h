@@ -102,6 +102,10 @@ public:
 
 	// Type registration
 	virtual int            RegisterObjectType(const char *obj, int byteSize, asQWORD flags);
+	// ORGLIN (ADR-0032): register the function called to attach an ANONYMOUS initializer
+	// entry's object to the enclosing block's target. `decl` is a method on `typeName`
+	// taking the child as its one parameter, e.g. "void __initializerAttach(UIElement @child)".
+	int                    RegisterObjectTypeInitializerFinalizer(const char *typeName, const char *decl);
 	virtual int            RegisterObjectProperty(const char *obj, const char *declaration, int byteOffset, int compositeOffset = 0, bool isCompositeIndirect = false);
 	virtual int            RegisterObjectMethod(const char *obj, const char *declaration, const asSFuncPtr &funcPointer, asDWORD callConv, void *auxiliary = 0, int compositeOffset = 0, bool isCompositeIndirect = false);
 	virtual int            RegisterObjectBehaviour(const char *obj, asEBehaviours behaviour, const char *declaration, const asSFuncPtr &funcPointer, asDWORD callConv, void *auxiliary = 0, int compositeOffset = 0, bool isCompositeIndirect = false);

@@ -48,6 +48,7 @@ BEGIN_AS_NAMESPACE
 asCObjectType::asCObjectType() : asCTypeInfo()
 {
 	derivedFrom = 0;
+	initializerFinalizerId = 0;
 
 	acceptValueSubType = true;
 	acceptRefSubType   = true;
@@ -60,6 +61,7 @@ asCObjectType::asCObjectType() : asCTypeInfo()
 asCObjectType::asCObjectType(asCScriptEngine *in_engine) : asCTypeInfo(in_engine)
 {
 	derivedFrom  = 0;
+	initializerFinalizerId = 0;
 
 	acceptValueSubType = true;
 	acceptRefSubType = true;
