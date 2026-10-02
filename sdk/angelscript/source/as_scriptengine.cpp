@@ -1610,12 +1610,12 @@ int asCScriptEngine::GetMethodIdByDecl(const asCObjectType *ot, const char *decl
 	return id;
 }
 
-// ORGLIN (ADR-0032): register the method an ANONYMOUS initializer entry's object is attached
+// ORGLIN (ADR-0032): register the method a child built inside an initializer block is attached
 // with — the function the block compiler calls with the enclosing target as `this` and the
-// freshly built child as its one argument (for the UI controls: `addChild`). `decl` names the
-// method explicitly, e.g. "void __initializerAttach(UIElement @child)", so the attachment is
-// not coupled to any public spelling the author could also reach. A type with no finalizer
-// registered simply never auto-attaches (the construct stays type-general).
+// freshly built child as its one argument, e.g. "UIElement @add(UIElement @child)". It must
+// RETURN the attached object: that result is what the child's own entries are applied to and
+// what a named entry keeps. A type with no finalizer registered simply never auto-attaches
+// (the construct stays type-general).
 int asCScriptEngine::RegisterObjectTypeInitializerFinalizer(const char *typeName, const char *decl)
 {
 	isPrepared = false;
@@ -1631,6 +1631,10 @@ int asCScriptEngine::RegisterObjectTypeInitializerFinalizer(const char *typeName
 	int id = GetMethodIdByDecl(ot, decl, 0);
 	if( id < 0 )
 		return ConfigError(asNO_FUNCTION, "RegisterObjectTypeInitializerFinalizer", typeName, decl);
+
+	asCScriptFunction *func = scriptFunctions[id];
+	if( func->parameterTypes.GetLength() != 1 || !func->returnType.IsObject() )
+		return ConfigError(asINVALID_DECLARATION, "RegisterObjectTypeInitializerFinalizer", typeName, decl);
 
 	ot->initializerFinalizerId = id;
 	return asSUCCESS;

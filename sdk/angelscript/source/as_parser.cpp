@@ -2352,8 +2352,11 @@ asCScriptNode *asCParser::ParseExprTerm()
 		// ORGLIN: with optional statement termination a '++'/'--' that begins a new
 		// line is the next statement, not a post-increment of this one — otherwise
 		// `++tickCount` on its own line is absorbed and an implicit ';' is missing.
+		// The same holds for a '[' that begins a line: it opens declaration metadata
+		// (`[Data("x.ini")]`) or a list literal, never a subscript of the line above —
+		// otherwise a tag after `dictionary d = dictionary()` is read as `dictionary()[...]`.
 		if( OptionalStatementTerminatorIsNewLine(t) &&
-			(t.type == ttInc || t.type == ttDec) )
+			(t.type == ttInc || t.type == ttDec || t.type == ttOpenBracket) )
 			return node;
 
 		node->AddChildLast(ParseExprPostOp());
@@ -4618,23 +4621,15 @@ asCScriptNode *asCParser::ParseInitBlockEntry()
 		call->AddChildLast(ParseArgList());
 		if( isSyntaxError ) return call;
 
-		// ORGLIN (ADR-0032 §2.2 form 3): `kind(args) { ... }` — an ANONYMOUS entry. It
-		// compiles to `target.kind(args)` with the block applied to the object that call
-		// returned, so the nesting IS the structure and the parent is never named.
-		//
-		// The authored identifier is REUSED as the member name, so the compiler resolves it
-		// as an ordinary method on the target — which is why this needs no synthesized name.
-		// The object is built by that method, i.e. already parented and rooted, so nothing
-		// is ever constructed detached.
 		sToken after;
 		GetToken(&after);
 		RewindTo(&after);
 		if( after.type == ttStartStatementBlock )
 		{
-			// ORGLIN (ADR-0032 §2.2 form 3): an ANONYMOUS entry `kind(args) { ... }`. The call
-			// builds the object DETACHED — a kind is NOT a member of its parent, so the object
-			// only becomes a child when the compiler attaches it via the target type's
-			// registered initializer finalizer (ADR-0032). The base is the BARE call wrapped in
+			// ORGLIN (ADR-0032 §2.2 form 3): an ANONYMOUS entry `kind(args) { ... }`. A kind is
+			// NOT a member of its parent: the bare call builds the object and the compiler
+			// attaches it via the target type's registered initializer finalizer, then applies
+			// the block to the attached object. The base is the BARE call wrapped in
 			// the ordinary expression chain (CONDITION > EXPRESSION > EXPRTERM > EXPRVALUE >
 			// call) and then as a single-child `snAssignment`, which is the language's
 			// "expression that is not an assignment" that CompileInitBlockValue hands to

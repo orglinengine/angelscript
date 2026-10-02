@@ -318,20 +318,29 @@ protected:
 	void CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);
 	// ORGLIN (ADR-0032): `Expr { name = value, ... }` and the entries within it.
 	bool CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem);
-	int  CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode);
+	int  CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode, bool attach = false);
 	void CompileInitializerEntries(asCScriptNode *block, asCByteCode *bc);
-	// ORGLIN (ADR-0032): after an anonymous entry's object is built, call the enclosing
-	// target's registered initializer finalizer (= addChild for UI controls) on it. Returns
-	// true when the attach was emitted and finalized here, false when the caller must finalize.
-	bool EmitInitializerAttach(asCScriptNode *node, asCExprContext *child, asCByteCode *bc);
-	// ORGLIN (ADR-0032): for a call entry `name(args)` inside a block, return the call node when
-	// `name` is NOT a member of the innermost target type — it is then an ANONYMOUS construction
-	// entry, compiled as a bare GLOBAL call and attached. Return 0 for an ordinary method-call
-	// entry (`target.name(args)`), which is left to the normal path.
-	// ORGLIN (ADR-0032): compile a BLOCK-LESS call entry `name(args)`. A member of the target
-	// compiles as `target.name(args)`; anything else is an ANONYMOUS construction entry, built
-	// detached and attached by the target's finalizer. Returns true when it handled the entry.
+	// ORGLIN (ADR-0032): call the enclosing target's registered initializer finalizer (`add`
+	// for UI controls) with a freshly built child. The call's RESULT — the attached object —
+	// is left in `out`. Returns 1 when the call was made, 0 when the target type has no
+	// finalizer (`out` untouched, the child simply stays unattached), < 0 on error.
+	int  MakeInitializerAttach(asCScriptNode *node, asCExprContext *child, asCExprContext *out);
+	// ORGLIN (ADR-0032): build a CHILD of the enclosing target — a bare value or a block — and
+	// attach it. The attach comes BEFORE the child's own entries, so every nested attach has a
+	// parent that is already in place. `ctx` is the attached object.
+	int  CompileInitChild(asCScriptNode *valueNode, asCExprContext *ctx);
+	// ORGLIN (ADR-0032): a BLOCK-LESS call entry `name(args)`. A member of the target compiles
+	// as `target.name(args)`; anything else is an ANONYMOUS child. Returns true when it handled
+	// the entry.
 	bool CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc);
+	// ORGLIN (ADR-0032): a `name = value` entry where `name` is NOT a member of the target but
+	// IS a variable in the enclosing scope: build the child, attach it, and keep the attached
+	// object in that variable. Members are checked FIRST, so this can never shadow one. Returns
+	// false when the entry is an ordinary member write.
+	bool CompileInitBoundEntry(asCScriptNode *entry, asCByteCode *bc);
+	bool FindInitOuterVariable(const asCString &name);
+	int  CompileInitTargetAccess(asCExprContext *ctx, asCScriptNode *node);
+	void PushInitTarget(asCExprValue *value, asCScriptNode *node, const asCDataType &type);
 	void FinishInitializerEntry(asCExprContext *e, asCScriptNode *node, asCByteCode *bc);
 	int  CompileInitListElement(asSListPatternNode *&patternNode, asCScriptNode *&valueNode, int bufferTypeId, short bufferVar, asUINT &bufferSize, asCByteCode &byteCode, int &elementsInSubList);
 	int  CompileDictionaryKey(asCScriptNode *keyNode, asCByteCode *bc);
@@ -515,12 +524,17 @@ protected:
 	int  noCodeOutput;
 
 	// ORGLIN (ADR-0032): the object each in-scope initializer block's entries are applied to,
-	// one frame per nesting level. A frame is EITHER a local value (the declaration's slot, or
-	// a hidden temp — `m_initTargetValues`) OR a member EXPRESSION the block was bound to by a
-	// nested entry (`m_initTargetNodes`), which is compiled against the frame below it. An
+	// one frame per nesting level. A frame is EITHER a local `value` (the declaration's slot, or
+	// a hidden temp) OR a member expression `node` the block was bound to by a nested entry,
+	// which is compiled against the frame below it. `type` is the target's type either way. An
 	// `snInitTarget` leaf resolves to the innermost frame, so nesting is pure recursion.
-	asCArray<asCExprValue *>  m_initTargetValues;
-	asCArray<asCScriptNode *> m_initTargetNodes;
+	struct sInitTarget
+	{
+		asCExprValue  *value;
+		asCScriptNode *node;
+		asCDataType    type;
+	};
+	asCArray<sInitTarget> m_initTargets;
 };
 
 END_AS_NAMESPACE

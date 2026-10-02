@@ -100,8 +100,7 @@ asCCompiler::asCCompiler(asCScriptEngine *_engine) : byteCode(_engine)
 	isCompilingDefaultArg      = false;
 	isProcessingDeferredParams = false;
 	noCodeOutput               = 0;
-	m_initTargetValues.SetLength(0);
-	m_initTargetNodes.SetLength(0);
+	m_initTargets.SetLength(0);
 }
 
 asCCompiler::~asCCompiler()
@@ -149,8 +148,7 @@ void asCCompiler::Reset(asCBuilder *in_builder, asCScriptCode *in_script, asCScr
 	byteCode.ClearAll();
 	m_initializedProperties.SetLength(0);
 	m_propertyAccessCount.EraseAll();
-	m_initTargetValues.SetLength(0);
-	m_initTargetNodes.SetLength(0);
+	m_initTargets.SetLength(0);
 }
 
 int asCCompiler::CompileDefaultCopyConstructor(asCBuilder* in_builder, asCScriptCode* in_script, asCScriptNode* in_node, asCScriptFunction* in_outFunc, sClassDeclaration* in_classDecl)
@@ -3973,13 +3971,9 @@ bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, 
 	if( !type.IsObjectHandle() )
 		target.isRefSafe = true;
 
-	m_initTargetValues.PushLast(&target);
-	m_initTargetNodes.PushLast(0);
-
+	PushInitTarget(&target, 0, target.dataType);
 	CompileInitializerEntries(node, bc);
-
-	m_initTargetValues.PopLast();
-	m_initTargetNodes.PopLast();
+	m_initTargets.PopLast();
 
 	if( direct )
 		return false;
@@ -4001,95 +3995,252 @@ bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, 
 // object's type, and the object is parked in a temporary so the entries have an addressable
 // lvalue. That temporary IS the value of the whole expression, so the caller treats it like
 // any other temporary object (and releases it as usual).
-int asCCompiler::CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode)
+//
+// With `attach`, the block is a CHILD of the enclosing block: the built object is handed to
+// the enclosing target's finalizer first, and it is the finalizer's RESULT that the entries
+// are applied to and that the expression evaluates to.
+int asCCompiler::CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode, bool attach)
 {
 	asASSERT(block->nodeType == snInitBlock);
 
-	asCExprContext base(engine);
-	int r = CompileAssignment(block->firstChild, &base);
+	asCExprContext built(engine), attached(engine);
+	asCExprContext *base = &built;
+	int r = CompileAssignment(block->firstChild, &built);
+	if( r >= 0 && attach )
+	{
+		r = MakeInitializerAttach(block, &built, &attached);
+		if( r > 0 )
+			base = &attached;
+	}
 	if( r < 0 )
 	{
 		ctx->type.SetDummy();
 		return r;
 	}
 
-	if( !base.type.dataType.IsObject() && !base.type.dataType.IsFuncdef() )
+	if( !base->type.dataType.IsObject() && !base->type.dataType.IsFuncdef() )
 	{
 		Error("An initializer block requires an object type", errNode);
 		ctx->type.SetDummy();
 		return -1;
 	}
 
-	PrepareTemporaryVariable(block, &base);
-	ctx->bc.AddCode(&base.bc);
+	PrepareTemporaryVariable(block, base);
+	ctx->bc.AddCode(&base->bc);
 
 	// The block owns the temporary; the entries must NOT release it. A member access inherits
 	// `isTemporary` from its base, and that would free the target underneath us.
-	asCExprValue target = base.type;
+	asCExprValue target = base->type;
 	target.isTemporary = false;
 	target.isLValue = true;
 
-	m_initTargetValues.PushLast(&target);
-	m_initTargetNodes.PushLast(0);
+	PushInitTarget(&target, 0, target.dataType);
 	CompileInitializerEntries(block, &ctx->bc);
-	m_initTargetValues.PopLast();
-	m_initTargetNodes.PopLast();
+	m_initTargets.PopLast();
 
-	// The temporary is the expression's value: base.bc already left a reference to it on the
+	// The temporary is the expression's value: base->bc already left a reference to it on the
 	// stack, and every entry is balanced around that.
-	ctx->type = base.type;
+	ctx->type = base->type;
 	return 0;
 }
 
-// ORGLIN (ADR-0032): after an ANONYMOUS entry's object is built, attach it to the enclosing
-// block's target by calling that target type's registered initializer finalizer — for the UI
-// controls this is `addChild`. The receiver is the current target frame; the only argument is
-// the freshly built child. Returns true when the call was emitted (the entry's result is then
-// finalized here), false when the target type registered no finalizer (the caller finalizes
-// the child itself; it simply stays unattached, so the construct stays type-general).
-bool asCCompiler::EmitInitializerAttach(asCScriptNode *node, asCExprContext *child, asCByteCode *bc)
+void asCCompiler::PushInitTarget(asCExprValue *value, asCScriptNode *node, const asCDataType &type)
 {
-	asUINT n = m_initTargetValues.GetLength();
-	if( n == 0 || child == 0 )
-		return false;
+	sInitTarget t;
+	t.value = value;
+	t.node  = node;
+	t.type  = type;
+	m_initTargets.PushLast(t);
+}
 
-	asCExprValue *target = m_initTargetValues[n-1];
+// ORGLIN (ADR-0032): the object the innermost initializer block is configuring. Each entry is
+// `<target>.name = value`, so this plays the role of the local variable at the base of an
+// ordinary member access.
+int asCCompiler::CompileInitTargetAccess(asCExprContext *ctx, asCScriptNode *node)
+{
+	asUINT n = m_initTargets.GetLength();
+	if( n == 0 )
+	{
+		Error("Initializer target used outside an initializer block", node);
+		ctx->type.SetDummy();
+		return -1;
+	}
+
+	sInitTarget top = m_initTargets[n-1];
+	if( top.node )
+	{
+		// A nested block's target is the member expression it was bound to (e.g.
+		// `outer.child`), which itself names the target BELOW it. Resolving it with the
+		// current frame popped is what makes nesting recurse correctly.
+		m_initTargets.PopLast();
+		int r = CompileCondition(top.node, ctx);
+		m_initTargets.PushLast(top);
+		return r;
+	}
+
+	ctx->bc.InstrSHORT(asBC_PSF, (short)top.value->stackOffset);
+	ctx->type = *top.value;
+	return 0;
+}
+
+int asCCompiler::MakeInitializerAttach(asCScriptNode *node, asCExprContext *child, asCExprContext *out)
+{
+	asUINT n = m_initTargets.GetLength();
+	if( n == 0 )
+		return 0;
+
+	// Only a VALUE frame attaches: a member-bound frame (`child = Leaf() { ... }`) belongs to
+	// the data path, where nothing is parented.
+	asCExprValue *target = m_initTargets[n-1].value;
 	if( target == 0 || !target->dataType.IsObject() )
-		return false;
+		return 0;
 
 	asCObjectType *parent = CastToObjectType(target->dataType.GetTypeInfo());
 	if( parent == 0 || parent->initializerFinalizerId == 0 )
-		return false;
+		return 0;
 
 	int funcId = parent->initializerFinalizerId;
-	asCScriptFunction *descr = builder->GetFunctionDescription(funcId);
-	if( descr == 0 || descr->parameterTypes.GetLength() != 1 )
-		return false;
 
 	// The receiver is the block's target. `PSF offset` addresses it exactly as a local object
 	// variable is addressed (a handle target needs the extra Dereference->RDSPtr), so the
 	// target's OWN reference-ness is kept — forcing it here would drop that load.
-	asCExprContext recv(engine);
-	recv.bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
-	recv.type = *target;
-	recv.exprNode = node;
+	out->bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
+	out->type = *target;
+	out->exprNode = node;
 
 	asCArray<asCExprContext *> args;
 	args.PushLast(child);
 
-	MakeFunctionCall(&recv, funcId, parent, args, node);
+	if( MakeFunctionCall(out, funcId, parent, args, node) < 0 )
+	{
+		out->type.SetDummy();
+		return -1;
+	}
+	return 1;
+}
 
-	// The call is a statement: its result (addChild returns the child handle) is discarded, so
-	// pop the value and release the temporary the return value was stored in.
-	FinishInitializerEntry(&recv, node, bc);
+int asCCompiler::CompileInitChild(asCScriptNode *valueNode, asCExprContext *ctx)
+{
+	if( valueNode->nodeType == snInitBlock )
+		return CompileInitBlockValue(valueNode, ctx, valueNode, true);
+
+	asCExprContext built(engine);
+	int r = valueNode->nodeType == snAssignment ? CompileAssignment(valueNode, &built)
+	                                            : CompileCondition(valueNode, &built);
+	if( r >= 0 )
+		r = ProcessPropertyGetAccessor(&built, valueNode);
+	if( r >= 0 )
+	{
+		r = MakeInitializerAttach(valueNode, &built, ctx);
+		if( r == 0 )
+			MergeExprBytecodeAndType(ctx, &built);
+	}
+	if( r < 0 )
+		ctx->type.SetDummy();
+	return r < 0 ? r : 0;
+}
+
+// ORGLIN (ADR-0032): is `name` a VARIABLE the enclosing scope can assign — a local, a field of
+// the class being compiled, or a global of the current namespace or one of its parents? A
+// silent lookup: the answer "no" is the ordinary member case, not an error.
+bool asCCompiler::FindInitOuterVariable(const asCString &name)
+{
+	if( variables )
+	{
+		sVariable *v = variables->GetVariable(name.AddressOf());
+		if( v )
+			return !v->isPureConstant;
+	}
+
+	if( outFunc && outFunc->objectType )
+	{
+		asCDataType dt = asCDataType::CreateType(outFunc->objectType, false);
+		if( builder->GetObjectProperty(dt, name.AddressOf()) )
+			return true;
+	}
+
+	for( asSNameSpace *ns = DetermineNameSpace(""); ns; ns = engine->GetParentNameSpace(ns) )
+	{
+		bool isCompiled = true, isPureConstant = false, isAppProp = false;
+		asQWORD constantValue = 0;
+		if( builder->GetGlobalProperty(name.AddressOf(), ns, &isCompiled, &isPureConstant, &constantValue, &isAppProp) )
+			return !isPureConstant;
+	}
+	return false;
+}
+
+bool asCCompiler::CompileInitBoundEntry(asCScriptNode *entry, asCByteCode *bc)
+{
+	asCScriptNode *lhsNode = entry->firstChild;
+	asCScriptNode *opNode  = lhsNode ? lhsNode->next : 0;
+	asCScriptNode *rhsNode = opNode ? opNode->next : 0;
+	if( rhsNode == 0 || m_initTargets.GetLength() == 0 )
+		return false;
+
+	// The parser wrote the left side as `<target>.name` (see asCParser::BuildInitTargetMember):
+	// CONDITION > EXPRESSION > EXPRTERM > [ EXPRVALUE > INIT_TARGET, EXPRPOSTOP > identifier ].
+	asCScriptNode *term = lhsNode;
+	while( term && (term->nodeType == snCondition || term->nodeType == snExpression) )
+		term = term->firstChild;
+	if( term == 0 || term->nodeType != snExprTerm )
+		return false;
+	asCScriptNode *value = term->firstChild;
+	asCScriptNode *post  = value ? value->next : 0;
+	if( value == 0 || value->nodeType != snExprValue || value->firstChild == 0 ||
+		value->firstChild->nodeType != snInitTarget ||
+		post == 0 || post->nodeType != snExprPostOp || post->next != 0 ||
+		post->firstChild == 0 || post->firstChild->nodeType != snIdentifier )
+		return false;
+
+	asCScriptNode *nameNode = post->firstChild;
+	asCString name(&script->code[nameNode->tokenPos], nameNode->tokenLength);
+
+	// THE ONE DECISION: a member of the target always wins. Only a name the target does not
+	// have can be an outer variable, so the two meanings never overlap.
+	asCObjectType *ot = CastToObjectType(m_initTargets[m_initTargets.GetLength()-1].type.GetTypeInfo());
+	if( ot == 0 )
+		return false;
+	asCExprContext scratch(engine);
+	bool isMember = SymbolLookupMember(name, ot, &scratch) != SL_NOMATCH;
+	bool isOuter  = FindInitOuterVariable(name);
+	if( isMember )
+	{
+		if( isOuter && rhsNode->nodeType == snInitBlock )
+		{
+			asCString msg;
+			msg.Format("'%s' is a member of '%s', so this entry sets the member; the variable '%s' in scope is not assigned",
+					   name.AddressOf(), ot->name.AddressOf(), name.AddressOf());
+			Warning(msg, nameNode);
+		}
+		return false;
+	}
+	if( !isOuter )
+		return false;   // the ordinary path reports "not a member"
+
+	asCExprContext child(engine);
+	if( CompileInitChild(rhsNode, &child) < 0 )
+		return true;
+	if( !child.type.dataType.IsObject() )
+	{
+		asCString msg;
+		msg.Format(TXT_s_NOT_MEMBER_OF_s, name.AddressOf(), ot->name.AddressOf());
+		Error(msg, nameNode);
+		return true;
+	}
+
+	asCExprContext lctx(engine), assigned(engine);
+	if( CompileVariableAccess(name, "", &lctx, nameNode) < 0 )
+		return true;
+	if( DoAssignment(&assigned, &lctx, &child, lhsNode, rhsNode, ttAssignment, opNode) >= 0 )
+		FinishInitializerEntry(&assigned, entry, bc);
 	return true;
 }
 
 // ORGLIN (ADR-0032): a call entry `name(args)` (no block). If `name` is a MEMBER of the
 // innermost target type it is an ordinary method-call entry: compile it as `target.name(args)`.
-// Otherwise it is an ANONYMOUS construction entry: build the bare GLOBAL call detached, apply
-// nothing, and attach it with the target's finalizer. Returns false when the entry is not a
-// bare call at all (so the caller falls back to the ordinary path).
+// Otherwise it is an ANONYMOUS child: the bare GLOBAL call builds it and the target's
+// finalizer attaches it. Returns false when the entry is not a bare call at all (so the
+// caller falls back to the ordinary path).
 bool asCCompiler::CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc)
 {
 	if( entry == 0 || entry->nodeType != snAssignment || entry->firstChild == 0 ||
@@ -4121,10 +4272,10 @@ bool asCCompiler::CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc)
 	bool isMember = false;
 	asCExprValue *target = 0;
 	asCObjectType *ot = 0;
-	asUINT m = m_initTargetValues.GetLength();
+	asUINT m = m_initTargets.GetLength();
 	if( m > 0 )
 	{
-		target = m_initTargetValues[m-1];
+		target = m_initTargets[m-1].value;
 		if( target && target->dataType.IsObject() )
 		{
 			ot = CastToObjectType(target->dataType.GetTypeInfo());
@@ -4150,14 +4301,10 @@ bool asCCompiler::CompileInitCallEntry(asCScriptNode *entry, asCByteCode *bc)
 		return true;
 	}
 
-	// Anonymous construction entry: bare GLOBAL call, built detached and attached. There are
-	// no entries of its own (no block), so compile the call directly.
+	// Anonymous child: a bare GLOBAL call with no entries of its own.
 	asCExprContext e(engine);
-	if( CompileCondition(cond, &e) >= 0 )
-	{
-		if( !EmitInitializerAttach(entry, &e, bc) )
-			FinishInitializerEntry(&e, entry, bc);
-	}
+	if( CompileInitChild(cond, &e) >= 0 )
+		FinishInitializerEntry(&e, entry, bc);
 	return true;
 }
 
@@ -4174,13 +4321,18 @@ void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *b
 			asCScriptNode *opNode  = lhsNode ? lhsNode->next : 0;
 			asCScriptNode *rhsNode = opNode ? opNode->next : 0;
 
-			if( rhsNode && rhsNode->nodeType == snInitBlock )
+			if( CompileInitBoundEntry(entry, bc) )
 			{
-				// A NESTED block: build the child, bind it to the member, and make that
-				// member the target for the child's own entries.
+				// `name = value` where `name` is an outer variable, not a member: handled.
+			}
+			else if( rhsNode && rhsNode->nodeType == snInitBlock )
+			{
+				// A NESTED block on a MEMBER: build the child, bind it to the member, and make
+				// that member the target for the child's own entries.
 				asCExprContext lctx(engine), rctx(engine);
 				int lr = CompileCondition(lhsNode, &lctx);
 				int rr = CompileAssignment(rhsNode->firstChild, &rctx);
+				asCDataType memberType = lctx.type.dataType;
 				if( lr >= 0 && rr >= 0 )
 				{
 					asCExprContext assigned(engine);
@@ -4189,18 +4341,15 @@ void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *b
 					FinishInitializerEntry(&assigned, entry, bc);
 				}
 
-				m_initTargetValues.PushLast(0);
-				m_initTargetNodes.PushLast(lhsNode);
+				PushInitTarget(0, lhsNode, memberType);
 				CompileInitializerEntries(rhsNode, bc);
-				m_initTargetValues.PopLast();
-				m_initTargetNodes.PopLast();
+				m_initTargets.PopLast();
 			}
 			else
 			{
 				// ORGLIN (ADR-0032): a call entry `name(args)` is handled here — a member of the
-				// target compiles as a method call, anything else is an anonymous construction
-				// entry that is built detached and attached. Anything that is not a bare call
-				// falls through to the ordinary assignment path.
+				// target compiles as a method call, anything else is an anonymous child. Anything
+				// that is not a bare call falls through to the ordinary assignment path.
 				if( !CompileInitCallEntry(entry, bc) )
 				{
 					asCExprContext e(engine);
@@ -4212,18 +4361,14 @@ void asCCompiler::CompileInitializerEntries(asCScriptNode *block, asCByteCode *b
 		else if( entry->nodeType == snInitBlock )
 		{
 			// ORGLIN (ADR-0032 §2.2 form 3): an ANONYMOUS entry — `kind(args) { ... }`, whose
-			// base the parser left as a BARE `kind(args)` call. The call builds the object
-			// DETACHED; the block's entries are applied to it; then the enclosing target's
-			// registered initializer FINALIZER (`addChild` for UI controls) attaches it. The
-			// object is never a member of the parent — it is only a member while its own block
-			// is applied. Order = structure: the calls run in source order, so children land in
-			// that order.
+			// base the parser left as a BARE `kind(args)` call. The call builds the object, the
+			// enclosing target's registered initializer FINALIZER (`add` for UI controls)
+			// attaches it, and the block's entries are then applied to the attached object. It
+			// is never a member of the parent. Order = structure: the calls run in source
+			// order, so children land in that order.
 			asCExprContext e(engine);
-			if( CompileInitBlockValue(entry, &e, entry) >= 0 )
-			{
-				if( !EmitInitializerAttach(entry, &e, bc) )
-					FinishInitializerEntry(&e, entry, bc);
-			}
+			if( CompileInitChild(entry, &e) >= 0 )
+				FinishInitializerEntry(&e, entry, bc);
 		}
 		else
 			Error("Unsupported initializer entry", entry);
@@ -12893,29 +13038,7 @@ int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx
 		// ORGLIN (ADR-0032): the object the innermost initializer block is configuring. Each
 		// entry is `<target>.name = value`, so this plays the role of the local variable at
 		// the base of an ordinary member access.
-		asUINT n = m_initTargetValues.GetLength();
-		if( n == 0 )
-		{
-			Error("Initializer target used outside an initializer block", node);
-			ctx->type.SetDummy();
-			return -1;
-		}
-		asCScriptNode *targetNode = m_initTargetNodes[n-1];
-		if( targetNode )
-		{
-			// A nested block's target is the member expression it was bound to (e.g.
-			// `outer.backdrop`), which itself names the target BELOW it. Resolving it with
-			// the current frame popped is what makes nesting recurse correctly.
-			m_initTargetValues.PopLast();
-			m_initTargetNodes.PopLast();
-			int r = CompileCondition(targetNode, ctx);
-			m_initTargetValues.PushLast(0);
-			m_initTargetNodes.PushLast(targetNode);
-			return r;
-		}
-		asCExprValue *target = m_initTargetValues[n-1];
-		ctx->bc.InstrSHORT(asBC_PSF, (short)target->stackOffset);
-		ctx->type = *target;
+		return CompileInitTargetAccess(ctx, node);
 	}
 	else if( vnode->nodeType == snConstant )
 	{
