@@ -47,6 +47,17 @@
 
 BEGIN_AS_NAMESPACE
 
+// ORGLIN: f-string scanning, shared by the tokenizer (to find where the literal ends)
+// and the compiler (to step over a nested f-string inside an expression).
+//
+// asFStringScanBody: `n` is the index just after the opening quote(s). Returns the
+// index of the closing quote (the first of the three for a """ literal), or `len` if
+// the literal never ends.
+// asFStringScanField: `n` is the index just after a field's `{`. Returns the index of
+// the `}` that closes the field, or `len`.
+size_t asFStringScanBody(const char *s, size_t len, size_t n, bool triple);
+size_t asFStringScanField(const char *s, size_t len, size_t n);
+
 class asCTokenizer
 {
 public:

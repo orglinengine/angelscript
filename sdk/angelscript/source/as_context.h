@@ -163,6 +163,7 @@ public:
 	void DetachEngine();
 
 	void ExecuteNext();
+	void *ArrayElement(void *obj, asUINT index); // ORGLIN: asEP_ARRAY_LAYOUT
 	void CleanStack(bool catchException = false);
 	bool CleanStackFrame(bool catchException = false);
 	void CleanArgsOnStack();

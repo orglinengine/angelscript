@@ -355,6 +355,36 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.initializerBlocks = value ? true : false;
 		break;
 
+	// ORGLIN: the function that f"..." literals are compiled into a call of.
+	case asEP_FSTRING_FORMAT_FUNCTION:
+		ep.fstringFormatFunc = (int)value;
+		break;
+
+	// ORGLIN: SUSPEND in loops.
+	case asEP_LOOP_SUSPEND:
+		ep.loopSuspend = value ? true : false;
+		break;
+
+	// ORGLIN: the array layout for the element-access fast path.
+	case asEP_ARRAY_LAYOUT:
+	{
+		ep.arrayLayoutSet = false;
+		arrayAtFunc[0] = arrayAtFunc[1] = 0;
+		if( value == 0 )
+			break;
+		arrayLayout = *(const asSArrayLayout*)value;
+		for( int n = 0; n < 2; n++ )
+		{
+			const int id = arrayLayout.opIndexFuncIds[n];
+			if( id <= 0 || id >= (int)scriptFunctions.GetLength() || scriptFunctions[id] == 0 ||
+				scriptFunctions[id]->sysFuncIntf == 0 || scriptFunctions[id]->sysFuncIntf->callConv != ICC_THISCALL )
+				return asINVALID_ARG;
+			arrayAtFunc[n] = scriptFunctions[id]->sysFuncIntf->func;
+		}
+		ep.arrayLayoutSet = true;
+		break;
+	}
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		ep.buildWithoutLineCues = value ? true : false;
 		break;
@@ -579,6 +609,18 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_INITIALIZER_BLOCKS:
 		return ep.initializerBlocks;
 
+	// ORGLIN: f-strings.
+	case asEP_FSTRING_FORMAT_FUNCTION:
+		return (asPWORD)ep.fstringFormatFunc;
+
+	// ORGLIN: SUSPEND in loops.
+	case asEP_LOOP_SUSPEND:
+		return ep.loopSuspend;
+
+	// ORGLIN: the array layout.
+	case asEP_ARRAY_LAYOUT:
+		return ep.arrayLayoutSet ? (asPWORD)&arrayLayout : 0;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		return ep.buildWithoutLineCues;
 
@@ -723,6 +765,9 @@ asCScriptEngine::asCScriptEngine()
 		ep.bracketListLiterals           = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.dictionaryLiterals            = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.initializerBlocks             = false;	// ORGLIN: off by default (language stays unchanged)
+		ep.fstringFormatFunc             = 0;		// ORGLIN: no f-string function (f"..." is a plain string)
+		ep.loopSuspend                   = true;	// ORGLIN: upstream behaviour
+		ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
 		ep.buildWithoutLineCues          = false;
@@ -857,6 +902,14 @@ void asCScriptEngine::DeleteDiscardedModules()
 		if( prop && prop->refCount.get() == 1 )
 			RemoveGlobalProperty(prop);
 	}
+}
+
+// ORGLIN: is this the application array's opIndex (or a template instance's copy of it)?
+bool asCScriptEngine::IsArrayAt(asCScriptFunction *func) const
+{
+	if( !ep.arrayLayoutSet || func == 0 || func->sysFuncIntf == 0 )
+		return false;
+	return func->sysFuncIntf->func == arrayAtFunc[0] || func->sysFuncIntf->func == arrayAtFunc[1];
 }
 
 asCScriptEngine::~asCScriptEngine()

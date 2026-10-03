@@ -130,6 +130,7 @@ const char *asCTokenizer::GetDefinition(int tokenType)
 	if( tokenType == ttDoubleConstant				) return "<double constant>";
 	if( tokenType == ttStringConstant				) return "<string constant>";
 	if( tokenType == ttMultilineStringConstant      ) return "<multiline string constant>";
+	if( tokenType == ttFStringConstant              ) return "<f-string constant>";
 	if( tokenType == ttNonTerminatedStringConstant	) return "<nonterminated string constant>";
 	if( tokenType == ttBitsConstant					) return "<bits constant>";
 	if( tokenType == ttHeredocStringConstant		) return "<heredoc string constant>";
@@ -279,6 +280,95 @@ bool asCTokenizer::IsValidSeparatorDigitInRadix(const char* source, size_t sourc
 	return true;
 }
 
+// ORGLIN: f-strings ---------------------------------------------------------------
+// A replacement field `{ ... }` holds an EXPRESSION, and an expression may itself
+// contain string literals, so the end of an f-string cannot be found by looking for
+// the next quote: a quote inside a field belongs to the expression, as in Python 3.12.
+//   f"{names["a"]} and {f"{x:>{w}}"}"
+size_t asFStringScanField(const char *s, size_t len, size_t n)
+{
+	int  depth   = 0;     // open ( [ { inside the expression
+	int  ternary = 0;     // `?` still waiting for its `:`
+	bool spec    = false; // after the `:` that starts the format spec
+	for( ; n < len; n++ )
+	{
+		const char c = s[n];
+		if( spec )
+		{
+			// The spec is plain text, except that it may hold nested fields
+			if( c == '}' ) return n;
+			if( c == '{' )
+			{
+				n = asFStringScanField(s, len, n + 1);
+				if( n >= len ) return len;
+			}
+			continue;
+		}
+
+		if( c == '"' || c == '\'' )
+		{
+			// A string (or name) literal inside the expression
+			for( n++; n < len && s[n] != c; n++ )
+				if( s[n] == '\\' ) n++;
+			if( n >= len ) return len;
+			continue;
+		}
+		if( c == 'f' && n + 1 < len && s[n+1] == '"' &&
+			!(n > 0 && ((s[n-1] >= 'a' && s[n-1] <= 'z') || (s[n-1] >= 'A' && s[n-1] <= 'Z') || (s[n-1] >= '0' && s[n-1] <= '9') || s[n-1] == '_')) )
+		{
+			// A nested f-string
+			n = asFStringScanBody(s, len, n + 2, false);
+			if( n >= len ) return len;
+			continue;
+		}
+		if( c == '\\' ) { n++; continue; }
+
+		if( c == '(' || c == '[' || c == '{' ) depth++;
+		else if( c == ')' || c == ']' ) depth--;
+		else if( c == '}' )
+		{
+			if( depth <= 0 ) return n;
+			depth--;
+		}
+		else if( depth <= 0 )
+		{
+			if( c == '?' ) ternary++;
+			else if( c == ':' )
+			{
+				if( n + 1 < len && s[n+1] == ':' ) n++;   // scope operator
+				else if( ternary > 0 ) ternary--;          // the `:` of `a ? b : c`
+				else spec = true;
+			}
+		}
+	}
+	return len;
+}
+
+size_t asFStringScanBody(const char *s, size_t len, size_t n, bool triple)
+{
+	bool evenSlashes = true;
+	for( ; n < len; n++ )
+	{
+		const char c = s[n];
+		if( triple )
+		{
+			if( c == '"' && n + 2 < len && s[n+1] == '"' && s[n+2] == '"' ) return n;
+		}
+		else if( c == '"' && evenSlashes )
+			return n;
+
+		if( c == '{' && evenSlashes )
+		{
+			if( n + 1 < len && s[n+1] == '{' ) { n++; continue; }
+			n = asFStringScanField(s, len, n + 1);
+			if( n >= len ) return len;
+			continue;
+		}
+
+		if( !triple && c == '\\' ) evenSlashes = !evenSlashes; else evenSlashes = true;
+	}
+	return len;
+}
 bool asCTokenizer::IsConstant(const char *source, size_t sourceLength, size_t &tokenLength, eTokenType &tokenType) const
 {
 	// Starting with number
@@ -364,6 +454,24 @@ bool asCTokenizer::IsConstant(const char *source, size_t sourceLength, size_t &t
 		return true;
 	}
 
+	// ORGLIN: f"..." and f"""...""": a string literal with an `f` prefix. Fields in
+	// braces hold expressions, so the end is found by asFStringScanBody (above) and
+	// not by the next quote.
+	if( source[0] == 'f' && sourceLength >= 2 && source[1] == '"' )
+	{
+		const bool triple = sourceLength >= 7 && source[2] == '"' && source[3] == '"';
+		const size_t end = asFStringScanBody(source, sourceLength, triple ? 4 : 2, triple);
+		if( end >= sourceLength )
+		{
+			tokenType   = ttNonTerminatedStringConstant;
+			tokenLength = sourceLength;
+			return true;
+		}
+
+		tokenType   = ttFStringConstant;
+		tokenLength = end + (triple ? 3 : 1);
+		return true;
+	}
 	// String constant between double or single quotes
 	if( source[0] == '"' || source[0] == '\'' )
 	{

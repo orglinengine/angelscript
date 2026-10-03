@@ -1811,12 +1811,24 @@ asCScriptNode *asCParser::ParseConstant()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	// We want to gather a list of string constants to concatenate as children
-	if( t.type == ttStringConstant || t.type == ttMultilineStringConstant || t.type == ttHeredocStringConstant )
+	// ORGLIN: an f"..." literal is one more kind of string piece in the list
+	if( t.type == ttStringConstant || t.type == ttMultilineStringConstant || t.type == ttHeredocStringConstant || t.type == ttFStringConstant )
 		RewindTo(&t);
 
-	while( t.type == ttStringConstant || t.type == ttMultilineStringConstant || t.type == ttHeredocStringConstant )
+	while( t.type == ttStringConstant || t.type == ttMultilineStringConstant || t.type == ttHeredocStringConstant || t.type == ttFStringConstant )
 	{
-		node->AddChildLast(ParseStringConstant());
+		if( t.type == ttFStringConstant )
+		{
+			asCScriptNode *fnode = CreateNode(snConstant);
+			if( fnode == 0 ) return node;
+
+			GetToken(&t);
+			fnode->SetToken(&t);
+			fnode->UpdateSourcePos(t.pos, t.length);
+			node->AddChildLast(fnode);
+		}
+		else
+			node->AddChildLast(ParseStringConstant());
 
 		GetToken(&t);
 		RewindTo(&t);
@@ -2566,6 +2578,7 @@ bool asCParser::IsConstant(int tokenType)
 		tokenType == ttStringConstant ||
 		tokenType == ttMultilineStringConstant ||
 		tokenType == ttHeredocStringConstant ||
+		tokenType == ttFStringConstant ||
 		tokenType == ttTrue ||
 		tokenType == ttFalse ||
 		tokenType == ttBitsConstant ||

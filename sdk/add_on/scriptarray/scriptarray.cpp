@@ -29,6 +29,22 @@ void CScriptArray::SetMemoryFunctions(asALLOCFUNC_t allocFunc, asFREEFUNC_t free
 }
 
 static void RegisterScriptArray_Native(asIScriptEngine *engine);
+
+// ORGLIN: the offsets of CScriptArray's protected members, for asEP_ARRAY_LAYOUT.
+// A derived class may name them; nothing is ever constructed.
+struct CScriptArrayLayoutProbe : CScriptArray
+{
+	static int BufferOffset()      { return Offset(&CScriptArrayLayoutProbe::buffer); }
+	static int ElementSizeOffset() { return Offset(&CScriptArrayLayoutProbe::elementSize); }
+	static int SubTypeIdOffset()   { return Offset(&CScriptArrayLayoutProbe::subTypeId); }
+private:
+	template <class M> static int Offset(M CScriptArray::*member)
+	{
+		alignas(CScriptArray) static char probe[sizeof(CScriptArray)];
+		CScriptArray *a = reinterpret_cast<CScriptArray*>(probe);
+		return (int)(reinterpret_cast<char*>(&(a->*member)) - probe);
+	}
+};
 static void RegisterScriptArray_Generic(asIScriptEngine *engine);
 
 struct SArrayBuffer
@@ -311,7 +327,23 @@ static void RegisterScriptArray_Native(asIScriptEngine *engine)
 
 	// The index operator returns the template subtype
 	r = engine->RegisterObjectMethod("array<T>", "T &opIndex(uint index)", asMETHODPR(CScriptArray, At, (asUINT), void*), asCALL_THISCALL); assert( r >= 0 );
+	const int opIndexId = r;
 	r = engine->RegisterObjectMethod("array<T>", "const T &opIndex(uint index) const", asMETHODPR(CScriptArray, At, (asUINT) const, const void*), asCALL_THISCALL); assert( r >= 0 );
+	const int opIndexConstId = r;
+
+	// ORGLIN: tell the VM where the elements are, so `a[i]` needs no native call
+	// (asEP_ARRAY_LAYOUT). At() and the VM agree on the layout below.
+	{
+		asSArrayLayout layout;
+		layout.opIndexFuncIds[0]  = opIndexId;
+		layout.opIndexFuncIds[1]  = opIndexConstId;
+		layout.bufferOffset       = CScriptArrayLayoutProbe::BufferOffset();
+		layout.elementSizeOffset  = CScriptArrayLayoutProbe::ElementSizeOffset();
+		layout.subTypeIdOffset    = CScriptArrayLayoutProbe::SubTypeIdOffset();
+		layout.lengthOffset       = (int)offsetof(SArrayBuffer, numElements);
+		layout.dataOffset         = (int)offsetof(SArrayBuffer, data);
+		r = engine->SetEngineProperty(asEP_ARRAY_LAYOUT, (asPWORD)&layout); assert( r >= 0 );
+	}
 
 	// Support for foreach
 	r = engine->RegisterObjectMethod("array<T>", "uint opForBegin() const", asFUNCTIONPR(CScriptArray_opForBegin, (const CScriptArray *), asUINT), asCALL_CDECL_OBJLAST); assert(r >= 0);

@@ -1911,6 +1911,7 @@ asCScriptFunction* asCScriptFunction::FindNextFunctionCalled(asUINT startSearchF
 		if (bc == asBC_CALL ||
 			bc == asBC_CALLSYS ||
 			bc == asBC_Thiscall1 ||
+			bc == asBC_ArrAt ||
 			bc == asBC_CALLINTF ||
 			bc == asBC_ALLOC ||
 			bc == asBC_CALLBND ||
@@ -1948,6 +1949,7 @@ asCScriptFunction* asCScriptFunction::GetCalledFunction(asDWORD programPos)
 	if (bc == asBC_CALL ||
 		bc == asBC_CALLSYS ||
 		bc == asBC_Thiscall1 ||
+		bc == asBC_ArrAt ||
 		bc == asBC_CALLINTF)
 	{
 		// Find the function from the function id in bytecode

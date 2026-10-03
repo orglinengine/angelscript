@@ -114,7 +114,8 @@ void asCByteCode::GetVarsUsed(asCArray<int> &vars)
 	asCByteInstruction *curr = first;
 	while( curr )
 	{
-		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG )
+		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG ||
+			asBCInfo[curr->op].type == asBCTYPE_rW_rW_rW_ARG )
 		{
 			InsertIfNotExists(vars, curr->wArg[0]);
 			InsertIfNotExists(vars, curr->wArg[1]);
@@ -133,6 +134,7 @@ void asCByteCode::GetVarsUsed(asCArray<int> &vars)
 		}
 		else if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_ARG ||
 				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG ||
+				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_W_DW_ARG ||
 				 asBCInfo[curr->op].type == asBCTYPE_wW_rW_DW_ARG )
 		{
 			InsertIfNotExists(vars, curr->wArg[0]);
@@ -159,7 +161,8 @@ bool asCByteCode::IsVarUsed(int offset)
 	while( curr )
 	{
 		// Verify all ops that use variables
-		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG )
+		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG ||
+			asBCInfo[curr->op].type == asBCTYPE_rW_rW_rW_ARG )
 		{
 			if( curr->wArg[0] == offset || curr->wArg[1] == offset || curr->wArg[2] == offset )
 				return true;
@@ -178,6 +181,7 @@ bool asCByteCode::IsVarUsed(int offset)
 		}
 		else if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_ARG ||
 				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG ||
+				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_W_DW_ARG ||
 				 asBCInfo[curr->op].type == asBCTYPE_wW_rW_DW_ARG )
 		{
 			if( curr->wArg[0] == offset || curr->wArg[1] == offset )
@@ -200,15 +204,22 @@ bool asCByteCode::IsVarUsed(int offset)
 	return false;
 }
 
-void asCByteCode::ExchangeVar(int oldOffset, int newOffset)
+void asCByteCode::ExchangeVar(int oldOffset, int newOffset, bool objInfoToo)
 {
 	asASSERT(oldOffset != 0);
 
 	asCByteInstruction *curr = first;
 	while( curr )
 	{
+		// ORGLIN: the "object initialized / destroyed" markers name the variable too.
+		// They are moved only on request (copy elision, where the object itself changes
+		// owner); the upstream callers keep their behaviour.
+		if( objInfoToo && curr->op == asBC_ObjInfo && curr->wArg[0] == oldOffset )
+			curr->wArg[0] = (short)newOffset;
+
 		// Verify all ops that use variables
-		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG )
+		if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG ||
+			asBCInfo[curr->op].type == asBCTYPE_rW_rW_rW_ARG )
 		{
 			if( curr->wArg[0] == oldOffset )
 				curr->wArg[0] = (short)newOffset;
@@ -230,7 +241,8 @@ void asCByteCode::ExchangeVar(int oldOffset, int newOffset)
 				curr->wArg[0] = (short)newOffset;
 		}
 		else if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_ARG ||
-				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG )
+				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG ||
+				 asBCInfo[curr->op].type == asBCTYPE_rW_rW_W_DW_ARG )
 		{
 			if( curr->wArg[0] == oldOffset )
 				curr->wArg[0] = (short)newOffset;
@@ -562,6 +574,84 @@ bool asCByteCode::RemoveUnusedValue(asCByteInstruction *curr, asCByteInstruction
 		return true;
 	}
 
+	// ORGLIN: the same for 64-bit results (int64 and double arithmetic, conversions):
+	// OP t, a, b ; CpyVtoV8 x, t  ->  OP x, a, b
+	if( (asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG ||
+		 asBCInfo[curr->op].type == asBCTYPE_wW_rW_DW_ARG ||
+		 asBCInfo[curr->op].type == asBCTYPE_wW_rW_ARG) &&
+		asBCInfo[curr->op].writeSize == 8 &&
+		curr->next && curr->next->op == asBC_CpyVtoV8 &&
+		curr->wArg[0] == curr->next->wArg[1] &&
+		IsTemporary(curr->wArg[0]) &&
+		!IsTempVarRead(curr->next, curr->wArg[0]) )
+	{
+		curr->wArg[0] = curr->next->wArg[0];
+		*next = GoForward(DeleteInstruction(curr->next));
+		return true;
+	}
+
+#ifndef AS_BIG_ENDIAN
+	// ORGLIN: i64TOi t, x ; PshV4 t  ->  PshV4 x
+	// The int value of an int64 is its low dword, which is where the variable starts:
+	// pushing those 4 bytes IS the conversion (the `a[i]` index with an int64 `i`).
+	if( curr->op == asBC_i64TOi && curr->next && curr->next->op == asBC_PshV4 &&
+		curr->next->wArg[0] == curr->wArg[0] &&
+		IsTemporary(curr->wArg[0]) &&
+		!IsTempVarRead(curr->next, curr->wArg[0]) )
+	{
+		curr->next->wArg[0] = curr->wArg[1];
+		*next = GoForward(DeleteInstruction(curr));
+		return true;
+	}
+#endif
+
+	// ORGLIN: a 64-bit constant set in a temp and immediately moved to a variable:
+	// SetV8 t, c ; CpyVtoV8 x, t  ->  SetV8 x, c
+	if( curr->op == asBC_SetV8 && curr->next && curr->next->op == asBC_CpyVtoV8 &&
+		curr->wArg[0] == curr->next->wArg[1] &&
+		IsTemporary(curr->wArg[0]) &&
+		!IsTempVarRead(curr->next, curr->wArg[0]) )
+	{
+		curr->wArg[0] = curr->next->wArg[0];
+		*next = GoForward(DeleteInstruction(curr->next));
+		return true;
+	}
+
+	// ORGLIN: a variable copied to a temp only to be read once by the next instruction
+	// reads the variable itself: CpyVtoV8 t, x ; OP .., t, ..  ->  OP .., x, ..
+	// (the `a[i]` index with an int64 `i` was CpyVtoV8 + i64TOi on every access).
+	if( (curr->op == asBC_CpyVtoV8 || curr->op == asBC_CpyVtoV4) && curr->next &&
+		curr->wArg[0] != curr->wArg[1] &&
+		IsTemporary(curr->wArg[0]) &&
+		ReadsValueOnly(curr->next, curr->op == asBC_CpyVtoV8) &&
+		IsTempVarReadByInstr(curr->next, curr->wArg[0]) &&
+		!IsTempVarRead(curr->next, curr->wArg[0]) )
+	{
+		const short t = curr->wArg[0];
+		const short x = curr->wArg[1];
+		asCByteInstruction *use = curr->next;
+		switch( asBCInfo[use->op].type )
+		{
+		case asBCTYPE_wW_rW_rW_ARG:
+			if( use->wArg[1] == t ) use->wArg[1] = x;
+			if( use->wArg[2] == t ) use->wArg[2] = x;
+			break;
+		case asBCTYPE_wW_rW_ARG:
+		case asBCTYPE_wW_rW_DW_ARG:
+			if( use->wArg[1] == t ) use->wArg[1] = x;
+			break;
+		case asBCTYPE_rW_rW_ARG:
+			if( use->wArg[0] == t ) use->wArg[0] = x;
+			if( use->wArg[1] == t ) use->wArg[1] = x;
+			break;
+		default: // rW_ARG / rW_DW_ARG
+			if( use->wArg[0] == t ) use->wArg[0] = x;
+			break;
+		}
+		*next = GoForward(DeleteInstruction(curr));
+		return true;
+	}
+
 	// The register is copied to a temp variable and then back to the register again without being used afterwards
 	if( curr->op == asBC_CpyRtoV4 && curr->next && curr->next->op == asBC_CpyVtoR4 &&
 		curr->wArg[0] == curr->next->wArg[0] &&
@@ -601,6 +691,41 @@ bool asCByteCode::RemoveUnusedValue(asCByteInstruction *curr, asCByteInstruction
 	}
 
 	return false;
+}
+
+// ORGLIN: instructions that only READ the VALUE of their source variables (never take
+// their address, never modify them in place), so a source can be renamed to another
+// variable holding the same value. `wide` = the value was copied with 8 bytes, which
+// also allows the readers of 4 bytes (they see the low half, which is the same).
+bool asCByteCode::ReadsValueOnly(asCByteInstruction *curr, bool wide)
+{
+	switch( curr->op )
+	{
+	// 4-byte readers
+	case asBC_PshV4: case asBC_CpyVtoR4: case asBC_CpyVtoV4:
+	case asBC_CMPi: case asBC_CMPu: case asBC_CMPf: case asBC_CMPIi: case asBC_CMPIu: case asBC_CMPIf:
+	case asBC_ADDi: case asBC_SUBi: case asBC_MULi: case asBC_DIVi: case asBC_MODi: case asBC_DIVu: case asBC_MODu:
+	case asBC_ADDf: case asBC_SUBf: case asBC_MULf: case asBC_DIVf: case asBC_MODf:
+	case asBC_ADDIi: case asBC_SUBIi: case asBC_MULIi: case asBC_ADDIf: case asBC_SUBIf: case asBC_MULIf:
+	case asBC_BAND: case asBC_BOR: case asBC_BXOR: case asBC_BSLL: case asBC_BSRL: case asBC_BSRA:
+	case asBC_iTOd: case asBC_uTOd: case asBC_fTOd: case asBC_iTOi64: case asBC_uTOi64: case asBC_fTOi64: case asBC_fTOu64:
+	case asBC_POWi: case asBC_POWu: case asBC_POWf:
+		return true;
+
+	// 8-byte readers
+	case asBC_PshV8: case asBC_CpyVtoR8: case asBC_CpyVtoV8:
+	case asBC_CMPi64: case asBC_CMPu64: case asBC_CMPd:
+	case asBC_ADDi64: case asBC_SUBi64: case asBC_MULi64: case asBC_DIVi64: case asBC_MODi64: case asBC_DIVu64: case asBC_MODu64:
+	case asBC_BAND64: case asBC_BOR64: case asBC_BXOR64: case asBC_BSLL64: case asBC_BSRL64: case asBC_BSRA64:
+	case asBC_ADDd: case asBC_SUBd: case asBC_MULd: case asBC_DIVd: case asBC_MODd:
+	case asBC_i64TOi: case asBC_i64TOf: case asBC_i64TOd: case asBC_u64TOf: case asBC_u64TOd:
+	case asBC_dTOi: case asBC_dTOu: case asBC_dTOf: case asBC_dTOi64: case asBC_dTOu64:
+	case asBC_POWd: case asBC_POWdi: case asBC_POWi64: case asBC_POWu64:
+		return wide;
+
+	default:
+		return false;
+	}
 }
 
 bool asCByteCode::IsTemporary(int offset)
@@ -727,6 +852,20 @@ void asCByteCode::OptimizeLocally(const asCArray<int> &tempVariableOffsets)
 			else if( curr->next->op == asBC_DECi && !IsTempRegUsed(curr->next) )
 			{
 				curr->op = asBC_DecVi;
+				DeleteInstruction(curr->next);
+				instr = GoForward(curr);
+			}
+			// ORGLIN: LDV x, INCi64 -> IncVi64 x
+			else if( curr->next->op == asBC_INCi64 && !IsTempRegUsed(curr->next) )
+			{
+				curr->op = asBC_IncVi64;
+				DeleteInstruction(curr->next);
+				instr = GoForward(curr);
+			}
+			// ORGLIN: LDV x, DECi64 -> DecVi64 x
+			else if( curr->next->op == asBC_DECi64 && !IsTempRegUsed(curr->next) )
+			{
+				curr->op = asBC_DecVi64;
 				DeleteInstruction(curr->next);
 				instr = GoForward(curr);
 			}
@@ -1049,6 +1188,87 @@ void asCByteCode::OptimizeLocally(const asCArray<int> &tempVariableOffsets)
 		}
 	}
 
+	// ORGLIN: CMPx a, b ; Jx label  ->  JCMPx a, b, cond, label
+	// The value register written by the compare is consumed by the jump alone (the
+	// compiler emits the pair for a condition), so nothing is lost by not writing it.
+	for( asCByteInstruction *c = first; c; c = c->next )
+	{
+		if( (c->op != asBC_CMPi && c->op != asBC_CMPu && c->op != asBC_CMPi64) || c->next == 0 )
+			continue;
+		asCByteInstruction *j = c->next;
+		int cond;
+		switch( j->op )
+		{
+		case asBC_JZ:  cond = 0; break;
+		case asBC_JNZ: cond = 1; break;
+		case asBC_JS:  cond = 2; break;
+		case asBC_JNS: cond = 3; break;
+		case asBC_JP:  cond = 4; break;
+		case asBC_JNP: cond = 5; break;
+		default: continue;
+		}
+		c->op = c->op == asBC_CMPi ? asBC_JCMPi : c->op == asBC_CMPu ? asBC_JCMPu : asBC_JCMPi64;
+		c->wArg[2] = (short)cond;
+		memcpy(c->arg, j->arg, sizeof(c->arg));
+		c->size = asBCTypeSize[asBCInfo[c->op].type];
+		c->stackInc = asBCInfo[c->op].stackInc;
+		DeleteInstruction(j);
+	}
+
+	// ORGLIN: a whole array read or write in one instruction, when the array and the
+	// index are local variables and nothing after reads the element address left in
+	// the value register:
+	//   PshV4 i ; PshVPtr a ; ArrAt ; RDRn d   ->  ArrGetN d, a, i
+	//   PshV4 i ; PshVPtr a ; ArrAt ; WRTVn s  ->  ArrSetN a, i, s
+	for( asCByteInstruction *c = first; c; c = c->next )
+	{
+		if( c->op != asBC_PshV4 ) continue;
+		asCByteInstruction *p = c->next;
+		if( p == 0 || p->op != asBC_PshVPtr ) continue;
+		asCByteInstruction *a = p->next;
+		if( a == 0 || a->op != asBC_ArrAt ) continue;
+		// A call is followed by a JitEntry (a resume point for a JIT); the fused
+		// instruction is not a call, so that entry goes with it.
+		asCByteInstruction *jit = a->next;
+		if( jit && jit->op != asBC_JitEntry ) jit = 0;
+		asCByteInstruction *u = jit ? jit->next : a->next;
+		if( u == 0 ) continue;
+
+		asEBCInstr fused;
+		switch( u->op )
+		{
+		case asBC_RDR1:  fused = asBC_ArrGet1; break;
+		case asBC_RDR2:  fused = asBC_ArrGet2; break;
+		case asBC_RDR4:  fused = asBC_ArrGet4; break;
+		case asBC_RDR8:  fused = asBC_ArrGet8; break;
+		case asBC_WRTV1: fused = asBC_ArrSet1; break;
+		case asBC_WRTV2: fused = asBC_ArrSet2; break;
+		case asBC_WRTV4: fused = asBC_ArrSet4; break;
+		case asBC_WRTV8: fused = asBC_ArrSet8; break;
+		default: continue;
+		}
+		if( IsTempRegUsed(u) ) continue;
+
+		const short idx = c->wArg[0];
+		const short arr = p->wArg[0];
+		const short val = u->wArg[0];
+		c->op = fused;
+		if( fused <= asBC_ArrGet8 )
+		{
+			c->wArg[0] = val; c->wArg[1] = arr; c->wArg[2] = idx;
+		}
+		else
+		{
+			c->wArg[0] = arr; c->wArg[1] = idx; c->wArg[2] = val;
+		}
+		c->size = asBCTypeSize[asBCInfo[fused].type];
+		c->stackInc = 0;
+		DeleteInstruction(u);
+		if( jit ) DeleteInstruction(jit);
+		DeleteInstruction(a);
+		DeleteInstruction(p);
+	}
+
 	// Optimize unnecessary refcpy for return handle. This scenario only happens for return statements
 	// and LOADOBJ can only be the last instruction before the RET, so doing this check after the rest of
 	// the optimizations have taken place saves us time.
@@ -1204,6 +1424,41 @@ void asCByteCode::Optimize()
 				instr = GoBack(DeleteInstruction(curr));
 		}
 	}
+
+	// (This needs the whole function: the step and the test are compiled as separate
+	// statements, so OptimizeLocally never sees them side by side.)
+	// ORGLIN: the step of a counting loop. A `for` loop ends with
+	//     L3: IncVi x ;  L1: JCMPx x, n, cond, L4
+	// where L1 is also where the loop is entered (the first test skips the step). The
+	// step becomes one instruction; the JCMP stays for the entry. When the fused step
+	// does not jump it falls into that JCMP, which finds the same answer and falls
+	// through too â€” one extra instruction per loop EXIT, none per iteration.
+	for( asCByteInstruction *c = first; c; c = c->next )
+	{
+		const bool inc32 = c->op == asBC_IncVi   || c->op == asBC_DecVi;
+		const bool inc64 = c->op == asBC_IncVi64 || c->op == asBC_DecVi64;
+		if( !inc32 && !inc64 ) continue;
+
+		// Skip the labels between the step and the test (and line markers and JIT entry points, which execute nothing here; a marker such
+		// as ObjInfo must not be jumped over)
+		asCByteInstruction *j = c->next;
+		while( j && (j->op == asBC_LABEL || j->op == asBC_LINE || j->op == asBC_JitEntry) ) j = j->next;
+		if( j == 0 || j->wArg[0] != c->wArg[0] ) continue;
+		asEBCInstr fused;
+		if( inc64 && j->op == asBC_JCMPi64 )     fused = asBC_IncJCMPi64;
+		else if( inc32 && j->op == asBC_JCMPi )  fused = asBC_IncJCMPi;
+		else if( inc32 && j->op == asBC_JCMPu )  fused = asBC_IncJCMPu;
+		else continue;
+		if( j->wArg[1] == c->wArg[0] ) continue; // x compared with itself: leave it
+
+		const bool dec = c->op == asBC_DecVi || c->op == asBC_DecVi64;
+		c->op = fused;
+		c->wArg[1] = j->wArg[1];
+		c->wArg[2] = (short)(j->wArg[2] | (dec ? 8 : 0));
+		memcpy(c->arg, j->arg, sizeof(c->arg));
+		c->size = asBCTypeSize[asBCInfo[fused].type];
+		c->stackInc = 0;
+	}
 }
 
 bool asCByteCode::IsTempVarReadByInstr(asCByteInstruction *curr, int offset)
@@ -1211,6 +1466,9 @@ bool asCByteCode::IsTempVarReadByInstr(asCByteInstruction *curr, int offset)
 	// Which instructions read from variables?
 	if( asBCInfo[curr->op].type == asBCTYPE_wW_rW_rW_ARG &&
 		(int(curr->wArg[1]) == offset || int(curr->wArg[2]) == offset) )
+		return true;
+	else if( asBCInfo[curr->op].type == asBCTYPE_rW_rW_rW_ARG &&
+		(int(curr->wArg[0]) == offset || int(curr->wArg[1]) == offset || int(curr->wArg[2]) == offset) )
 		return true;
 	else if( (asBCInfo[curr->op].type == asBCTYPE_rW_ARG    ||
 			  asBCInfo[curr->op].type == asBCTYPE_rW_DW_ARG ||
@@ -1224,7 +1482,8 @@ bool asCByteCode::IsTempVarReadByInstr(asCByteInstruction *curr, int offset)
 			  asBCInfo[curr->op].type == asBCTYPE_wW_rW_DW_ARG) &&
 			 int(curr->wArg[1]) == offset )
 		return true;
-	else if( asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG &&
+	else if( (asBCInfo[curr->op].type == asBCTYPE_rW_rW_ARG ||
+			  asBCInfo[curr->op].type == asBCTYPE_rW_rW_W_DW_ARG) &&
 			 (int(curr->wArg[0]) == offset || int(curr->wArg[1]) == offset) )
 		return true;
 	else if( asBCInfo[curr->op].type == asBCTYPE_W_rW_ARG &&
@@ -1248,6 +1507,12 @@ bool asCByteCode::IsInstrJmpOrLabel(asCByteInstruction *curr)
 		curr->op == asBC_JNZ     ||
 		curr->op == asBC_JLowZ   ||
 		curr->op == asBC_JLowNZ  ||
+		curr->op == asBC_JCMPi   ||
+		curr->op == asBC_JCMPu   ||
+		curr->op == asBC_JCMPi64 ||
+		curr->op == asBC_IncJCMPi   ||
+		curr->op == asBC_IncJCMPu   ||
+		curr->op == asBC_IncJCMPi64 ||
 		curr->op == asBC_LABEL   )
 		return true;
 
@@ -1315,7 +1580,9 @@ bool asCByteCode::IsTempVarRead(asCByteInstruction *curr, int offset)
 			else if( curr->op == asBC_JZ    || curr->op == asBC_JNZ    ||
 				     curr->op == asBC_JS    || curr->op == asBC_JNS    ||
 					 curr->op == asBC_JP    || curr->op == asBC_JNP    ||
-					 curr->op == asBC_JLowZ || curr->op == asBC_JLowNZ )
+					 curr->op == asBC_JLowZ || curr->op == asBC_JLowNZ ||
+					 curr->op == asBC_JCMPi || curr->op == asBC_JCMPu  || curr->op == asBC_JCMPi64 ||
+					 curr->op == asBC_IncJCMPi || curr->op == asBC_IncJCMPu || curr->op == asBC_IncJCMPi64 )
 			{
 				// Find the destination. If it cannot be found it is because we're doing a localized
 				// optimization and the label hasn't been added to the final bytecode yet
@@ -1418,6 +1685,7 @@ bool asCByteCode::IsTempRegUsed(asCByteInstruction *curr)
 			curr->op == asBC_CALLSYS   ||
 			curr->op == asBC_CALLBND   ||
 			curr->op == asBC_Thiscall1 ||
+			curr->op == asBC_ArrAt     ||
 			curr->op == asBC_SUSPEND   ||
 			curr->op == asBC_ALLOC     ||
 			curr->op == asBC_CpyVtoR4  ||
@@ -1437,6 +1705,12 @@ bool asCByteCode::IsTempRegUsed(asCByteInstruction *curr)
 			curr->op == asBC_CMPIi     ||
 			curr->op == asBC_CMPIu     ||
 			curr->op == asBC_CMPIf     ||
+			curr->op == asBC_JCMPi     ||
+			curr->op == asBC_JCMPu     ||
+			curr->op == asBC_JCMPi64   ||
+			curr->op == asBC_IncJCMPi   ||
+			curr->op == asBC_IncJCMPu   ||
+			curr->op == asBC_IncJCMPi64 ||
 			curr->op == asBC_LoadThisR ||
 			curr->op == asBC_LoadRObjR ||
 			curr->op == asBC_LoadVObjR )
@@ -1461,8 +1735,10 @@ bool asCByteCode::IsSimpleExpression()
 			instr->op == asBC_FREE ||
 			instr->op == asBC_CallPtr ||
 			instr->op == asBC_CALLINTF ||
-			instr->op == asBC_CALLBND || 
-			instr->op == asBC_Thiscall1 )
+			instr->op == asBC_CALLBND ||
+			instr->op == asBC_Thiscall1 ||
+			instr->op == asBC_ArrAt ||
+			(instr->op >= asBC_ArrGet1 && instr->op <= asBC_ArrSet8) )
 			return false;
 
 		instr = instr->next;
@@ -1922,7 +2198,9 @@ int asCByteCode::ResolveJumpAddresses()
 			instr->op == asBC_JZ    || instr->op == asBC_JNZ    ||
 			instr->op == asBC_JLowZ || instr->op == asBC_JLowNZ ||
 			instr->op == asBC_JS    || instr->op == asBC_JNS    ||
-			instr->op == asBC_JP    || instr->op == asBC_JNP    )
+			instr->op == asBC_JP    || instr->op == asBC_JNP    ||
+			instr->op == asBC_JCMPi || instr->op == asBC_JCMPu  || instr->op == asBC_JCMPi64 ||
+			instr->op == asBC_IncJCMPi || instr->op == asBC_IncJCMPu || instr->op == asBC_IncJCMPi64 )
 		{
 			int label = *((int*) ARG_DW(instr->arg));
 			int labelPosOffset;
@@ -1988,6 +2266,7 @@ void asCByteCode::Output(asDWORD *array)
 				*(((asWORD*)ap)+1) = 0; // Clear upper bytes
 				break;
 			case asBCTYPE_wW_rW_rW_ARG:
+			case asBCTYPE_rW_rW_rW_ARG: // ORGLIN
 				*(((asWORD*)ap)+1) = instr->wArg[0];
 				*(((asWORD*)ap)+2) = instr->wArg[1];
 				*(((asWORD*)ap)+3) = instr->wArg[2];
@@ -2002,6 +2281,12 @@ void asCByteCode::Output(asDWORD *array)
 			case asBCTYPE_rW_W_DW_ARG:
 				*(((asWORD*)ap)+1) = instr->wArg[0];
 				*(((asWORD*)ap)+2) = instr->wArg[1];
+				*(ap+2) = *(asDWORD*)&instr->arg;
+				break;
+			case asBCTYPE_rW_rW_W_DW_ARG: // ORGLIN
+				*(((asWORD*)ap)+1) = instr->wArg[0];
+				*(((asWORD*)ap)+2) = instr->wArg[1];
+				*(((asWORD*)ap)+3) = instr->wArg[2];
 				*(ap+2) = *(asDWORD*)&instr->arg;
 				break;
 			case asBCTYPE_wW_QW_ARG:
@@ -2099,6 +2384,8 @@ void asCByteCode::PostProcess()
 					 instr->op == asBC_JLowZ || instr->op == asBC_JLowNZ ||
 					 instr->op == asBC_JS    || instr->op == asBC_JNS    ||
 					 instr->op == asBC_JP    || instr->op == asBC_JNP    ||
+					 instr->op == asBC_JCMPi || instr->op == asBC_JCMPu  || instr->op == asBC_JCMPi64 ||
+					 instr->op == asBC_IncJCMPi || instr->op == asBC_IncJCMPu || instr->op == asBC_IncJCMPi64 ||
 					 instr->op == asBC_TryBlock )
 			{
 				// Find the label that is being jumped to
@@ -2266,6 +2553,14 @@ void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 
 		case asBCTYPE_wW_W_ARG:
 			fprintf(file, "   %-8s v%d, %d\n", asBCInfo[instr->op].name, instr->wArg[0], instr->wArg[1]);
+			break;
+
+		case asBCTYPE_rW_rW_rW_ARG: // ORGLIN: array element store
+			fprintf(file, "   %-8s v%d, v%d, v%d\n", asBCInfo[instr->op].name, instr->wArg[0], instr->wArg[1], instr->wArg[2]);
+			break;
+
+		case asBCTYPE_rW_rW_W_DW_ARG: // ORGLIN: fused compare-and-jump
+			fprintf(file, "   %-8s v%d, v%d, cond %d, %+d\n", asBCInfo[instr->op].name, instr->wArg[0], instr->wArg[1], instr->wArg[2], *((int*) ARG_DW(instr->arg)));
 			break;
 
 		case asBCTYPE_wW_rW_DW_ARG:
@@ -2480,7 +2775,8 @@ void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 					instr->op == asBC_CALLSYS ||
 					instr->op == asBC_CALLBND ||
 					instr->op == asBC_CALLINTF ||
-					instr->op == asBC_Thiscall1 )
+					instr->op == asBC_Thiscall1 ||
+					instr->op == asBC_ArrAt )
 			{
 				int funcID = *(int*)ARG_DW(instr->arg);
 				asCString decl = engine->GetFunctionDeclaration(funcID);

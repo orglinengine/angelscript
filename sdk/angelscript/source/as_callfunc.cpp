@@ -624,6 +624,220 @@ void CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, voi
 #endif
 
 
+#ifdef AS_X64_MSVC
+// ---- ORGLIN: the fast call lane -------------------------------------------
+// See asSSystemFunctionInterface::SFast. The Win64 convention makes this small:
+// the first four arguments travel in registers BY POSITION (integer register i or
+// xmm register i), every argument is one 64-bit slot, and the caller cleans up. So
+// a function with up to four register arguments can be called through a plain
+// function pointer whose parameter i is `asQWORD` or `double` according to one bit
+// of a mask â€” 16 shapes, no assembly, no per-call inspection of the signature. A
+// float travels as its raw bits in the low half of the slot, and a float/double
+// result is read back as the raw bits of xmm0.
+static bool PrepareFastCall(asCScriptFunction *descr, asSSystemFunctionInterface *sysFunc)
+{
+	asSSystemFunctionInterface::SFast f;
+	memset(&f, 0, sizeof(f));
+	sysFunc->fast.state = 2; // assume not eligible until every check has passed
+
+	const int callConv = sysFunc->callConv;
+	const bool isMethod = callConv == ICC_THISCALL || callConv == ICC_CDECL_OBJLAST || callConv == ICC_CDECL_OBJFIRST;
+	if( !isMethod && callConv != ICC_CDECL && callConv != ICC_STDCALL )
+		return false;
+	if( sysFunc->auxiliary || sysFunc->compositeOffset || sysFunc->isCompositeIndirect || sysFunc->baseOffset )
+		return false;
+	if( sysFunc->takesObjByVal || sysFunc->returnAutoHandle || sysFunc->cleanArgs.GetLength() || descr->IsVariadic() )
+		return false;
+	for( asUINT n = 0; n < sysFunc->paramAutoHandles.GetLength(); n++ )
+		if( sysFunc->paramAutoHandles[n] ) return false;
+
+	// The return
+	const asCDataType &rt = descr->returnType;
+	const bool retOnStack = descr->DoesReturnOnStack();
+	if( (rt.IsObject() || rt.IsFuncdef()) && !rt.IsReference() )
+	{
+		if( rt.IsObjectHandle() )
+			f.retKind = 3;
+		else if( retOnStack && sysFunc->hostReturnInMemory )
+			f.retKind = 0;
+		else
+			return false; // an object returned in registers: leave it to the general path
+	}
+	else
+	{
+		if( retOnStack || sysFunc->hostReturnInMemory ) return false;
+		if( sysFunc->hostReturnFloat )
+			f.retKind = sysFunc->hostReturnSize == 1 ? 4 : 5;
+		else
+			f.retKind = sysFunc->hostReturnSize == 1 ? 1 : 2;
+	}
+	f.popsObj = isMethod ? 1 : 0;
+	f.popsRet = retOnStack ? 1 : 0;
+
+	// The register arguments, in the order the host function expects them
+	asUINT count = 0;
+	if( callConv == ICC_THISCALL ) f.src[count++] = 0;
+	if( sysFunc->hostReturnInMemory ) f.src[count++] = 1;
+	if( callConv == ICC_CDECL_OBJFIRST ) f.src[count++] = 0;
+
+	asUINT spos = 0;
+	for( asUINT n = 0; n < descr->parameterTypes.GetLength(); n++ )
+	{
+		const asCDataType &dt = descr->parameterTypes[n];
+		if( dt.IsObject() && !dt.IsObjectHandle() && !dt.IsReference() ) return false;
+		if( dt.GetTokenType() == ttQuestion ) return false;
+		if( count >= 4 || spos > 250 ) return false;
+
+		const asUINT dwords = dt.GetSizeOnStackDWords();
+		f.src[count] = dwords > 1 ? 3 : 2;
+		f.off[count] = asBYTE(spos);
+		if( !dt.IsReference() && (dt.IsFloatType() || dt.IsDoubleType()) )
+			f.fpMask |= asBYTE(1 << count);
+		count++;
+		spos += dwords;
+	}
+	if( callConv == ICC_CDECL_OBJLAST )
+	{
+		if( count >= 4 ) return false;
+		f.src[count++] = 0;
+	}
+
+	f.argCount = asBYTE(count);
+	f.state = 1;
+	sysFunc->fast = f;
+	return true;
+}
+
+static int CallSystemFunctionFast(asCContext *context, asCScriptFunction *descr, asSSystemFunctionInterface *sysFunc)
+{
+	const asSSystemFunctionInterface::SFast &f = sysFunc->fast;
+	asDWORD *args    = context->m_regs.stackPointer;
+	int      popSize = sysFunc->paramSize;
+	void    *obj = 0;
+	void    *retPointer = 0;
+
+	if( f.popsObj )
+	{
+		obj = (void*)*(asPWORD*)args;
+		if( obj == 0 )
+		{
+			context->SetInternalException(TXT_NULL_POINTER_ACCESS);
+			return 0;
+		}
+		popSize += AS_PTR_SIZE;
+		args += AS_PTR_SIZE;
+	}
+	if( f.popsRet )
+	{
+		retPointer = (void*)*(asPWORD*)args;
+		popSize += AS_PTR_SIZE;
+		args += AS_PTR_SIZE;
+		context->m_regs.objectType = 0;
+	}
+	else
+		context->m_regs.objectType = descr->returnType.GetTypeInfo();
+
+	// Gather the register arguments: an integer view and a floating-point view of
+	// the same bits, so the call below can pick either per position.
+	asQWORD a[4] = { 0, 0, 0, 0 };
+	double  d[4];
+	for( asUINT n = 0; n < f.argCount; n++ )
+	{
+		switch( f.src[n] )
+		{
+		case 0:  a[n] = (asQWORD)(asPWORD)obj; break;
+		case 1:  a[n] = (asQWORD)(asPWORD)retPointer; break;
+		case 2:  a[n] = args[f.off[n]]; break;
+		default: a[n] = *(asQWORD*)&args[f.off[n]]; break;
+		}
+	}
+	memcpy(d, a, sizeof(d));
+
+	typedef asQWORD Q;
+	typedef double  D;
+	void (*func)() = (void (*)())sysFunc->func;
+	const bool fpRet = f.retKind >= 4;
+	asQWORD ret = 0;
+	double  retD = 0;
+	bool    cppException = false;
+
+#define AS_FAST_SHAPE(mask, T0, V0, T1, V1, T2, V2, T3, V3) \
+	case mask: \
+		if( fpRet ) retD = ((D (*)(T0, T1, T2, T3))func)(V0, V1, V2, V3); \
+		else        ret  = ((Q (*)(T0, T1, T2, T3))func)(V0, V1, V2, V3); \
+		break;
+
+	context->m_callingSystemFunction = descr;
+#ifndef AS_NO_EXCEPTIONS
+	try
+	{
+#endif
+		switch( f.fpMask )
+		{
+		AS_FAST_SHAPE( 0, Q, a[0], Q, a[1], Q, a[2], Q, a[3])
+		AS_FAST_SHAPE( 1, D, d[0], Q, a[1], Q, a[2], Q, a[3])
+		AS_FAST_SHAPE( 2, Q, a[0], D, d[1], Q, a[2], Q, a[3])
+		AS_FAST_SHAPE( 3, D, d[0], D, d[1], Q, a[2], Q, a[3])
+		AS_FAST_SHAPE( 4, Q, a[0], Q, a[1], D, d[2], Q, a[3])
+		AS_FAST_SHAPE( 5, D, d[0], Q, a[1], D, d[2], Q, a[3])
+		AS_FAST_SHAPE( 6, Q, a[0], D, d[1], D, d[2], Q, a[3])
+		AS_FAST_SHAPE( 7, D, d[0], D, d[1], D, d[2], Q, a[3])
+		AS_FAST_SHAPE( 8, Q, a[0], Q, a[1], Q, a[2], D, d[3])
+		AS_FAST_SHAPE( 9, D, d[0], Q, a[1], Q, a[2], D, d[3])
+		AS_FAST_SHAPE(10, Q, a[0], D, d[1], Q, a[2], D, d[3])
+		AS_FAST_SHAPE(11, D, d[0], D, d[1], Q, a[2], D, d[3])
+		AS_FAST_SHAPE(12, Q, a[0], Q, a[1], D, d[2], D, d[3])
+		AS_FAST_SHAPE(13, D, d[0], Q, a[1], D, d[2], D, d[3])
+		AS_FAST_SHAPE(14, Q, a[0], D, d[1], D, d[2], D, d[3])
+		AS_FAST_SHAPE(15, D, d[0], D, d[1], D, d[2], D, d[3])
+		}
+#ifndef AS_NO_EXCEPTIONS
+	}
+	catch(...)
+	{
+		cppException = true;
+		context->HandleAppException();
+	}
+#endif
+#undef AS_FAST_SHAPE
+	context->m_callingSystemFunction = 0;
+
+	switch( f.retKind )
+	{
+	case 0:
+		// Nothing in a register. If the function raised a SCRIPT exception after it
+		// had built the returned object, destroy it (same rule as the general path;
+		// after a C++ exception the object was never completed).
+		if( retPointer && context->m_status == asEXECUTION_EXCEPTION && !cppException )
+		{
+			asCObjectType *ot = CastToObjectType(descr->returnType.GetTypeInfo());
+			if( ot && ot->beh.destruct )
+				context->m_engine->CallObjectMethod(retPointer, ot->beh.destruct);
+		}
+		break;
+	case 1: *(asDWORD*)&context->m_regs.valueRegister = (asDWORD)ret; break;
+	case 2: context->m_regs.valueRegister = ret; break;
+	case 3:
+		context->m_regs.objectRegister = (void*)(asPWORD)ret;
+		if( context->m_status == asEXECUTION_EXCEPTION && context->m_regs.objectRegister )
+		{
+			context->m_engine->CallObjectMethod(context->m_regs.objectRegister, CastToObjectType(descr->returnType.GetTypeInfo())->beh.release);
+			context->m_regs.objectRegister = 0;
+		}
+		break;
+	case 4:
+		memcpy(&ret, &retD, sizeof(ret));
+		*(asDWORD*)&context->m_regs.valueRegister = (asDWORD)ret;
+		break;
+	default:
+		memcpy(&context->m_regs.valueRegister, &retD, sizeof(asQWORD));
+		break;
+	}
+
+	return popSize;
+}
+#endif // AS_X64_MSVC
+
 int CallSystemFunction(int id, asCContext *context)
 {
 	asCScriptEngine            *engine  = context->m_engine;
@@ -633,6 +847,12 @@ int CallSystemFunction(int id, asCContext *context)
 	int callConv = sysFunc->callConv;
 	if( callConv == ICC_GENERIC_FUNC || callConv == ICC_GENERIC_METHOD )
 		return context->CallGeneric(descr);
+
+#ifdef AS_X64_MSVC
+	// ORGLIN: the fast lane, for every function whose plan says it is eligible.
+	if( sysFunc->fast.state == 1 || (sysFunc->fast.state == 0 && PrepareFastCall(descr, sysFunc)) )
+		return CallSystemFunctionFast(context, descr, sysFunc);
+#endif
 
 #ifndef RETURN_VALUE_MAX_SIZE
 	asQWORD retQW[2] = { 0 };

@@ -2090,6 +2090,21 @@ int asCCompiler::PrepareArgument(asCDataType *paramType, asCExprContext *ctx, as
 
 				if( dt.IsPrimitive() )
 				{
+					// ORGLIN: when the argument is a local variable, the temporary starts with
+					// that variable's value, so a function that does not write its output
+					// (`dict.get(key, v)` with a missing key) leaves the variable as it was.
+					// Upstream leaves the temporary uninitialized, and scripts were getting the
+					// old value only by accident of what the slot last held — which the
+					// optimizer is free to change.
+					if( ctx->type.isVariable && ctx->type.dataType.IsPrimitive() &&
+						ctx->type.dataType.GetSizeOnStackDWords() == dt.GetSizeOnStackDWords() )
+					{
+						if( dt.GetSizeOnStackDWords() == 2 )
+							ctx->bc.InstrW_W(asBC_CpyVtoV8, (short)offset, ctx->type.stackOffset);
+						else
+							ctx->bc.InstrW_W(asBC_CpyVtoV4, (short)offset, ctx->type.stackOffset);
+					}
+
 					ctx->type.SetVariable(dt, offset, true);
 					PushVariableOnStack(ctx, true);
 				}
@@ -3600,6 +3615,47 @@ bool asCCompiler::CompileInitializationWithAssignment(asCByteCode* bc, const asC
 		ReleaseTemporaryVariable(rexpr->type.stackOffset, bc);
 
 		bc->Instr(asBC_PopPtr);
+
+		return false;
+	}
+
+	// ORGLIN: copy elision for a local value-type variable initialized from a temporary
+	// of the same type — `string t = a + b`, `Vec3 v = f()`. The expression has already
+	// BUILT the object in a temporary stack slot; upstream then copy-constructs the
+	// variable from it and destroys the temporary (two extra calls and, for a string,
+	// an allocation). Instead the expression is re-pointed to build the object directly
+	// in the variable's own slot, so there is nothing to copy and nothing to destroy.
+	//
+	// This is safe only when every condition below holds:
+	//  - both the variable and the temporary are value objects living on the stack
+	//  - the expression leaves nothing to clean up afterwards (no deferred params)
+	//  - the expression does not read the variable being declared (`string t = t + x`)
+	//  - the expression ends by pushing the address of its result, which is the only
+	//    thing left on the stack and is simply dropped
+	if (isVarGlobOrMem == asVGM_VARIABLE &&
+		rexpr->type.isTemporary && rexpr->type.isVariable && !rexpr->type.isExplicitHandle &&
+		type.IsObject() && !type.IsObjectHandle() && !type.IsReference() &&
+		!rexpr->type.dataType.IsObjectHandle() && !rexpr->type.dataType.IsReference() &&
+		type.GetTypeInfo() == rexpr->type.dataType.GetTypeInfo() &&
+		(type.GetTypeInfo()->flags & asOBJ_VALUE) &&
+		rexpr->deferredParams.GetLength() == 0 &&
+		rexpr->bc.GetLastInstr() == asBC_PSF &&
+		!IsVariableOnHeap(offset) && !IsVariableOnHeap(rexpr->type.stackOffset) &&
+		!rexpr->bc.IsVarUsed(offset))
+	{
+		int temp = rexpr->type.stackOffset;
+
+		// Drop the trailing "push address of the result", then rename the temporary to
+		// the variable everywhere in the expression, including the markers that tell
+		// the exception handler when the object becomes live.
+		rexpr->bc.RemoveLastInstr();
+		rexpr->bc.ExchangeVar(temp, offset, true);
+		if (bc != &rexpr->bc) // the for-each lowering compiles straight into the target
+			bc->AddCode(&rexpr->bc);
+
+		// The temporary slot was never used: free it without emitting a destructor
+		ReleaseTemporaryVariable(temp, 0);
+		rexpr->type.isTemporary = false;
 
 		return false;
 	}
@@ -6200,7 +6256,9 @@ void asCCompiler::CompileForStatement(asCScriptNode *fnode, asCByteCode *bc)
 
 	// Add a suspend bytecode inside the loop to guarantee
 	// that the application can suspend the execution
-	bc->Instr(asBC_SUSPEND);
+	// ORGLIN: unless the application turned that off (asEP_LOOP_SUSPEND)
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
 	bc->InstrPTR(asBC_JitEntry, 0);
 
 	LineInstr(bc, fnode->lastChild->tokenPos);
@@ -6730,7 +6788,9 @@ void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 
 	// Add a suspend bytecode inside the loop to guarantee
 	// that the application can suspend the execution
-	bc->Instr(asBC_SUSPEND);
+	// ORGLIN: unless the application turned that off (asEP_LOOP_SUSPEND)
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
 	bc->InstrPTR(asBC_JitEntry, 0);
 
 	LineInstr(bc, node->lastChild->tokenPos);
@@ -6817,7 +6877,9 @@ void asCCompiler::CompileWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 
 	// Add a suspend bytecode inside the loop to guarantee
 	// that the application can suspend the execution
-	bc->Instr(asBC_SUSPEND);
+	// ORGLIN: unless the application turned that off (asEP_LOOP_SUSPEND)
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
 	bc->InstrPTR(asBC_JitEntry, 0);
 
 	// Compile statement
@@ -6871,7 +6933,9 @@ void asCCompiler::CompileDoWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 
 	// Add a suspend bytecode inside the loop to guarantee
 	// that the application can suspend the execution
-	bc->Instr(asBC_SUSPEND);
+	// ORGLIN: unless the application turned that off (asEP_LOOP_SUSPEND)
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
 	bc->InstrPTR(asBC_JitEntry, 0);
 
 	// Add a line instruction
@@ -13015,6 +13079,299 @@ int asCCompiler::CompileVariableAccess(const asCString &name, const asCString &s
 	return 0;
 }
 
+// ORGLIN: f-strings -----------------------------------------------------------------
+//
+// f"hp {hp:.1f} of {max}"  is compiled as  format("hp {:.1f} of {}", hp, max)
+// where `format` is the function named by asEP_FSTRING_FORMAT_FUNCTION. The compiler
+// only separates text from expressions; it never interprets a format spec.
+//
+// A replacement field is  {expression [=] [!c] [:spec]} :
+//   - the expression ends at the first top-level `:` (not `::`), `!` (not `!=`) or `}`
+//   - `{x=}` also writes the expression text, as in Python: "x=" followed by the value
+//   - `!c` (a conversion) and the spec are passed through to the template untouched
+//   - a `{expression}` inside the spec becomes `{}` plus one more argument
+//   - `{{` and `}}` are literal braces and pass through for the function to handle
+
+// Doubles the braces in a plain string piece that is concatenated with an f-string
+static void asFStringEscapeBraces(asCString &s)
+{
+	asCString r;
+	for( size_t n = 0; n < s.GetLength(); n++ )
+	{
+		r += s[n];
+		if( s[n] == '{' || s[n] == '}' )
+			r += s[n];
+	}
+	s = r;
+}
+
+// s[i] starts a literal inside an expression: "..." , '...' or a nested f"...".
+// Returns the index just past it, or -1 if it never ends.
+static int asFStringSkipQuoted(const char *s, int n, int i)
+{
+	if( s[i] == 'f' )
+	{
+		const size_t end = asFStringScanBody(s, (size_t)n, (size_t)i + 2, false);
+		return end >= (size_t)n ? -1 : (int)end + 1;
+	}
+
+	const char quote = s[i];
+	for( int j = i + 1; j < n; j++ )
+	{
+		if( s[j] == '\\' ) { j++; continue; }
+		if( s[j] == quote ) return j + 1;
+	}
+	return -1;
+}
+
+// Records s[from..to) as one expression, trimmed.
+// Returns false if nothing is left after trimming.
+static bool asFStringAddExpr(const char *s, int from, int to, asCString &exprText, asCArray<int> &exprPos, asCArray<int> &exprLen)
+{
+	while( from < to && (s[from] == ' ' || s[from] == '\t' || s[from] == '\r' || s[from] == '\n') ) from++;
+	while( to > from && (s[to-1] == ' ' || s[to-1] == '\t' || s[to-1] == '\r' || s[to-1] == '\n') ) to--;
+	if( from == to ) return false;
+
+	// Stored in parentheses: the text is parsed on its own as an EXPRESSION, and the
+	// parentheses are what let it be a full one (`a ? b : c` is above that level).
+	exprPos.PushLast((int)exprText.GetLength());
+	exprText += '(';
+	exprText.Concatenate(&s[from], to - from);
+	exprText += ')';
+	exprLen.PushLast(to - from + 2);
+	return true;
+}
+
+// Rewrites the raw text of one f"..." into the template and appends its expressions.
+// Returns 0, or the error message.
+static const char *asFStringSplit(asCString &text, asCString &exprText, asCArray<int> &exprPos, asCArray<int> &exprLen)
+{
+	const char *MSG_END   = "f-string: expecting '}'";
+	const char *MSG_EMPTY = "f-string: empty expression not allowed";
+
+	const char *s = text.AddressOf();
+	const int   n = (int)text.GetLength();
+	asCString out;
+
+	int i = 0;
+	while( i < n )
+	{
+		const char c = s[i];
+		if( c == '}' )
+		{
+			if( i + 1 < n && s[i+1] == '}' ) { out += "}}"; i += 2; continue; }
+			return "f-string: single '}' is not allowed";
+		}
+		if( c != '{' ) { out += c; i++; continue; }
+		if( i + 1 < n && s[i+1] == '{' ) { out += "{{"; i += 2; continue; }
+
+		// Find where the expression ends (the same walk as asFStringScanField)
+		const int start = i + 1;
+		int  j       = start;
+		int  depth   = 0;
+		int  ternary = 0;
+		bool debug   = false;
+		for( ;; j++ )
+		{
+			if( j >= n ) return MSG_END;
+			const char ch = s[j];
+			if( ch == '"' || ch == '\'' ||
+				(ch == 'f' && j + 1 < n && s[j+1] == '"' &&
+				 !(j > start && ((s[j-1] >= 'a' && s[j-1] <= 'z') || (s[j-1] >= 'A' && s[j-1] <= 'Z') || (s[j-1] >= '0' && s[j-1] <= '9') || s[j-1] == '_'))) )
+			{
+				j = asFStringSkipQuoted(s, n, j);
+				if( j < 0 ) return "f-string: unterminated string in expression";
+				j--;
+				continue;
+			}
+			if( ch == '\\' ) { j++; continue; }
+			if( ch == '(' || ch == '[' || ch == '{' ) { depth++; continue; }
+			if( ch == ')' || ch == ']' ) { depth--; continue; }
+			if( ch == '}' )
+			{
+				if( depth <= 0 ) break;
+				depth--;
+				continue;
+			}
+			if( depth > 0 ) continue;
+
+			if( ch == '?' ) { ternary++; continue; }
+			if( ch == ':' )
+			{
+				if( j + 1 < n && s[j+1] == ':' ) { j++; continue; }
+				if( ternary > 0 ) { ternary--; continue; }
+				break;
+			}
+			if( ch == '!' )
+			{
+				if( j + 1 < n && s[j+1] == '=' ) { j++; continue; }
+
+				// `!r` / `!s` / `!a` ends the expression; any other `!` is the not operator
+				if( j + 2 < n && (s[j+1] == 'r' || s[j+1] == 's' || s[j+1] == 'a') && (s[j+2] == '}' || s[j+2] == ':') )
+					break;
+				continue;
+			}
+			if( ch == '=' )
+			{
+				if( j + 1 < n && s[j+1] == '=' ) { j++; continue; }
+				const char p = j > start ? s[j-1] : 0;
+				if( p == '<' || p == '>' || p == '+' || p == '-' || p == '*' || p == '/' || p == '%' || p == '&' || p == '|' || p == '^' )
+					continue;
+
+				// `{x=}`: an `=` that is the last thing in the expression
+				int k = j + 1;
+				while( k < n && (s[k] == ' ' || s[k] == '\t') ) k++;
+				if( k < n && (s[k] == '}' || s[k] == ':' || (s[k] == '!' && !(k + 1 < n && s[k+1] == '='))) )
+				{
+					debug = true;
+					break;
+				}
+			}
+		}
+
+		if( !asFStringAddExpr(s, start, j, exprText, exprPos, exprLen) )
+			return MSG_EMPTY;
+
+		if( debug )
+		{
+			// The text as written, up to and including the `=` and the blanks after it
+			int k = j + 1;
+			while( k < n && (s[k] == ' ' || s[k] == '\t') ) k++;
+			asCString label;
+			label.Assign(&s[start], k - start);
+			asFStringEscapeBraces(label);
+			out += label;
+			j = k;
+		}
+
+		out += '{';
+
+		bool hasConversion = false;
+		if( s[j] == '!' )
+		{
+			if( j + 1 >= n ) return MSG_END;
+			out += s[j];
+			out += s[j+1];
+			j += 2;
+			hasConversion = true;
+			if( j >= n ) return MSG_END;
+		}
+
+		if( s[j] == ':' )
+		{
+			out += ':';
+			for( j++;; j++ )
+			{
+				if( j >= n ) return MSG_END;
+				if( s[j] == '}' ) break;
+				if( s[j] == '{' )
+				{
+					// A nested field: a whole expression of its own, `{}` in the template
+					const size_t k = asFStringScanField(s, (size_t)n, (size_t)j + 1);
+					if( k >= (size_t)n ) return MSG_END;
+					if( !asFStringAddExpr(s, j + 1, (int)k, exprText, exprPos, exprLen) )
+						return MSG_EMPTY;
+					out += "{}";
+					j = (int)k;
+					continue;
+				}
+				out += s[j];
+			}
+		}
+		else if( debug && !hasConversion )
+			out += "!r";
+
+		if( s[j] != '}' ) return MSG_END;
+		out += '}';
+		i = j + 1;
+	}
+
+	text = out;
+	return 0;
+}
+// Compiles the call  formatFunc(tmpl, expr0, expr1, ...)  into ctx. `tmpl` already
+// holds the template string constant; the expressions are compiled here from their text.
+int asCCompiler::CompileFStringCall(asCScriptNode *node, asCExprContext *ctx, asCExprContext *tmpl, const asCString &exprText, const asCArray<int> &exprPos, const asCArray<int> &exprLen)
+{
+	asCScriptFunction *func = builder->GetFunctionDescription(engine->ep.fstringFormatFunc);
+	if( func == 0 )
+	{
+		Error("f-string: the function set with asEP_FSTRING_FORMAT_FUNCTION does not exist", node);
+		ctx->type.SetDummy();
+		return -1;
+	}
+
+	asCArray<asCExprContext *> args;
+	args.PushLast(tmpl);
+
+	int r = 0;
+	for( asUINT n = 0; n < exprPos.GetLength() && r >= 0; n++ )
+	{
+		// Parse the expression text on its own, the same way a default argument is
+		asCParser parser(builder);
+		asCScriptCode *code = builder->FindOrAddCode("f-string", exprText.AddressOf() + exprPos[n], exprLen[n]);
+		if( code == 0 || parser.ParseExpression(code) < 0 )
+		{
+			Error("f-string: invalid expression", node);
+			r = -1;
+			break;
+		}
+
+		asCScriptNode *arg = parser.GetScriptNode();
+
+		// The expression is compiled in the current scope: it sees the local variables
+		asCScriptCode *origScript = script;
+		script = code;
+
+		asCExprContext expr(engine);
+		r = CompileExpression(arg, &expr);
+
+		script = origScript;
+
+		if( r < 0 )
+		{
+			Error("f-string: invalid expression", node);
+			break;
+		}
+
+		asCExprContext *a = asNEW(asCExprContext)(engine);
+		if( a == 0 )
+		{
+			r = -1;
+			break;
+		}
+		MergeExprBytecodeAndType(a, &expr);
+		if( a->exprNode )
+		{
+			// Disconnect the node from the parser, and tell the compiler to free it when complete
+			a->exprNode->DisconnectParent();
+			nodesToFreeUponComplete.PushLast(a->exprNode);
+		}
+		args.PushLast(a);
+	}
+
+	if( r >= 0 )
+	{
+		asCArray<int> funcs;
+		funcs.PushLast(func->id);
+		MatchFunctions(funcs, args, node, func->name.AddressOf());
+		if( funcs.GetLength() != 1 )
+			r = -1; // the error was reported by MatchFunctions()
+		else
+			r = MakeFunctionCall(ctx, funcs[0], 0, args, node);
+	}
+
+	if( r < 0 )
+		ctx->type.SetDummy();
+
+	// The template (args[0]) belongs to the caller
+	for( asUINT n = 1; n < args.GetLength(); n++ )
+		if( args[n] )
+			asDELETE(args[n], asCExprContext);
+
+	return r;
+}
+
 int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx)
 {
 	// Shouldn't receive any byte code
@@ -13131,10 +13488,28 @@ int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx
 		}
 		else if( vnode->tokenType == ttStringConstant ||
 			     vnode->tokenType == ttMultilineStringConstant ||
-				 vnode->tokenType == ttHeredocStringConstant )
+				 vnode->tokenType == ttHeredocStringConstant ||
+				 vnode->tokenType == ttFStringConstant )
 		{
 			asCString str;
 			asCScriptNode *snode = vnode->firstChild;
+
+			// ORGLIN: f-strings. When the application has named a format function and any
+			// piece of this literal is an f"...", the whole literal becomes the TEMPLATE of
+			// a call to that function and the embedded expressions become its arguments.
+			bool isFString = false;
+			asCString fexprText;
+			asCArray<int> fexprPos, fexprLen;
+			asCExprContext ftmpl(engine);
+			asCExprContext *sctx = ctx;
+			if( engine->ep.fstringFormatFunc )
+			{
+				for( asCScriptNode *fn = snode; fn; fn = fn->next )
+					if( fn->tokenType == ttFStringConstant )
+						isFString = true;
+				if( isFString )
+					sctx = &ftmpl;
+			}
 			if( script->code[snode->tokenPos] == '\'' && engine->ep.useCharacterLiterals )
 			{
 				// Treat the single quoted string as a single character literal
@@ -13181,6 +13556,38 @@ int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx
 						cat.Assign(&script->code[snode->tokenPos+3], snode->tokenLength-6);
 						ProcessHeredocStringConstant(cat, snode);
 					}
+					else if( snode->tokenType == ttFStringConstant )
+					{
+						// ORGLIN: f"text" or f"""text""": drop the prefix and the quotes
+						const bool triple = snode->tokenLength >= 7 &&
+							script->code[snode->tokenPos+2] == '"' && script->code[snode->tokenPos+3] == '"';
+						if( triple )
+							cat.Assign(&script->code[snode->tokenPos+4], snode->tokenLength-7);
+						else
+						{
+							cat.Assign(&script->code[snode->tokenPos+2], snode->tokenLength-3);
+							if( !engine->ep.allowMultilineStrings && strchr(cat.AddressOf(), '\n') )
+								Error(TXT_MULTILINE_STRINGS_NOT_ALLOWED, snode);
+						}
+						if( isFString )
+						{
+							const char *msg = asFStringSplit(cat, fexprText, fexprPos, fexprLen);
+							if( msg )
+							{
+								Error(msg, snode);
+								ctx->type.SetDummy();
+								return -1;
+							}
+						}
+						// A """ literal is taken as written, like a heredoc string
+						if( triple )
+							ProcessHeredocStringConstant(cat, snode);
+						else
+							ProcessStringConstant(cat, snode);
+					}
+					// ORGLIN: a plain piece next to an f-string is literal text in the template
+					if( isFString && snode->tokenType != ttFStringConstant )
+						asFStringEscapeBraces(cat);
 
 					str += cat;
 
@@ -13214,17 +13621,21 @@ int asCCompiler::CompileExpressionValue(asCScriptNode *node, asCExprContext *ctx
 					// Push the pointer on the stack. The string factory already guarantees that the
 					// string object is valid throughout the lifetime of the script so no need to add
 					// reference count or make local copy.
-					ctx->bc.InstrPTR(asBC_PGA, strPtr);
-					ctx->type.Set(engine->stringType);
+					sctx->bc.InstrPTR(asBC_PGA, strPtr);
+					sctx->type.Set(engine->stringType);
 
 					// Mark the string as literal constant so the compiler knows it is allowed
 					// to treat it differently than an ordinary constant string variable
-					ctx->type.isConstant = true;
+					sctx->type.isConstant = true;
 
 					// Mark the reference to the string constant as safe, so the compiler can
 					// avoid making unnecessary temporary copies when passing the reference to
 					// functions.
-					ctx->type.isRefSafe = true;
+					sctx->type.isRefSafe = true;
+
+					// ORGLIN: the constant above is the template; now compile the call
+					if( isFString && CompileFStringCall(vnode, ctx, sctx, fexprText, fexprPos, fexprLen) < 0 )
+						return -1;
 				}
 			}
 		}
@@ -16556,6 +16967,53 @@ bool asCCompiler::CompileOverloadedDualOperator(asCScriptNode *node, asCExprCont
 
 	// TODO: Might be interesting to support a concatenation operator, e.g. ~
 
+	// ORGLIN: string concatenation chains. In `a + b + c + d` every `+` used to build a
+	// brand-new string from its left operand (a copy that grows each step) and then
+	// destroy that left operand. When the left operand is a TEMPORARY string — the result
+	// of the previous `+` — nobody else can see it, so it is appended to in place
+	// (`opAddAssign`) and becomes the result. The chain then builds ONE string. Only the
+	// script string type: for it `x + y` and `copy(x) += y` are the same by definition.
+	if( token == ttPlus &&
+		lctx->type.isTemporary && lctx->type.isVariable && !lctx->type.isExplicitHandle &&
+		!lctx->type.dataType.IsObjectHandle() && !lctx->type.dataType.IsReference() &&
+		engine->stringType.GetTypeInfo() &&
+		lctx->type.dataType.GetTypeInfo() == engine->stringType.GetTypeInfo() &&
+		lctx->deferredParams.GetLength() == 0 &&
+		!IsVariableOnHeap(lctx->type.stackOffset) )
+	{
+		const int temp = lctx->type.stackOffset;
+		int r = CompileOverloadedDualOperator2(node, "opAddAssign", lctx, rctx, leftToRight, ctx);
+		if( r < 0 )
+		{
+			ctx->type.SetDummy();
+			return true;
+		}
+		if( r == 1 )
+		{
+			// opAddAssign returned a reference to the temporary and queued the temporary
+			// for release as a deferred parameter. Keep it instead: it is the result.
+			for( asUINT n = 0; n < ctx->deferredParams.GetLength(); )
+			{
+				if( ctx->deferredParams[n].argType.isTemporary && ctx->deferredParams[n].argType.stackOffset == temp )
+					ctx->deferredParams.RemoveIndex(n);
+				else
+					n++;
+			}
+
+			// The reference is no longer needed; the arguments' own temporaries can go now
+			ctx->bc.Instr(asBC_PopPtr);
+			ProcessDeferredParams(ctx);
+
+			// The value of the expression is the temporary variable, as after an opAdd
+			ctx->bc.InstrSHORT(asBC_PSF, (short)temp);
+			ctx->type.SetVariable(engine->stringType, temp, true);
+			ctx->type.dataType.MakeReference(false);
+			ctx->type.isLValue = false;
+
+			return true;
+		}
+	}
+
 	if( op && op_r )
 	{
 		// TODO: Should evaluate which of the two have the best match. If both have equal match, the first version should be used
@@ -18999,7 +19457,13 @@ void asCCompiler::PerformFunctionCall(int funcId, asCExprContext *ctx, bool isCo
 				(descr->parameterTypes[0].IsIntegerType() || descr->parameterTypes[0].IsUnsignedType()) &&
 				descr->parameterTypes[0].GetSizeInMemoryBytes() == 4 &&
 				!descr->parameterTypes[0].IsReference())
-				ctx->bc.Call(asBC_Thiscall1, descr->id, argSize, 0);
+			{
+				// ORGLIN: the array's opIndex is computed by the VM itself (asEP_ARRAY_LAYOUT)
+				if( engine->IsArrayAt(descr) )
+					ctx->bc.Call(asBC_ArrAt, descr->id, argSize, 0);
+				else
+					ctx->bc.Call(asBC_Thiscall1, descr->id, argSize, 0);
+			}
 			else
 				ctx->bc.Call(asBC_CALLSYS, descr->id, argSize, asWORD(args ? args->GetLength() : 0));
 		}

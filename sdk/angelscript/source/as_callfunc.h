@@ -119,6 +119,25 @@ struct asSSystemFunctionInterface
 	};
 	asCArray<SClean>     cleanArgs;
 
+	// ORGLIN: the FAST CALL PLAN (x64 MSVC). Most registered functions take a few
+	// primitives/references/handles and return a primitive, a reference, a handle
+	// or an object in caller-provided memory. For those, everything the general
+	// path works out per call (which convention, where each argument goes, how the
+	// return comes back) is worked out ONCE, on the first call, and stored here.
+	// state: 0 = not analysed yet, 1 = use the plan, 2 = not eligible (general path).
+	struct SFast
+	{
+		asBYTE state;
+		asBYTE argCount;   // register arguments, 0..4
+		asBYTE fpMask;     // bit i set = register argument i is a float/double
+		asBYTE retKind;    // 0 none/in memory, 1 dword, 2 qword, 3 handle, 4 float, 5 double
+		asBYTE src[4];     // 0 = object pointer, 1 = return pointer, 2 = stack dword, 3 = stack qword
+		asBYTE off[4];     // stack offset (dwords) of a stack argument
+		asBYTE popsObj;    // the object pointer is on the script stack
+		asBYTE popsRet;    // the return pointer is on the script stack
+	};
+	SFast                fast;
+
 	asSSystemFunctionInterface()
 	{ 
 		Clear(); 
@@ -146,6 +165,7 @@ struct asSSystemFunctionInterface
 
 		paramAutoHandles.SetLength(0);
 		cleanArgs.SetLength(0);
+		memset(&fast, 0, sizeof(fast));
 	}
 
 	asSSystemFunctionInterface &operator=(const asSSystemFunctionInterface &in)
@@ -165,6 +185,7 @@ struct asSSystemFunctionInterface
 
 		cleanArgs           = in.cleanArgs;
 		paramAutoHandles    = in.paramAutoHandles;
+		fast                = in.fast;
 
 		return *this;
 	}

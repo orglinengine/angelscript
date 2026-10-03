@@ -2240,6 +2240,21 @@ void asCContext::CallInterfaceMethod(asCScriptFunction *func)
 #define BEGIN() switch( *(const asBYTE*)l_bc )
 #endif
 
+// ORGLIN: the address of element `index` of an array object laid out as described by
+// asEP_ARRAY_LAYOUT, or 0 when the object is null or the index is out of range.
+inline void *asCContext::ArrayElement(void *obj, asUINT index)
+{
+	if( obj == 0 ) return 0;
+	const asSArrayLayout &L = m_engine->arrayLayout;
+	asBYTE *buf = *(asBYTE**)((asBYTE*)obj + L.bufferOffset);
+	if( buf == 0 || index >= *(asUINT*)(buf + L.lengthOffset) ) return 0;
+	asBYTE *elem = buf + L.dataOffset + (asPWORD)index * (asUINT)*(int*)((asBYTE*)obj + L.elementSizeOffset);
+	const int subTypeId = *(int*)((asBYTE*)obj + L.subTypeIdOffset);
+	if( (subTypeId & asTYPEID_MASK_OBJECT) && !(subTypeId & asTYPEID_OBJHANDLE) )
+		return *(void**)elem;
+	return elem;
+}
+
 void asCContext::ExecuteNext()
 {
 #if defined(_MSC_VER) && defined(__clang__)
@@ -2299,13 +2314,12 @@ static const void *const dispatch_table[256] = {
 &&INSTRUCTION(asBC_JLowNZ),		&&INSTRUCTION(asBC_AllocMem),	&&INSTRUCTION(asBC_SetListSize),&&INSTRUCTION(asBC_PshListElmnt),
 &&INSTRUCTION(asBC_SetListType),&&INSTRUCTION(asBC_POWi),		&&INSTRUCTION(asBC_POWu),		&&INSTRUCTION(asBC_POWf),
 &&INSTRUCTION(asBC_POWd),		&&INSTRUCTION(asBC_POWdi),		&&INSTRUCTION(asBC_POWi64),		&&INSTRUCTION(asBC_POWu64),
-&&INSTRUCTION(asBC_Thiscall1),
-
-								&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
-&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
-&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
-&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
-&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
+&&INSTRUCTION(asBC_Thiscall1),	&&INSTRUCTION(asBC_IncVi64),	&&INSTRUCTION(asBC_DecVi64),
+&&INSTRUCTION(asBC_JCMPi),		&&INSTRUCTION(asBC_JCMPu),		&&INSTRUCTION(asBC_JCMPi64),	&&INSTRUCTION(asBC_ArrAt),
+&&INSTRUCTION(asBC_ArrGet1),	&&INSTRUCTION(asBC_ArrGet2),	&&INSTRUCTION(asBC_ArrGet4),	&&INSTRUCTION(asBC_ArrGet8),
+&&INSTRUCTION(asBC_ArrSet1),	&&INSTRUCTION(asBC_ArrSet2),	&&INSTRUCTION(asBC_ArrSet4),	&&INSTRUCTION(asBC_ArrSet8),
+&&INSTRUCTION(asBC_IncJCMPi),	&&INSTRUCTION(asBC_IncJCMPu),	&&INSTRUCTION(asBC_IncJCMPi64),
+&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
@@ -2794,6 +2808,140 @@ static const void *const dispatch_table[256] = {
 	// Decrement the local integer variable
 	INSTRUCTION(asBC_DecVi):
 		(*(int*)(l_fp - asBC_SWORDARG0(l_bc)))--;
+		l_bc++;
+		NEXT_INSTRUCTION();
+
+	// ORGLIN: array element access (asEP_ARRAY_LAYOUT). ArrayElement() gives the
+	// element's address or 0 (null array or index out of range); the caller raises
+	// the exception with the program state saved, like any other instruction.
+#define AS_ORGLIN_ARRAY_FAIL(obj) \
+	{ \
+		m_regs.programPointer    = l_bc; \
+		m_regs.stackPointer      = l_sp; \
+		m_regs.stackFramePointer = l_fp; \
+		SetInternalException((obj) == 0 ? TXT_NULL_POINTER_ACCESS : "Index out of bounds"); \
+		return; \
+	}
+
+	INSTRUCTION(asBC_ArrAt):
+		// The same stack as the opIndex call it replaces: the object on top, the index under it
+		{
+			void *obj = *(void**)l_sp;
+			void *elem = ArrayElement(obj, *(asUINT*)(l_sp + AS_PTR_SIZE));
+			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj)
+			l_sp += AS_PTR_SIZE + 1;
+			*(asPWORD*)&m_regs.valueRegister = (asPWORD)elem;
+			l_bc += 2;
+		}
+		NEXT_INSTRUCTION();
+
+	// ArrGetN dst, arr, idx: dst = arr[idx] (narrow values are zero-extended to a dword, as RDRn)
+#define AS_ORGLIN_ARRAY_GET(T) \
+		{ \
+			void *obj = *(void**)(l_fp - asBC_SWORDARG1(l_bc)); \
+			void *elem = ArrayElement(obj, *(asUINT*)(l_fp - asBC_SWORDARG2(l_bc))); \
+			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+			asDWORD *dst = l_fp - asBC_SWORDARG0(l_bc); \
+			if( sizeof(T) < 4 ) *dst = 0; \
+			*(T*)dst = *(T*)elem; \
+			l_bc += 2; \
+		}
+	INSTRUCTION(asBC_ArrGet1): AS_ORGLIN_ARRAY_GET(asBYTE)  NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrGet2): AS_ORGLIN_ARRAY_GET(asWORD)  NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrGet4): AS_ORGLIN_ARRAY_GET(asDWORD) NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrGet8): AS_ORGLIN_ARRAY_GET(asQWORD) NEXT_INSTRUCTION();
+#undef AS_ORGLIN_ARRAY_GET
+
+	// ArrSetN arr, idx, src: arr[idx] = src
+#define AS_ORGLIN_ARRAY_SET(T) \
+		{ \
+			void *obj = *(void**)(l_fp - asBC_SWORDARG0(l_bc)); \
+			void *elem = ArrayElement(obj, *(asUINT*)(l_fp - asBC_SWORDARG1(l_bc))); \
+			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+			*(T*)elem = *(T*)(l_fp - asBC_SWORDARG2(l_bc)); \
+			l_bc += 2; \
+		}
+	INSTRUCTION(asBC_ArrSet1): AS_ORGLIN_ARRAY_SET(asBYTE)  NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrSet2): AS_ORGLIN_ARRAY_SET(asWORD)  NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrSet4): AS_ORGLIN_ARRAY_SET(asDWORD) NEXT_INSTRUCTION();
+	INSTRUCTION(asBC_ArrSet8): AS_ORGLIN_ARRAY_SET(asQWORD) NEXT_INSTRUCTION();
+#undef AS_ORGLIN_ARRAY_SET
+#undef AS_ORGLIN_ARRAY_FAIL
+
+	// ORGLIN: compare two local variables and jump (fused CMPx + Jx). The condition is
+	// the third word; the jump offset is the third dword, relative to the next instruction.
+#define AS_ORGLIN_JCMP(T) \
+	{ \
+		const T a = *(T*)(l_fp - asBC_SWORDARG0(l_bc)); \
+		const T b = *(T*)(l_fp - asBC_SWORDARG1(l_bc)); \
+		bool take; \
+		switch( asBC_SWORDARG2(l_bc) ) \
+		{ \
+		case 0:  take = a == b; break; \
+		case 1:  take = a != b; break; \
+		case 2:  take = a <  b; break; \
+		case 3:  take = a >= b; break; \
+		case 4:  take = a >  b; break; \
+		default: take = a <= b; break; \
+		} \
+		if( take ) l_bc += 3 + *(int*)(l_bc + 2); \
+		else       l_bc += 3; \
+	}
+
+	INSTRUCTION(asBC_JCMPi):
+		AS_ORGLIN_JCMP(int)
+		NEXT_INSTRUCTION();
+
+	INSTRUCTION(asBC_JCMPu):
+		AS_ORGLIN_JCMP(asUINT)
+		NEXT_INSTRUCTION();
+
+	INSTRUCTION(asBC_JCMPi64):
+		AS_ORGLIN_JCMP(asINT64)
+		NEXT_INSTRUCTION();
+
+	// ORGLIN: ++a (or --a when bit 3 of the condition is set), then JCMP on (a, b)
+#define AS_ORGLIN_INCJCMP(T) \
+	{ \
+		T *a = (T*)(l_fp - asBC_SWORDARG0(l_bc)); \
+		if( asBC_SWORDARG2(l_bc) & 8 ) --*a; else ++*a; \
+		const T b = *(T*)(l_fp - asBC_SWORDARG1(l_bc)); \
+		bool take; \
+		switch( asBC_SWORDARG2(l_bc) & 7 ) \
+		{ \
+		case 0:  take = *a == b; break; \
+		case 1:  take = *a != b; break; \
+		case 2:  take = *a <  b; break; \
+		case 3:  take = *a >= b; break; \
+		case 4:  take = *a >  b; break; \
+		default: take = *a <= b; break; \
+		} \
+		if( take ) l_bc += 3 + *(int*)(l_bc + 2); \
+		else       l_bc += 3; \
+	}
+
+	INSTRUCTION(asBC_IncJCMPi):
+		AS_ORGLIN_INCJCMP(int)
+		NEXT_INSTRUCTION();
+
+	INSTRUCTION(asBC_IncJCMPu):
+		AS_ORGLIN_INCJCMP(asUINT)
+		NEXT_INSTRUCTION();
+
+	INSTRUCTION(asBC_IncJCMPi64):
+		AS_ORGLIN_INCJCMP(asINT64)
+		NEXT_INSTRUCTION();
+#undef AS_ORGLIN_INCJCMP
+#undef AS_ORGLIN_JCMP
+
+	// ORGLIN: increment / decrement the local int64 variable
+	INSTRUCTION(asBC_IncVi64):
+		(*(asINT64*)(l_fp - asBC_SWORDARG0(l_bc)))++;
+		l_bc++;
+		NEXT_INSTRUCTION();
+
+	INSTRUCTION(asBC_DecVi64):
+		(*(asINT64*)(l_fp - asBC_SWORDARG0(l_bc)))--;
 		l_bc++;
 		NEXT_INSTRUCTION();
 
@@ -4953,23 +5101,10 @@ static const void *const dispatch_table[256] = {
 	// Don't let the optimizer optimize for size,
 	// since it requires extra conditions and jumps
 #if AS_USE_COMPUTED_GOTOS == 0
-	INSTRUCTION(201): l_bc = (asDWORD*)201; goto case_FAULT;
-	INSTRUCTION(202): l_bc = (asDWORD*)202; goto case_FAULT;
-	INSTRUCTION(203): l_bc = (asDWORD*)203; goto case_FAULT;
-	INSTRUCTION(204): l_bc = (asDWORD*)204; goto case_FAULT;
-	INSTRUCTION(205): l_bc = (asDWORD*)205; goto case_FAULT;
-	INSTRUCTION(206): l_bc = (asDWORD*)206; goto case_FAULT;
-	INSTRUCTION(207): l_bc = (asDWORD*)207; goto case_FAULT;
-	INSTRUCTION(208): l_bc = (asDWORD*)208; goto case_FAULT;
-	INSTRUCTION(209): l_bc = (asDWORD*)209; goto case_FAULT;
-	INSTRUCTION(210): l_bc = (asDWORD*)210; goto case_FAULT;
-	INSTRUCTION(211): l_bc = (asDWORD*)211; goto case_FAULT;
-	INSTRUCTION(212): l_bc = (asDWORD*)212; goto case_FAULT;
-	INSTRUCTION(213): l_bc = (asDWORD*)213; goto case_FAULT;
-	INSTRUCTION(214): l_bc = (asDWORD*)214; goto case_FAULT;
-	INSTRUCTION(215): l_bc = (asDWORD*)215; goto case_FAULT;
-	INSTRUCTION(216): l_bc = (asDWORD*)216; goto case_FAULT;
-	INSTRUCTION(217): l_bc = (asDWORD*)217; goto case_FAULT;
+
+
+
+
 	INSTRUCTION(218): l_bc = (asDWORD*)218; goto case_FAULT;
 	INSTRUCTION(219): l_bc = (asDWORD*)219; goto case_FAULT;
 	INSTRUCTION(220): l_bc = (asDWORD*)220; goto case_FAULT;
@@ -5028,6 +5163,9 @@ static const void *const dispatch_table[256] = {
 #ifdef AS_DEBUG
 		asDWORD instr = *(asBYTE*)old;
 		if( instr != asBC_JMP && instr != asBC_JMPP && (instr < asBC_JZ || instr > asBC_JNP) && instr != asBC_JLowZ && instr != asBC_JLowNZ &&
+			instr != asBC_JCMPi && instr != asBC_JCMPu && instr != asBC_JCMPi64 &&
+			instr != asBC_IncJCMPi && instr != asBC_IncJCMPu && instr != asBC_IncJCMPi64 &&
+			!(instr >= asBC_ArrGet1 && instr <= asBC_ArrSet8) &&
 			instr != asBC_CALL && instr != asBC_CALLBND && instr != asBC_CALLINTF && instr != asBC_RET && instr != asBC_ALLOC && instr != asBC_CallPtr &&
 			instr != asBC_JitEntry )
 		{

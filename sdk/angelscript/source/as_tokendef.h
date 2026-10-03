@@ -62,6 +62,7 @@ enum eTokenType
 	ttStringConstant,              // "123"
 	ttMultilineStringConstant,     //
 	ttHeredocStringConstant,       // """text"""
+	ttFStringConstant,             // f"text {expr}"   (ORGLIN)
 	ttNonTerminatedStringConstant, // "123
 	ttBitsConstant,                // 0xFFFF
 

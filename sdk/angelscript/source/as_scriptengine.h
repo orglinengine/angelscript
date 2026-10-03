@@ -383,6 +383,12 @@ public:
 
 	// Stores all functions, i.e. registered functions, script functions, class methods, behaviours, etc.
 	asCArray<asCScriptFunction *> scriptFunctions;       // doesn't increase ref count
+
+	// ORGLIN: the application's array layout (asEP_ARRAY_LAYOUT) and the native
+	// functions behind its opIndex, to recognise every template instance's copy.
+	asSArrayLayout arrayLayout;
+	asFUNCTION_t   arrayAtFunc[2];
+	bool           IsArrayAt(asCScriptFunction *func) const;
 	asCArray<int>                 freeScriptFunctionIds;
 	asCArray<asCScriptFunction *> signatureIds;
 
@@ -504,6 +510,9 @@ public:
 		bool   bracketListLiterals;			// ORGLIN: `[ ... ]` allowed as a list literal
 		bool   dictionaryLiterals;			// ORGLIN: `{ key = value }` list literal entries
 		bool   initializerBlocks;				// ORGLIN: `{ ... }` initializer block after a constructor
+		int    fstringFormatFunc;				// ORGLIN: function called by f"..." literals (0 = none)
+		bool   loopSuspend;						// ORGLIN: a SUSPEND in every loop (default true)
+		bool   arrayLayoutSet;					// ORGLIN: arrayLayout below is valid
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;

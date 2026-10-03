@@ -213,7 +213,46 @@ enum asEEngineProp
 	// ADR-0032). Off by default: the language stays unchanged unless asked for.
 	asEP_INITIALIZER_BLOCKS                 = 45,
 
+	// ORGLIN: F-STRINGS:`f"hp {hp:.1f} of {max}"`. The library only does the
+	// SYNTAX: it splits the literal into a template and its embedded expressions and
+	// compiles a call to an application function,
+	//     format("hp {:.1f} of {}", hp, max)
+	// The value of this property is the id of that function (what
+	// RegisterGlobalFunction returned). It must take the template string first and
+	// then any number of arguments, e.g. `string format(const string &in, const ?&in ...)`.
+	// What a format spec MEANS is entirely up to that function. With the property
+	// left at 0 (the default) an f"..." literal is an ordinary string literal.
+	asEP_FSTRING_FORMAT_FUNCTION            = 46,
+
+	// ORGLIN: whether every loop gets a SUSPEND instruction (default true, as
+	// upstream). The SUSPEND is what lets the application suspend or abort a script
+	// stuck in a loop, and what a debugger's line callback hooks. An application with
+	// no debugger attached and no watchdog can turn it off: each loop iteration is
+	// then one instruction shorter.
+	asEP_LOOP_SUSPEND                       = 47,
+
+	// ORGLIN: how to reach the elements of the application's array type, so element
+	// access needs no native call. The value is a pointer to an asSArrayLayout (copied
+	// by the engine), or 0 to turn the fast path off. See asSArrayLayout.
+	asEP_ARRAY_LAYOUT                       = 48,
+
 	asEP_LAST_PROPERTY
+};
+
+// ORGLIN: the memory layout of the application's array type (asEP_ARRAY_LAYOUT).
+// The object holds a pointer to a buffer; the buffer holds the element count and then
+// the elements, `elementSize` bytes apart. An element whose type is a value OBJECT
+// (not a handle, not a primitive) is stored as a pointer to the object. Calls of the
+// two opIndex methods (and of every template instance's copy of them) are replaced by
+// the VM's own address computation, which also does the bounds check.
+struct asSArrayLayout
+{
+	int opIndexFuncIds[2];   // the registered `T &opIndex(uint)` and `const T &opIndex(uint) const`
+	int bufferOffset;        // in the object: the buffer pointer
+	int elementSizeOffset;   // in the object: int, bytes per element
+	int subTypeIdOffset;     // in the object: int, type id of the elements
+	int lengthOffset;        // in the buffer: asUINT, number of elements
+	int dataOffset;          // in the buffer: the first element
 };
 
 // Calling conventions
@@ -1695,7 +1734,34 @@ enum asEBCInstr
 	asBC_POWi64			= 198,
 	asBC_POWu64			= 199,
 	asBC_Thiscall1		= 200,
-	asBC_MAXBYTECODE	= 201,
+	// ORGLIN: ++ / -- on a local int64 in ONE instruction (was LDV + INCi64/DECi64).
+	asBC_IncVi64		= 201,
+	asBC_DecVi64		= 202,
+	// ORGLIN: compare two local variables and jump, in ONE instruction (was CMPx + Jx).
+	// Arguments: var a, var b, condition (0 ==, 1 !=, 2 <, 3 >=, 4 >, 5 <=), jump offset.
+	asBC_JCMPi			= 203,
+	asBC_JCMPu			= 204,
+	asBC_JCMPi64		= 205,
+	// ORGLIN: array element access without a native call (asEP_ARRAY_LAYOUT).
+	// ArrAt replaces the call of the array's opIndex: same stack, same result (the
+	// element's address in the value register). ArrGetN / ArrSetN are the whole
+	// `local = arr[i]` / `arr[i] = local` in one instruction for an N-byte element.
+	asBC_ArrAt			= 206,
+	asBC_ArrGet1		= 207,
+	asBC_ArrGet2		= 208,
+	asBC_ArrGet4		= 209,
+	asBC_ArrGet8		= 210,
+	asBC_ArrSet1		= 211,
+	asBC_ArrSet2		= 212,
+	asBC_ArrSet4		= 213,
+	asBC_ArrSet8		= 214,
+	// ORGLIN: the step of a counting loop in ONE instruction: ++a (or --a), then
+	// compare a with b and jump (was IncVi + JCMPx). Same arguments as JCMPx; bit 3 of
+	// the condition word selects -- instead of ++.
+	asBC_IncJCMPi		= 215,
+	asBC_IncJCMPu		= 216,
+	asBC_IncJCMPi64		= 217,
+	asBC_MAXBYTECODE	= 218,
 
 	// Temporary tokens. Can't be output to the final program
 	asBC_TryBlock		= 250,
@@ -1732,11 +1798,13 @@ enum asEBCType
 	asBCTYPE_rW_DW_DW_ARG = 20,
 	asBCTYPE_W_DW_DW_ARG  = 21,
 	asBCTYPE_W_QW_DW_ARG  = 22,
-	asBCTYPE_W_rW_ARG     = 23
+	asBCTYPE_W_rW_ARG     = 23,
+	asBCTYPE_rW_rW_W_DW_ARG = 24, // ORGLIN: two variables read, a word, a dword (fused compare-and-jump)
+	asBCTYPE_rW_rW_rW_ARG   = 25  // ORGLIN: three variables read (array element store)
 };
 
 // Instruction type sizes
-const int asBCTypeSize[24] =
+const int asBCTypeSize[26] =
 {
 	0, // asBCTYPE_INFO
 	1, // asBCTYPE_NO_ARG
@@ -1761,7 +1829,9 @@ const int asBCTypeSize[24] =
 	3, // asBCTYPE_rW_DW_DW_ARG
 	3, // asBCTYPE_W_DW_DW_ARG
 	4, // asBCTYPE_W_QW_DW_ARG
-	2  // asBCTYPE_W_rW_ARG
+	2, // asBCTYPE_W_rW_ARG
+	3, // asBCTYPE_rW_rW_W_DW_ARG
+	2  // asBCTYPE_rW_rW_rW_ARG
 };
 
 // Instruction info
@@ -2001,23 +2071,23 @@ const asSBCInfo asBCInfo[256] =
 	asBCINFO(POWu64,	wW_rW_rW_ARG,	0,            8),
 	asBCINFO(Thiscall1, DW_ARG,			-AS_PTR_SIZE-1, 0),
 
-	asBCINFO_DUMMY(201),
-	asBCINFO_DUMMY(202),
-	asBCINFO_DUMMY(203),
-	asBCINFO_DUMMY(204),
-	asBCINFO_DUMMY(205),
-	asBCINFO_DUMMY(206),
-	asBCINFO_DUMMY(207),
-	asBCINFO_DUMMY(208),
-	asBCINFO_DUMMY(209),
-	asBCINFO_DUMMY(210),
-	asBCINFO_DUMMY(211),
-	asBCINFO_DUMMY(212),
-	asBCINFO_DUMMY(213),
-	asBCINFO_DUMMY(214),
-	asBCINFO_DUMMY(215),
-	asBCINFO_DUMMY(216),
-	asBCINFO_DUMMY(217),
+	asBCINFO(IncVi64,	rW_ARG,			0,            8),
+	asBCINFO(DecVi64,	rW_ARG,			0,            8),
+	asBCINFO(JCMPi,		rW_rW_W_DW_ARG,	0,            0),
+	asBCINFO(JCMPu,		rW_rW_W_DW_ARG,	0,            0),
+	asBCINFO(JCMPi64,	rW_rW_W_DW_ARG,	0,            0),
+	asBCINFO(ArrAt,		DW_ARG,			-AS_PTR_SIZE-1, 0),
+	asBCINFO(ArrGet1,	wW_rW_rW_ARG,	0,            1),
+	asBCINFO(ArrGet2,	wW_rW_rW_ARG,	0,            2),
+	asBCINFO(ArrGet4,	wW_rW_rW_ARG,	0,            4),
+	asBCINFO(ArrGet8,	wW_rW_rW_ARG,	0,            8),
+	asBCINFO(ArrSet1,	rW_rW_rW_ARG,	0,            0),
+	asBCINFO(ArrSet2,	rW_rW_rW_ARG,	0,            0),
+	asBCINFO(ArrSet4,	rW_rW_rW_ARG,	0,            0),
+	asBCINFO(ArrSet8,	rW_rW_rW_ARG,	0,            0),
+	asBCINFO(IncJCMPi,	rW_rW_W_DW_ARG,	0,            0),
+	asBCINFO(IncJCMPu,	rW_rW_W_DW_ARG,	0,            0),
+	asBCINFO(IncJCMPi64,rW_rW_W_DW_ARG,	0,            0),
 	asBCINFO_DUMMY(218),
 	asBCINFO_DUMMY(219),
 	asBCINFO_DUMMY(220),

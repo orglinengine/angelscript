@@ -304,6 +304,7 @@ protected:
 	int  CompileExpressionPostOp(asCScriptNode *node, asCExprContext *out);
 	int  CompileExpressionValue(asCScriptNode *node, asCExprContext *out);
 	int  CompileFunctionCall(asCScriptNode *node, asCExprContext *out, asCObjectType *objectType, bool objIsConst, const asCString &scope = "");
+	int  CompileFStringCall(asCScriptNode *node, asCExprContext *out, asCExprContext *tmpl, const asCString &exprText, const asCArray<int> &exprPos, const asCArray<int> &exprLen); // ORGLIN
 	int  CompileConstructCall(asCScriptNode *node, asCExprContext *out);
 	int  CompileConversion(asCScriptNode *node, asCExprContext *out);
 	int  CompileOperator(asCScriptNode *node, asCExprContext *l, asCExprContext *r, asCExprContext *out, eTokenType opToken = ttUnrecognizedToken, bool leftToRight = true);

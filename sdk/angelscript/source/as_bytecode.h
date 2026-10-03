@@ -95,7 +95,8 @@ public:
 	void InsertIfNotExists(asCArray<int> &vars, int var);
 	void GetVarsUsed(asCArray<int> &vars);
 	bool IsVarUsed(int offset);
-	void ExchangeVar(int oldOffset, int newOffset);
+	void ExchangeVar(int oldOffset, int newOffset, bool objInfoToo = false);
+	bool ReadsValueOnly(asCByteInstruction *curr, bool wide); // ORGLIN
 	bool IsSimpleExpression();
 
 	void Label(short label);
