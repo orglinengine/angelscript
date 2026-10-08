@@ -389,6 +389,11 @@ public:
 	asSArrayLayout arrayLayout;
 	asFUNCTION_t   arrayAtFunc[2];
 	bool           IsArrayAt(asCScriptFunction *func) const;
+
+	// ORGLIN: the application's dynamic value layout (asEP_ANY_LAYOUT); AnyKindOf()
+	// is the asEAnyKind of a registered function (0 = none, or the fast path is off).
+	asSAnyLayout   anyLayout;
+	int            AnyKindOf(asCScriptFunction *func) const;
 	asCArray<int>                 freeScriptFunctionIds;
 	asCArray<asCScriptFunction *> signatureIds;
 
@@ -513,6 +518,7 @@ public:
 		int    fstringFormatFunc;				// ORGLIN: function called by f"..." literals (0 = none)
 		bool   loopSuspend;						// ORGLIN: a SUSPEND in every loop (default true)
 		bool   arrayLayoutSet;					// ORGLIN: arrayLayout below is valid
+		bool   anyLayoutSet;					// ORGLIN: anyLayout is valid and the any fast path is on
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;
 		bool   requireEnumScope;

@@ -19449,10 +19449,17 @@ void asCCompiler::PerformFunctionCall(int funcId, asCExprContext *ctx, bool isCo
 			ctx->bc.Call(asBC_CALL, descr->id, argSize, 0);
 		else if (descr->funcType == asFUNC_SYSTEM)
 		{
+			// ORGLIN: the application's dynamic value type runs its designated functions in
+			// the VM (asEP_ANY_LAYOUT); the stack protocol is exactly that of the call
+			const int anyKind = engine->AnyKindOf(descr);
+			if (anyKind == asANYK_DTOR)
+				ctx->bc.Call(asBC_AnyDtor, descr->id, argSize, 0);
+			else if (anyKind != 0)
+				ctx->bc.Call(asBC_AnyCall, descr->id, argSize, asWORD(anyKind));
 			// Check if we can use the faster asBC_Thiscall1 instruction, i.e. one of
 			//    type &obj::func(int)
 			//    type &obj::func(uint)
-			if (descr->GetObjectType() && descr->returnType.IsReference() &&
+			else if (descr->GetObjectType() && descr->returnType.IsReference() &&
 				descr->parameterTypes.GetLength() == 1 &&
 				(descr->parameterTypes[0].IsIntegerType() || descr->parameterTypes[0].IsUnsignedType()) &&
 				descr->parameterTypes[0].GetSizeInMemoryBytes() == 4 &&

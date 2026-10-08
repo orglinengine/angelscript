@@ -385,6 +385,45 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		break;
 	}
 
+	// ORGLIN: the any layout and its designated functions (explicit ids, no signature matching).
+	case asEP_ANY_LAYOUT:
+	{
+		if( ep.anyLayoutSet )
+		{
+			// switch the old designation off
+			for( int n = 1; n < asANYK_COUNT; n++ )
+			{
+				const int id = anyLayout.funcIds[n];
+				if( id > 0 && id < (int)scriptFunctions.GetLength() && scriptFunctions[id] && scriptFunctions[id]->sysFuncIntf )
+					scriptFunctions[id]->sysFuncIntf->anyKind = 0;
+			}
+			ep.anyLayoutSet = false;
+		}
+		if( value == 0 )
+			break;
+		const asSAnyLayout &in = *(const asSAnyLayout*)value;
+		// the VM reads exactly this layout: tag byte @0, type id @4, payload @8, 16 bytes, Empty = tag 0
+		if( in.size != 16 || in.tagOffset != 0 || in.typeIdOffset != 4 || in.payloadOffset != 8 ||
+			in.tagBool <= 0 || in.tagInt <= 0 || in.tagDouble <= 0 || in.tagBool > 255 || in.tagInt > 255 ||
+			in.tagDouble > 255 || in.firstHeapTag <= in.tagBool || in.firstHeapTag <= in.tagInt ||
+			in.firstHeapTag <= in.tagDouble || in.firstHeapTag > 255 )
+			return asINVALID_ARG;
+		for( int n = 1; n < asANYK_COUNT; n++ )
+		{
+			const int id = in.funcIds[n];
+			if( id == 0 ) continue;
+			if( id < 0 || id >= (int)scriptFunctions.GetLength() || scriptFunctions[id] == 0 ||
+				scriptFunctions[id]->sysFuncIntf == 0 )
+				return asINVALID_ARG;
+		}
+		anyLayout = in;
+		for( int n = 1; n < asANYK_COUNT; n++ )
+			if( anyLayout.funcIds[n] > 0 )
+				scriptFunctions[anyLayout.funcIds[n]]->sysFuncIntf->anyKind = (asBYTE)n;
+		ep.anyLayoutSet = true;
+		break;
+	}
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		ep.buildWithoutLineCues = value ? true : false;
 		break;
@@ -621,6 +660,10 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_ARRAY_LAYOUT:
 		return ep.arrayLayoutSet ? (asPWORD)&arrayLayout : 0;
 
+	// ORGLIN: the any layout.
+	case asEP_ANY_LAYOUT:
+		return ep.anyLayoutSet ? (asPWORD)&anyLayout : 0;
+
 	case asEP_BUILD_WITHOUT_LINE_CUES:
 		return ep.buildWithoutLineCues;
 
@@ -768,6 +811,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.fstringFormatFunc             = 0;		// ORGLIN: no f-string function (f"..." is a plain string)
 		ep.loopSuspend                   = true;	// ORGLIN: upstream behaviour
 		ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
+		ep.anyLayoutSet                  = false;	// ORGLIN: no any fast path until the application describes its value type
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
 		ep.buildWithoutLineCues          = false;
@@ -910,6 +954,14 @@ bool asCScriptEngine::IsArrayAt(asCScriptFunction *func) const
 	if( !ep.arrayLayoutSet || func == 0 || func->sysFuncIntf == 0 )
 		return false;
 	return func->sysFuncIntf->func == arrayAtFunc[0] || func->sysFuncIntf->func == arrayAtFunc[1];
+}
+
+// ORGLIN: the asEAnyKind of a registered function (0 when the fast path is off)
+int asCScriptEngine::AnyKindOf(asCScriptFunction *func) const
+{
+	if( !ep.anyLayoutSet || func == 0 || func->sysFuncIntf == 0 )
+		return 0;
+	return func->sysFuncIntf->anyKind;
 }
 
 asCScriptEngine::~asCScriptEngine()

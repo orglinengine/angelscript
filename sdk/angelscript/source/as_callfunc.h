@@ -138,6 +138,9 @@ struct asSSystemFunctionInterface
 	};
 	SFast                fast;
 
+	// ORGLIN: the asEAnyKind the VM runs inline for this function (asEP_ANY_LAYOUT), 0 = none
+	asBYTE               anyKind;
+
 	asSSystemFunctionInterface()
 	{ 
 		Clear(); 
@@ -166,6 +169,7 @@ struct asSSystemFunctionInterface
 		paramAutoHandles.SetLength(0);
 		cleanArgs.SetLength(0);
 		memset(&fast, 0, sizeof(fast));
+		anyKind             = 0;
 	}
 
 	asSSystemFunctionInterface &operator=(const asSSystemFunctionInterface &in)
@@ -186,6 +190,7 @@ struct asSSystemFunctionInterface
 		cleanArgs           = in.cleanArgs;
 		paramAutoHandles    = in.paramAutoHandles;
 		fast                = in.fast;
+		anyKind             = in.anyKind;
 
 		return *this;
 	}

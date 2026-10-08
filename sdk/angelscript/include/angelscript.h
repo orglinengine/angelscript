@@ -236,7 +236,53 @@ enum asEEngineProp
 	// by the engine), or 0 to turn the fast path off. See asSArrayLayout.
 	asEP_ARRAY_LAYOUT                       = 48,
 
+	// ORGLIN: the memory layout of the application's dynamic value type, plus the
+	// registered functions the VM may run inline (construct, copy, assign, convert,
+	// destroy) when the value holds a plain number. The value is a pointer to an
+	// asSAnyLayout (copied by the engine), or 0 to turn the fast path off (the
+	// switch is live: already compiled code falls back to the native calls).
+	asEP_ANY_LAYOUT                         = 49,
+
 	asEP_LAST_PROPERTY
+};
+
+// ORGLIN: what the VM may do inline for the application's value type (asEP_ANY_LAYOUT).
+// The functions are named EXPLICITLY (funcIds[kind]); the VM never matches signatures.
+// A kind whose id is 0 is simply not accelerated.
+enum asEAnyKind
+{
+	asANYK_NONE = 0,
+	asANYK_DEF_CTOR,     // void f()
+	asANYK_CTOR_I64,     // void f(int64)
+	asANYK_CTOR_DOUBLE,  // void f(double)
+	asANYK_CTOR_BOOL,    // void f(bool)
+	asANYK_DTOR,         // void f()         (own opcode, asBC_AnyDtor)
+	asANYK_ASSIGN_I64,   // any &opAssign(int64)
+	asANYK_ASSIGN_DOUBLE,// any &opAssign(double)
+	asANYK_ASSIGN_BOOL,  // any &opAssign(bool)
+	asANYK_CONV_I64,     // int64 opConv() const
+	asANYK_CONV_DOUBLE,  // double opConv() const
+	asANYK_CONV_BOOL,    // bool opConv() const
+	asANYK_COPY_CTOR,    // void f(const any &in)
+	asANYK_COPY_ASSIGN,  // any &opAssign(const any &in)
+	asANYK_COUNT
+};
+
+// The value is `size` bytes: a tag byte, a 32-bit type id and an 8-byte payload. A tag
+// below firstHeapTag owns nothing (Empty is tag 0); the VM only touches such values, and
+// leaves every other case to the registered native function. The engine accepts exactly
+// the layout tag @0, type id @4, payload @8, size 16 (checked here and by the application).
+struct asSAnyLayout
+{
+	int size;
+	int tagOffset;
+	int typeIdOffset;
+	int payloadOffset;
+	int tagBool;
+	int tagInt;
+	int tagDouble;
+	int firstHeapTag;
+	int funcIds[asANYK_COUNT];
 };
 
 // ORGLIN: the memory layout of the application's array type (asEP_ARRAY_LAYOUT).
@@ -1761,7 +1807,13 @@ enum asEBCInstr
 	asBC_IncJCMPi		= 215,
 	asBC_IncJCMPu		= 216,
 	asBC_IncJCMPi64		= 217,
-	asBC_MAXBYTECODE	= 218,
+	// ORGLIN: the application's dynamic value type (asEP_ANY_LAYOUT). AnyCall replaces
+	// CALLSYS of a designated function (the kind is in the word argument); AnyDtor the
+	// destructor. Same stack as the call they replace; whatever the inline code cannot
+	// do it hands to the CALLSYS handler with the same function id.
+	asBC_AnyCall		= 218,
+	asBC_AnyDtor		= 219,
+	asBC_MAXBYTECODE	= 220,
 
 	// Temporary tokens. Can't be output to the final program
 	asBC_TryBlock		= 250,
@@ -2088,8 +2140,8 @@ const asSBCInfo asBCInfo[256] =
 	asBCINFO(IncJCMPi,	rW_rW_W_DW_ARG,	0,            0),
 	asBCINFO(IncJCMPu,	rW_rW_W_DW_ARG,	0,            0),
 	asBCINFO(IncJCMPi64,rW_rW_W_DW_ARG,	0,            0),
-	asBCINFO_DUMMY(218),
-	asBCINFO_DUMMY(219),
+	asBCINFO(AnyCall,	W_DW_ARG,		0xFFFF,       0),
+	asBCINFO(AnyDtor,	DW_ARG,			-AS_PTR_SIZE, 0),
 	asBCINFO_DUMMY(220),
 	asBCINFO_DUMMY(221),
 	asBCINFO_DUMMY(222),

@@ -1683,6 +1683,8 @@ bool asCByteCode::IsTempRegUsed(asCByteInstruction *curr)
 		if( curr->op == asBC_CALL      ||
 			curr->op == asBC_PopRPtr   ||
 			curr->op == asBC_CALLSYS   ||
+			curr->op == asBC_AnyCall   ||
+			curr->op == asBC_AnyDtor   ||
 			curr->op == asBC_CALLBND   ||
 			curr->op == asBC_Thiscall1 ||
 			curr->op == asBC_ArrAt     ||
@@ -1730,6 +1732,8 @@ bool asCByteCode::IsSimpleExpression()
 		if( instr->op == asBC_ALLOC ||
 			instr->op == asBC_CALL ||
 			instr->op == asBC_CALLSYS ||
+			instr->op == asBC_AnyCall ||
+			instr->op == asBC_AnyDtor ||
 			instr->op == asBC_SUSPEND ||
 			instr->op == asBC_LINE ||
 			instr->op == asBC_FREE ||
@@ -2773,6 +2777,8 @@ void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 				fprintf(file, "   %-8s v%d, %f\n", asBCInfo[instr->op].name, instr->wArg[0], *(float*)ARG_DW(instr->arg));
 			else if( instr->op == asBC_CALL ||
 					instr->op == asBC_CALLSYS ||
+					instr->op == asBC_AnyCall ||
+					instr->op == asBC_AnyDtor ||
 					instr->op == asBC_CALLBND ||
 					instr->op == asBC_CALLINTF ||
 					instr->op == asBC_Thiscall1 ||

@@ -1284,6 +1284,8 @@ void asCScriptFunction::AddReferences()
 
 			// System functions
 			case asBC_CALLSYS:
+			case asBC_AnyCall:
+			case asBC_AnyDtor:
 				{
 					int funcId = asBC_INTARG(&bc[n]);
 					asCConfigGroup *group = engine->FindConfigGroupForFunction(funcId);
@@ -1442,6 +1444,8 @@ void asCScriptFunction::ReleaseReferences()
 
 			// System functions
 			case asBC_CALLSYS:
+			case asBC_AnyCall:
+			case asBC_AnyDtor:
 				{
 					int funcId = asBC_INTARG(&bc[n]);
 					asCConfigGroup *group = engine->FindConfigGroupForFunction(funcId);
@@ -1910,6 +1914,8 @@ asCScriptFunction* asCScriptFunction::FindNextFunctionCalled(asUINT startSearchF
 		asBYTE bc = *(asBYTE*)&scriptData->byteCode[n];
 		if (bc == asBC_CALL ||
 			bc == asBC_CALLSYS ||
+			bc == asBC_AnyCall ||
+			bc == asBC_AnyDtor ||
 			bc == asBC_Thiscall1 ||
 			bc == asBC_ArrAt ||
 			bc == asBC_CALLINTF ||
@@ -1948,6 +1954,8 @@ asCScriptFunction* asCScriptFunction::GetCalledFunction(asDWORD programPos)
 
 	if (bc == asBC_CALL ||
 		bc == asBC_CALLSYS ||
+		bc == asBC_AnyCall ||
+		bc == asBC_AnyDtor ||
 		bc == asBC_Thiscall1 ||
 		bc == asBC_ArrAt ||
 		bc == asBC_CALLINTF)

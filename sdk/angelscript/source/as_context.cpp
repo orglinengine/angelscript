@@ -2319,7 +2319,7 @@ static const void *const dispatch_table[256] = {
 &&INSTRUCTION(asBC_ArrGet1),	&&INSTRUCTION(asBC_ArrGet2),	&&INSTRUCTION(asBC_ArrGet4),	&&INSTRUCTION(asBC_ArrGet8),
 &&INSTRUCTION(asBC_ArrSet1),	&&INSTRUCTION(asBC_ArrSet2),	&&INSTRUCTION(asBC_ArrSet4),	&&INSTRUCTION(asBC_ArrSet8),
 &&INSTRUCTION(asBC_IncJCMPi),	&&INSTRUCTION(asBC_IncJCMPu),	&&INSTRUCTION(asBC_IncJCMPi64),
-&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
+&&INSTRUCTION(asBC_AnyCall),	&&INSTRUCTION(asBC_AnyDtor),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
 &&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),			&&INSTRUCTION(FAULT),
@@ -2811,6 +2811,138 @@ static const void *const dispatch_table[256] = {
 		l_bc++;
 		NEXT_INSTRUCTION();
 
+	// ORGLIN: the application's dynamic value type (asEP_ANY_LAYOUT). AnyCall stands in for
+	// CALLSYS of one designated function (asEAnyKind, in the word argument) and has the same
+	// stack. It only ever handles values that own nothing (tag below firstHeapTag) and
+	// never raises: everything else (a heap value, a null pointer, a conversion that
+	// fails, the fast path switched off) jumps to the CALLSYS handler with the same function
+	// id, so errors and heap semantics come from the registered function.
+	INSTRUCTION(asBC_AnyCall):
+		{
+			bool done = false;
+			if( m_engine->ep.anyLayoutSet )
+			{
+				const asSAnyLayout &L = m_engine->anyLayout;
+				asBYTE *self = *(asBYTE**)l_sp;
+				asDWORD *sp = l_sp + AS_PTR_SIZE;   // the first argument
+				if( self ) switch( asBC_WORDARG0(l_bc) )
+				{
+				case asANYK_DEF_CTOR:
+					((asQWORD*)self)[0] = 0; ((asQWORD*)self)[1] = 0;
+					done = true;
+					break;
+				case asANYK_CTOR_I64:
+				case asANYK_CTOR_DOUBLE:
+					((asQWORD*)self)[0] = asWORD(asBC_WORDARG0(l_bc)) == asANYK_CTOR_I64 ? (asQWORD)L.tagInt : (asQWORD)L.tagDouble;
+					((asQWORD*)self)[1] = *(asQWORD*)sp;
+					sp += 2;
+					done = true;
+					break;
+				case asANYK_CTOR_BOOL:
+					((asQWORD*)self)[0] = (asQWORD)L.tagBool;
+					((asQWORD*)self)[1] = *(asBYTE*)sp ? 1 : 0;
+					sp += 1;
+					done = true;
+					break;
+				case asANYK_ASSIGN_I64:
+				case asANYK_ASSIGN_DOUBLE:
+					if( self[0] < L.firstHeapTag )
+					{
+						((asQWORD*)self)[0] = asWORD(asBC_WORDARG0(l_bc)) == asANYK_ASSIGN_I64 ? (asQWORD)L.tagInt : (asQWORD)L.tagDouble;
+						((asQWORD*)self)[1] = *(asQWORD*)sp;
+						sp += 2;
+						*(asPWORD*)&m_regs.valueRegister = (asPWORD)self;
+						done = true;
+					}
+					break;
+				case asANYK_ASSIGN_BOOL:
+					if( self[0] < L.firstHeapTag )
+					{
+						((asQWORD*)self)[0] = (asQWORD)L.tagBool;
+						((asQWORD*)self)[1] = *(asBYTE*)sp ? 1 : 0;
+						sp += 1;
+						*(asPWORD*)&m_regs.valueRegister = (asPWORD)self;
+						done = true;
+					}
+					break;
+				case asANYK_CONV_I64:
+					if( self[0] == L.tagInt )
+					{
+						m_regs.valueRegister = ((asQWORD*)self)[1];
+						done = true;
+					}
+					else if( self[0] == L.tagBool )
+					{
+						m_regs.valueRegister = self[8] ? 1 : 0;
+						done = true;
+					}
+					else if( self[0] == L.tagDouble )
+					{
+						// the same saturating, nan-safe truncation as the application's conversion
+						const double d = *(double*)(self + 8);
+						asINT64 r;
+						if( d != d ) r = 0;
+						else if( d >= 9223372036854775807.0 ) r = (asINT64)0x7FFFFFFFFFFFFFFFLL;
+						else if( d <= -9223372036854775808.0 ) r = (asINT64)0x8000000000000000ULL;
+						else r = (asINT64)d;
+						m_regs.valueRegister = (asQWORD)r;
+						done = true;
+					}
+					break;
+				case asANYK_CONV_DOUBLE:
+					{
+						double d = 0;
+						if( self[0] == L.tagDouble ) { d = *(double*)(self + 8); done = true; }
+						else if( self[0] == L.tagInt ) { d = (double)*(asINT64*)(self + 8); done = true; }
+						else if( self[0] == L.tagBool ) { d = self[8] ? 1.0 : 0.0; done = true; }
+						if( done ) memcpy(&m_regs.valueRegister, &d, sizeof(d));
+					}
+					break;
+				case asANYK_CONV_BOOL:
+					if( self[0] == L.tagBool ) { m_regs.valueRegister = self[8] ? 1 : 0; done = true; }
+					else if( self[0] == L.tagInt ) { m_regs.valueRegister = *(asINT64*)(self + 8) != 0 ? 1 : 0; done = true; }
+					else if( self[0] == L.tagDouble ) { m_regs.valueRegister = *(double*)(self + 8) != 0.0 ? 1 : 0; done = true; }
+					break;
+				case asANYK_COPY_CTOR:
+				case asANYK_COPY_ASSIGN:
+					{
+						const asBYTE *src = *(asBYTE**)sp;
+						const bool assign = asBC_WORDARG0(l_bc) == asANYK_COPY_ASSIGN;
+						if( src && src[0] < L.firstHeapTag && (!assign || self[0] < L.firstHeapTag) )
+						{
+							((asQWORD*)self)[0] = ((const asQWORD*)src)[0];
+							((asQWORD*)self)[1] = ((const asQWORD*)src)[1];
+							sp += AS_PTR_SIZE;
+							if( assign ) *(asPWORD*)&m_regs.valueRegister = (asPWORD)self;
+							done = true;
+						}
+					}
+					break;
+				}
+				if( done ) l_sp = sp;
+			}
+			if( !done )
+				goto any_callsys;
+			l_bc += 2;
+		}
+		NEXT_INSTRUCTION();
+
+	// AnyDtor: the destructor of a value that owns nothing is a no-op
+	INSTRUCTION(asBC_AnyDtor):
+		{
+			if( m_engine->ep.anyLayoutSet )
+			{
+				asBYTE *self = *(asBYTE**)l_sp;
+				if( self && self[0] < m_engine->anyLayout.firstHeapTag )
+				{
+					l_sp += AS_PTR_SIZE;
+					l_bc += 2;
+					NEXT_INSTRUCTION();
+				}
+			}
+			goto any_callsys;
+		}
+
 	// ORGLIN: array element access (asEP_ARRAY_LAYOUT). ArrayElement() gives the
 	// element's address or 0 (null array or index out of range); the caller raises
 	// the exception with the program state saved, like any other instruction.
@@ -3154,6 +3286,7 @@ static const void *const dispatch_table[256] = {
 		NEXT_INSTRUCTION();
 
 	INSTRUCTION(asBC_CALLSYS):
+	any_callsys: // ORGLIN: where asBC_AnyCall / asBC_AnyDtor hand over what they cannot do inline
 		{
 			// Get function ID from the argument
 			int i = asBC_INTARG(l_bc);
@@ -5105,8 +5238,6 @@ static const void *const dispatch_table[256] = {
 
 
 
-	INSTRUCTION(218): l_bc = (asDWORD*)218; goto case_FAULT;
-	INSTRUCTION(219): l_bc = (asDWORD*)219; goto case_FAULT;
 	INSTRUCTION(220): l_bc = (asDWORD*)220; goto case_FAULT;
 	INSTRUCTION(221): l_bc = (asDWORD*)221; goto case_FAULT;
 	INSTRUCTION(222): l_bc = (asDWORD*)222; goto case_FAULT;
@@ -5530,7 +5661,7 @@ void asCContext::CleanArgsOnStack()
 	// Determine what function was being called
 	asCScriptFunction *func = 0;
 	asBYTE bc = prevInstr ? *(asBYTE*)prevInstr : 0;
-	if( bc == asBC_CALL || bc == asBC_CALLSYS || bc == asBC_CALLINTF )
+	if( bc == asBC_CALL || bc == asBC_CALLSYS || bc == asBC_AnyCall || bc == asBC_AnyDtor || bc == asBC_CALLINTF )
 	{
 		int funcId = asBC_INTARG(prevInstr);
 		func = m_engine->scriptFunctions[funcId];
