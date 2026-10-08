@@ -243,6 +243,17 @@ enum asEEngineProp
 	// switch is live: already compiled code falls back to the native calls).
 	asEP_ANY_LAYOUT                         = 49,
 
+	// ORGLIN (ADR-0048): the layout of the application's `table` type, a second array-like
+	// type that coexists with the array of asEP_ARRAY_LAYOUT. The value is a pointer to an
+	// asSArrayLayout (copied by the engine) read as described at asSArrayLayout, or 0 to
+	// turn it off. The instructions record which of the two layouts they use.
+	asEP_TABLE_LAYOUT                       = 50,
+
+	// ORGLIN (ADR-0048): when on (and a `table` template is registered) a `{ ... }` literal whose
+	// destination cannot name a shape (an `any` or a `?` slot) builds a `table<string,any>`; when off
+	// (the default) it builds the legacy `dictionary`. Off until the content is migrated to table.
+	asEP_TABLE_LITERALS                     = 51,
+
 	asEP_LAST_PROPERTY
 };
 
@@ -299,6 +310,18 @@ struct asSArrayLayout
 	int subTypeIdOffset;     // in the object: int, type id of the elements
 	int lengthOffset;        // in the buffer: asUINT, number of elements
 	int dataOffset;          // in the buffer: the first element
+	// SPIKE-PATCH-5
+	int indexSize;           // 4: a uint index (as before), 8: an int64 index
+	int inlineTypeId;        // an element object type stored INLINE in the buffer (not through a pointer); 0 = none
+	int servedFlags;         // bit0: handle elements are served, bit1: other object elements are served (stored as pointers)
+	// asEP_TABLE_LAYOUT reads the same struct with these differences: the object holds the element
+	// pointer itself at bufferOffset (to element 0, no buffer header) and the element count (asUINT)
+	// at lengthOffset, both IN THE OBJECT; elements are never pointer-stored.
+	// Table only, an INDIRECT element (G7): when the element type id is indirectTypeId, the slot is a tagged
+	// value whose tag byte (@0) must equal indirectTag and whose pointer payload (@dataOffset) IS the element
+	// address. A slot with another tag is not served (the registered opIndex runs). 0 = none.
+	int indirectTypeId;
+	int indirectTag;
 };
 
 // Calling conventions
@@ -368,9 +391,12 @@ enum asEObjTypeFlags
 };
 
 // These need to be here since they are too large for enum underlying type (int32 or uint32) on C++98 compliant compilers
-static const asQWORD asOBJ_MASK_VALID_FLAGS = 0x1801FFFFFLL;
+static const asQWORD asOBJ_MASK_VALID_FLAGS = 0x3801FFFFFLL;
 static const asQWORD asOBJ_APP_CLASS_MORE_CONSTRUCTORS = (asQWORD(1) << 31);
 static const asQWORD asOBJ_APP_CLASS_UNION = (asQWORD(1) << 32);
+// SPIKE-PATCH-9/10/11: the type follows the `table` protocol: split index (a read never creates, only an
+// assignment target does), entry literals ({ positional, name = v, [expr] = v } lowered to calls) and dot sugar
+static const asQWORD asOBJ_TABLE = (asQWORD(1) << 33);
 
 // Behaviours
 enum asEBehaviours
@@ -2128,7 +2154,7 @@ const asSBCInfo asBCInfo[256] =
 	asBCINFO(JCMPi,		rW_rW_W_DW_ARG,	0,            0),
 	asBCINFO(JCMPu,		rW_rW_W_DW_ARG,	0,            0),
 	asBCINFO(JCMPi64,	rW_rW_W_DW_ARG,	0,            0),
-	asBCINFO(ArrAt,		DW_ARG,			-AS_PTR_SIZE-1, 0),
+	asBCINFO(ArrAt,		W_DW_ARG,		-AS_PTR_SIZE-1, 0),   // ADR-0048: the word is which array layout
 	asBCINFO(ArrGet1,	wW_rW_rW_ARG,	0,            1),
 	asBCINFO(ArrGet2,	wW_rW_rW_ARG,	0,            2),
 	asBCINFO(ArrGet4,	wW_rW_rW_ARG,	0,            4),

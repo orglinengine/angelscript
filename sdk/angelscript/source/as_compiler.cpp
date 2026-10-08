@@ -1102,6 +1102,16 @@ int asCCompiler::CallCopyConstructor(asCDataType &type, int offset, bool isObjec
 	return -1;
 }
 
+// SPIKE-PATCH-3: the type a literal builds when the destination cannot name a shape (a ? slot, an any):
+// table<string,any> when the application registered a table template, else the legacy dictionary.
+// (One lookup replaces the hardcoded dictionary lookup at four sites.)
+static asCObjectType *LiteralTableType(asCScriptEngine *engine)
+{
+	if( !engine->ep.tableLiterals || engine->GetTypeInfoByName("table") == 0 )
+		return 0;
+	return CastToObjectType(reinterpret_cast<asCTypeInfo*>(engine->GetTypeInfoByDecl("table<string,any>")));
+}
+
 int asCCompiler::CallDefaultConstructor(const asCDataType &type, int offset, bool isObjectOnHeap, asCByteCode *bc, asCScriptNode *node, EVarGlobOrMem isVarGlobOrMem, bool derefDest)
 {
 	if( !type.IsObject() || type.IsObjectHandle() )
@@ -3019,6 +3029,40 @@ asUINT asCCompiler::MatchFunctions(asCArray<int> &funcs, asCArray<asCExprContext
 		}
 	}
 
+	// SPIKE-PATCH-4: two candidates that differ only in taking a primitive by value or by `const T &in`
+	// (a template whose key type is int64 registers `opIndex(int64)` and `opIndex(const K &in)`): the
+	// by-value one is the more specific, so it wins instead of "Multiple matching signatures".
+	if( funcs.GetLength() == 2 )
+	{
+		asCScriptFunction *fa = builder->GetFunctionDescription(funcs[0]);
+		asCScriptFunction *fb = builder->GetFunctionDescription(funcs[1]);
+		if( fa->parameterTypes.GetLength() == fb->parameterTypes.GetLength() )
+		{
+			bool sameButRef = true;
+			int byValue = -1;
+			for( asUINT p = 0; p < fa->parameterTypes.GetLength() && sameButRef; p++ )
+			{
+				const asCDataType &pa = fa->parameterTypes[p];
+				const asCDataType &pb = fb->parameterTypes[p];
+				if( pa == pb && fa->inOutFlags[p] == fb->inOutFlags[p] )
+					continue;   // an identical parameter (e.g. the `const V &in` value of _literalSet) takes no part
+				if( !pa.IsPrimitive() || !pb.IsPrimitive() || pa.GetTokenType() != pb.GetTokenType() ||
+					pa.IsReference() == pb.IsReference() )
+					sameButRef = false;
+				else if( byValue == -1 )
+					byValue = pa.IsReference() ? 1 : 0;
+				else if( byValue != (pa.IsReference() ? 1 : 0) )
+					sameButRef = false;
+			}
+			if( sameButRef && byValue >= 0 )
+			{
+				int keep = funcs[byValue];
+				funcs.SetLength(0);
+				funcs.PushLast(keep);
+			}
+		}
+	}
+
 	// If there are still multiple functions left, then report an error
 	if( funcs.GetLength() != 1 && !silent )
 	{
@@ -3305,7 +3349,9 @@ bool asCCompiler::CompileInitialization(asCScriptNode *node, asCByteCode *bc, co
 	if( node && node->nodeType == snArgList )
 	{
 		// Make sure it is an object and not a handle
-		if( type.GetTypeInfo() == 0 || type.IsObjectHandle() )
+		// SPIKE-PATCH-6: a registered implicit-handle type takes constructor arguments in a declaration (`table<int64> t(n)`)
+		if( type.GetTypeInfo() == 0 ||
+			(type.IsObjectHandle() && !((type.GetTypeInfo()->flags & asOBJ_IMPLICIT_HANDLE) && !(type.GetTypeInfo()->flags & asOBJ_SCRIPT_OBJECT))) )
 		{
 			Error(TXT_MUST_BE_OBJECT, node);
 		}
@@ -3479,13 +3525,13 @@ bool asCCompiler::CompileInitialization(asCScriptNode *node, asCByteCode *bc, co
 		// (that is the addon's own value-taking constructor). Doing it here rather
 		// than in CompileInitList keeps the wrapping on the engine's normal path.
 		bool anyDest = engine->ep.dictionaryLiterals &&
-			node->tokenType == ttStartStatementBlock &&
+			(node->tokenType == ttStartStatementBlock || LiteralTableType(engine) != 0) &&
 			type.GetTypeInfo() && type.GetTypeInfo()->GetName() &&
 			strcmp(type.GetTypeInfo()->GetName(), "any") == 0;
 
 		if( anyDest )
 		{
-			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			asITypeInfo *dictType = LiteralTableType(engine) ? (asITypeInfo*)LiteralTableType(engine) : engine->GetTypeInfoByName("dictionary");
 			if( dictType == 0 )
 			{
 				Error(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, node);
@@ -3551,17 +3597,28 @@ bool asCCompiler::CompileInitialization(asCScriptNode *node, asCByteCode *bc, co
 	{
 		asASSERT( node == 0 );
 
+		// SPIKE-PATCH-1: a registered implicit-handle type is built by its default factory on a bare
+		// declaration (`table<int64> t;`), local, global or member. Script classes stay null.
+		// (Done here, in the declaration path only: CallDefaultConstructor also serves temporaries.)
+		asCDataType dt = type;
+		// Only when the type HAS a trivial default factory: a registered implicit-handle type built from
+		// arguments only (UIElement) stays a null handle, as before.
+		if( dt.IsObjectHandle() && dt.GetTypeInfo() &&
+			(dt.GetTypeInfo()->flags & asOBJ_IMPLICIT_HANDLE) && (dt.GetTypeInfo()->flags & asOBJ_TABLE) && !(dt.GetTypeInfo()->flags & asOBJ_SCRIPT_OBJECT) &&
+			dt.GetBehaviour() && dt.GetBehaviour()->factory != 0 )
+			dt.MakeHandle(false);
+
 		// Call the default constructor here, as no explicit initialization is done
 		if( isVarGlobOrMem == asVGM_VARIABLE )
-			CallDefaultConstructor(type, offset, IsVariableOnHeap(offset), bc, errNode);
+			CallDefaultConstructor(dt, offset, IsVariableOnHeap(offset), bc, errNode);
 		else if( isVarGlobOrMem == asVGM_GLOBAL )
-			CallDefaultConstructor(type, offset, true, bc, errNode, isVarGlobOrMem);
+			CallDefaultConstructor(dt, offset, true, bc, errNode, isVarGlobOrMem);
 		else if( isVarGlobOrMem == asVGM_MEMBER )
 		{
-			if( !(type.IsObject() || type.IsFuncdef()) || type.IsReference() || (type.GetTypeInfo()->flags & asOBJ_REF) )
-				CallDefaultConstructor(type, offset, true, bc, errNode, isVarGlobOrMem);
+			if( !(dt.IsObject() || dt.IsFuncdef()) || dt.IsReference() || (dt.GetTypeInfo()->flags & asOBJ_REF) )
+				CallDefaultConstructor(dt, offset, true, bc, errNode, isVarGlobOrMem);
 			else
-				CallDefaultConstructor(type, offset, false, bc, errNode, isVarGlobOrMem);
+				CallDefaultConstructor(dt, offset, false, bc, errNode, isVarGlobOrMem);
 		}
 	}
 
@@ -4450,6 +4507,159 @@ void asCCompiler::FinishInitializerEntry(asCExprContext *e, asCScriptNode *node,
 	bc->AddCode(&e->bc);
 }
 
+// SPIKE-PATCH-10: a list literal for a type with the table protocol. Three entry kinds, freely mixed, in source
+// order; the object is built by its default factory and each entry becomes one call on it:
+//   expr             -> insertLast(expr)
+//   name = expr      -> _literalSet("name", expr)      (a lone identifier or string constant left of '=')
+//   [key] = expr     -> _literalSet(key, expr)         (an evaluated key)
+// Constant keys that collide (an integer key equal to a positional index, a repeated name or integer) are a
+// compile error; non-constant keys are checked by _literalSet at run time.
+void asCCompiler::CompileTableLiteral(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem)
+{
+	asCObjectType *ot = CastToObjectType(var->dataType.GetTypeInfo());
+	asCDataType hdt = asCDataType::CreateObjectHandle(ot, false);
+
+	// where the object lives while it is filled: the declared variable, else a temporary stored at the end
+	const int off = var->isVariable ? var->stackOffset : AllocateVariable(hdt, true);
+	CompileInitialization(0, bc, hdt, node, off, 0, asVGM_VARIABLE);
+
+	// pass 1: how many positional entries (their implicit indices are 0..P-1)
+	asUINT positional = 0;
+	for( asCScriptNode *e = node->firstChild; e; e = e->next )
+		if( !(e->nodeType == snInitList && e->firstChild && (e->firstChild->nodeType == snDictionaryKey || e->firstChild->nodeType == snTableKey)) )
+			positional++;
+
+	asCArray<asINT64> intKeys;
+	asCArray<asCString> strKeys;
+	asUINT nextPos = 0;
+
+	for( asCScriptNode *e = node->firstChild; e; e = e->next )
+	{
+		asCArray<asCExprContext*> args;
+		bool keyed = e->nodeType == snInitList && e->firstChild && (e->firstChild->nodeType == snDictionaryKey || e->firstChild->nodeType == snTableKey);
+		asCScriptNode *valueNode = keyed ? e->firstChild->next : e;
+		bool ok = true;
+
+		asCExprContext *kctx = 0;
+		if( keyed )
+		{
+			kctx = asNEW(asCExprContext)(engine);
+			if( e->firstChild->nodeType == snDictionaryKey )
+			{
+				asCString name;
+				if( e->firstChild->tokenType == ttStringConstant )
+					name = asCString(&script->code[e->firstChild->tokenPos + 1], e->firstChild->tokenLength - 2);
+				else
+					name = asCString(&script->code[e->firstChild->tokenPos], e->firstChild->tokenLength);
+				if( CompileDictionaryKey(e->firstChild, &kctx->bc) < 0 )
+					ok = false;
+				kctx->type.Set(engine->stringType);
+				kctx->type.isConstant = true;
+				kctx->type.isRefSafe = true;
+				for( asUINT n = 0; n < strKeys.GetLength(); n++ )
+					if( strKeys[n] == name )
+					{
+						asCString msg;
+						msg.Format("table: duplicate key '%s' in literal", name.AddressOf());
+						Error(msg, e);
+						ok = false;
+					}
+				strKeys.PushLast(name);
+			}
+			else
+			{
+				kctx->exprNode = e->firstChild->firstChild;
+				if( CompileCondition(e->firstChild->firstChild, kctx) < 0 )
+					ok = false;
+				else if( kctx->type.isConstant && kctx->type.dataType.IsIntegerType() )
+				{
+					const asINT64 k = kctx->type.dataType.GetSizeInMemoryBytes() == 8 ? (asINT64)kctx->type.GetConstantQW() : (asINT64)(asINT32)kctx->type.GetConstantDW();
+					bool dup = k >= 0 && (asUINT)k < positional;
+					for( asUINT n = 0; n < intKeys.GetLength() && !dup; n++ )
+						dup = intKeys[n] == k;
+					if( dup )
+					{
+						asCString msg;
+						msg.Format("table: duplicate key %lld in literal", (long long)k);
+						Error(msg, e);
+						ok = false;
+					}
+					intKeys.PushLast(k);
+				}
+			}
+		}
+		else
+			nextPos++;
+
+		asCExprContext *vctx = asNEW(asCExprContext)(engine);
+		vctx->exprNode = valueNode;
+		if( valueNode->nodeType == snInitList )
+			vctx->SetAnonymousInitList(valueNode, script);
+		else if( CompileAssignment(valueNode, vctx) < 0 )
+			ok = false;
+
+		if( ok )
+		{
+			// _literalSet(value, key): the key is the LAST argument, which the VM evaluates first
+			args.PushLast(vctx);
+			if( keyed ) args.PushLast(kctx);
+			if( TableLiteralCall(e, off, hdt, ot, keyed ? "_literalSet" : "insertLast", args, bc) < 0 )
+				ok = false;
+		}
+		else
+		{
+			if( kctx ) asDELETE(kctx, asCExprContext);
+			asDELETE(vctx, asCExprContext);
+			continue;
+		}
+		for( asUINT n = 0; n < args.GetLength(); n++ )
+			if( args[n] )
+				asDELETE(args[n], asCExprContext);
+	}
+	(void)nextPos;
+
+	if( !var->isVariable )
+	{
+		// store the finished table into the global / member, as the list-factory path stores its result
+		bc->InstrSHORT(asBC_PSF, (short)off);
+		bc->Instr(asBC_RDSPtr);
+		if( isVarGlobOrMem == 1 )
+			bc->InstrPTR(asBC_PGA, engine->globalProperties[var->stackOffset]->GetAddressOfValue());
+		else
+		{
+			bc->InstrSHORT(asBC_PSF, 0);
+			bc->Instr(asBC_RDSPtr);
+			bc->InstrSHORT_DW(asBC_ADDSi, (short)var->stackOffset, engine->GetTypeIdFromDataType(asCDataType::CreateType(outFunc->objectType, false)));
+		}
+		bc->InstrPTR(asBC_REFCPY, var->dataType.GetTypeInfo());
+		bc->Instr(asBC_PopPtr);
+		ReleaseTemporaryVariable(off, bc);
+	}
+}
+
+// one lowered call of a table literal, `obj.method(args)` on the object held in `objOffset`
+int asCCompiler::TableLiteralCall(asCScriptNode *node, int objOffset, const asCDataType &hdt, asCObjectType *ot,
+									  const char *method, asCArray<asCExprContext*> &args, asCByteCode *bc)
+{
+	asCExprContext octx(engine);
+	octx.bc.InstrSHORT(asBC_PSF, (short)objOffset);
+	octx.type.SetVariable(hdt, objOffset, false);
+	if( IsVariableOnHeap(objOffset) )
+		octx.type.dataType.MakeReference(true);
+
+	asCArray<int> funcs;
+	builder->GetObjectMethodDescriptions(method, ot, funcs, false);
+	MatchFunctions(funcs, args, node, method, 0, ot, false);
+	if( funcs.GetLength() != 1 )
+		return -1;
+	if( CompileDefaultAndNamedArgs(node, args, funcs[0], ot) < 0 )
+		return -1;
+	if( MakeFunctionCall(&octx, funcs[0], ot, args, node, false, 0, octx.type.stackOffset) < 0 )
+		return -1;
+	bc->AddCode(&octx.bc);
+	return 0;
+}
+
 void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem)
 {
 	// ORGLIN (ADR-0011): the literal's DELIMITER decides what it is.
@@ -4488,11 +4698,19 @@ void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByt
 		// the ordinary conversion can build the `any` around the dictionary.)
 		if( var->dataType.GetTokenType() == ttQuestion )
 		{
-			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			asITypeInfo *dictType = LiteralTableType(engine) ? (asITypeInfo*)LiteralTableType(engine) : engine->GetTypeInfoByName("dictionary");
 			if( dictType )
 				var->dataType = asCDataType::CreateObjectHandle(
 					CastToObjectType(reinterpret_cast<asCTypeInfo*>(dictType)), false);
 		}
+	}
+
+	// SPIKE-PATCH-10: a type with the table protocol takes every list literal as entries lowered to calls
+	if( node && node->nodeType == snInitList && var->dataType.GetTypeInfo() &&
+		(var->dataType.GetTypeInfo()->flags & asOBJ_TABLE) )
+	{
+		CompileTableLiteral(var, node, bc, isVarGlobOrMem);
+		return;
 	}
 
 	// ORGLIN (ADR-0011): `{ ... }` is the DICTIONARY spelling, and it is the ONLY
@@ -4514,7 +4732,9 @@ void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByt
 			(var->dataType.GetTypeInfo() && var->dataType.GetTypeInfo()->GetName() &&
 			 strcmp(var->dataType.GetTypeInfo()->GetName(), "any") == 0));
 
-		if( braceLiteral && canNameShape && !dictionaryDest )
+		// SPIKE-PATCH-2: a type with a second (brace) list factory takes the { ... } literal itself
+		const bool hasBraceFactory = var->dataType.GetBehaviour() && var->dataType.GetBehaviour()->listFactoryBrace;
+		if( braceLiteral && canNameShape && !dictionaryDest && !hasBraceFactory )
 		{
 			// A brace list of plain values (`array<int> a = {1, 2, 3}`) is retired:
 			// it is the one thing that used to make a `?` destination ambiguous.
@@ -4544,6 +4764,8 @@ void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByt
 
 	// Find the list factory
 	int funcId = var->dataType.GetBehaviour()->listFactory;
+	if( node && node->nodeType == snInitList && node->tokenType == ttStartStatementBlock && var->dataType.GetBehaviour()->listFactoryBrace )
+		funcId = var->dataType.GetBehaviour()->listFactoryBrace;   // SPIKE-PATCH-2
 	asASSERT( engine->scriptFunctions[funcId]->listPattern );
 
 	// TODO: runtime optimize: A future optimization should be to use the stack space directly
@@ -4560,7 +4782,7 @@ void asCCompiler::CompileInitList(asCExprValue *var, asCScriptNode *node, asCByt
 	// Evaluate all elements of the list
 	asCExprContext valueExpr(engine);
 	asCScriptNode *el = node;
-	asSListPatternNode *patternNode = engine->scriptFunctions[listPatternType->templateSubTypes[0].GetBehaviour()->listFactory]->listPattern;
+	asSListPatternNode *patternNode = engine->scriptFunctions[listPatternType->listFactoryId]->listPattern;   // SPIKE-PATCH-2
 	int elementsInSubList = -1;
 	int r = CompileInitListElement(patternNode, el, engine->GetTypeIdFromDataType(asCDataType::CreateType(listPatternType, false)), short(bufferVar), bufferSize, valueExpr.bc, elementsInSubList);
 	asASSERT( r || patternNode == 0 );
@@ -4855,6 +5077,8 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 			asCScriptNode *nestedList = 0;
 			asCDataType inferredArrayElem;
 			bool untypedListInQuestionSlot = false;
+			bool inferredIsTable = false;                 // SPIKE-PATCH-3
+			asCScriptNode *anySlotList = 0;               // SPIKE-PATCH-3: a nested literal in an any-typed element
 			if( engine->ep.dictionaryLiterals && dt.GetTokenType() == ttQuestion )
 			{
 				// A list literal written as a value is wrapped by the expression
@@ -4874,6 +5098,12 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 				{
 					if( IsDictionaryList(candidate) )
 						nestedList = candidate;
+					else if( LiteralTableType(engine) )
+					{
+						// SPIKE-PATCH-3: a positional literal in a ? slot is a table<string,any>, no inference
+						inferredArrayElem = asCDataType::CreateObjectHandle(LiteralTableType(engine), false);
+						inferredIsTable = true;
+					}
 					else if( !InferArrayElementType(candidate, inferredArrayElem) )
 					{
 						// A LIST that is not a dictionary literal, and whose element
@@ -4887,7 +5117,32 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 				}
 			}
 
-			if( untypedListInQuestionSlot )
+			// SPIKE-PATCH-3: an any-typed element (table<string,any>) given a nested literal
+			if( engine->ep.dictionaryLiterals && LiteralTableType(engine) && dt.GetTypeInfo() && dt.GetTypeInfo()->GetName() &&
+				strcmp(dt.GetTypeInfo()->GetName(), "any") == 0 )
+			{
+				asCScriptNode *c2 = valueNode;
+				while( c2 && c2->nodeType != snInitList && c2->firstChild && c2->firstChild->next == 0 &&
+					   (c2->nodeType == snAssignment || c2->nodeType == snCondition || c2->nodeType == snExpression ||
+						c2->nodeType == snExprTerm || c2->nodeType == snExprValue || c2->nodeType == snScope) )
+					c2 = c2->firstChild;
+				if( c2 && c2->nodeType == snInitList )
+					anySlotList = c2;
+			}
+
+			if( anySlotList )
+			{
+				asCDataType tdt = asCDataType::CreateObjectHandle(LiteralTableType(engine), false);
+				int toff = AllocateVariable(tdt, true);
+				rctx.type.Set(tdt);
+				rctx.type.isVariable = true;
+				rctx.type.isTemporary = true;
+				rctx.type.stackOffset = toff;
+				CompileInitList(&rctx.type, anySlotList, &rctx.bc, 0);
+				rctx.bc.InstrSHORT(asBC_PSF, (short)toff);
+				rctx.type.dataType.MakeReference(true);
+			}
+			else if( untypedListInQuestionSlot )
 			{
 				asCString str;
 				str.Format(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, "?");
@@ -4904,7 +5159,7 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 				// compiled as a real `array<T>` temporary and its type id inlined in
 				// the buffer, exactly like the typed path below.
 				asCDataType arrDt = inferredArrayElem;
-				if( arrDt.MakeArray(engine, 0) < 0 || !arrDt.IsValid() )
+				if( (!inferredIsTable && arrDt.MakeArray(engine, 0) < 0) || !arrDt.IsValid() )
 				{
 					asCString str;
 					str.Format(TXT_INIT_LIST_CANNOT_BE_USED_WITH_s, "?");
@@ -4950,7 +5205,7 @@ int asCCompiler::CompileInitListElement(asSListPatternNode *&patternNode, asCScr
 			}
 			else if( nestedList )
 			{
-				asCObjectType *dictObj = CastToObjectType(reinterpret_cast<asCTypeInfo*>(engine->GetTypeInfoByName("dictionary")));
+				asCObjectType *dictObj = LiteralTableType(engine) ? LiteralTableType(engine) : CastToObjectType(reinterpret_cast<asCTypeInfo*>(engine->GetTypeInfoByName("dictionary")));
 				if( dictObj == 0 )
 				{
 					asCString str;
@@ -8992,7 +9247,7 @@ asUINT asCCompiler::ImplicitConversion(asCExprContext *ctx, const asCDataType &t
 			ctx->exprNode && ctx->exprNode->nodeType == snInitList &&
 			ctx->exprNode->tokenType == ttStartStatementBlock )
 		{
-			asITypeInfo *dictType = engine->GetTypeInfoByName("dictionary");
+			asITypeInfo *dictType = LiteralTableType(engine) ? (asITypeInfo*)LiteralTableType(engine) : engine->GetTypeInfoByName("dictionary");
 			if( dictType )
 			{
 				asCDataType dictDt = asCDataType::CreateObjectHandle(
@@ -16042,6 +16297,172 @@ int asCCompiler::ProcessPropertyGetAccessor(asCExprContext *ctx, asCScriptNode *
 	return r;
 }
 
+// The opIndex call itself, shared by `obj[args]` and the table dot sugar (`t.name` = `t["name"]`).
+// Returns 1 when compiled, 0 when the type has no opIndex method, -1 on error (reported).
+// SPIKE-PATCH-9: a type with the table protocol splits the index by use. A read and a read-modify-write take
+// the const (throwing) opIndex; only the left side of `=` takes the non-const (creating) one.
+int asCCompiler::CompileOpIndexCall(asCScriptNode *node, asCExprContext *ctx, asCArray<asCExprContext*> &args)
+{
+	bool isConst = ctx->type.dataType.IsObjectConst();
+	asCObjectType *objectType = CastToObjectType(ctx->type.dataType.GetTypeInfo());
+	bool isOK = true, found = false;
+
+	const int idxMode = (objectType && (objectType->flags & asOBJ_TABLE)) ? IndexAccessMode(node) : -1;
+	if( idxMode >= 0 && idxMode != 1 )
+		isConst = true;
+
+	asCArray<int> funcs;
+	builder->GetObjectMethodDescriptions("opIndex", objectType, funcs, isConst);
+	if( idxMode == 1 && !isConst )
+	{
+		// the creating write: drop the const overloads when a non-const one exists
+		for( asUINT f = 0; f < funcs.GetLength(); f++ )
+			if( builder->GetFunctionDescription(funcs[f])->IsReadOnly() )
+			{
+				funcs[f] = funcs[funcs.GetLength()-1];
+				funcs.PopLast();
+				f--;
+			}
+		if( funcs.GetLength() == 0 )
+			builder->GetObjectMethodDescriptions("opIndex", objectType, funcs, isConst);
+	}
+	if( funcs.GetLength() > 0 )
+	{
+		// Since there are opIndex methods, the compiler should not look for get/set_opIndex accessors
+		found = true;
+
+		// Determine which of opIndex methods that match
+		MatchFunctions(funcs, args, node, "opIndex", 0, objectType, isConst);
+		if( funcs.GetLength() != 1 )
+		{
+			// The error has already been reported by MatchFunctions
+			isOK = false;
+		}
+		else
+		{
+			// Add the default values for arguments not explicitly supplied
+			int r = CompileDefaultAndNamedArgs(node, args, funcs[0], objectType);
+
+			if( r < 0 )
+				isOK = false;
+			else if( MakeFunctionCall(ctx, funcs[0], objectType, args, node, false, 0, ctx->type.stackOffset) < 0 )
+				isOK = false;
+			else if( idxMode >= 0 )
+			{
+				// The element reached through the const getter. A read of a value-type element stays const
+				// (`t["pos"].x = 5` is an error); an object that is a reference type stays usable
+				// (`t["list"].insertLast(x)`); a read-modify-write needs a writable element.
+				asCDataType &edt = ctx->type.dataType;
+				const bool refObj = edt.IsObject() && edt.GetTypeInfo() && (edt.GetTypeInfo()->flags & asOBJ_REF);
+				if( idxMode == 2 || refObj )
+				{
+					if( edt.IsObjectHandle() ) edt.MakeHandleToConst(false);
+					edt.MakeReadOnly(false);
+				}
+			}
+		}
+	}
+	return !isOK ? -1 : (found ? 1 : 0);
+}
+
+// SPIKE-PATCH-11: `t.name` on a table whose name is neither a method nor a property is `t["name"]`.
+// Returns 1 when it lowered the access, 0 when the name is a member (or the type is not a table) so the
+// ordinary member lookup goes on, -1 on error.
+int asCCompiler::CompileTableDot(asCScriptNode *node, asCExprContext *ctx)
+{
+	asCObjectType *ot = CastToObjectType(ctx->type.dataType.GetTypeInfo());
+	if( ot == 0 || !(ot->flags & asOBJ_TABLE) || !ctx->type.dataType.IsObject() )
+		return 0;
+
+	asCString name(&script->code[node->firstChild->tokenPos], node->firstChild->tokenLength);
+
+	// a real method or property always wins
+	for( asUINT n = 0; n < ot->methods.GetLength(); n++ )
+		if( engine->scriptFunctions[ot->methods[n]]->name == name )
+			return 0;
+	for( asUINT n = 0; n < ot->properties.GetLength(); n++ )
+		if( ot->properties[n]->name == name )
+			return 0;
+
+	// the key type must be able to hold a name: string or any
+	bool keyOk = false;
+	if( ot->templateSubTypes.GetLength() > 0 )
+	{
+		const asCDataType &k = ot->templateSubTypes[0];
+		keyOk = (k.GetTypeInfo() == engine->stringType.GetTypeInfo()) ||
+				(k.GetTypeInfo() && strcmp(k.GetTypeInfo()->GetName(), "any") == 0);
+	}
+	if( !keyOk )
+	{
+		asCString str;
+		asCDataType odt = asCDataType::CreateType(ot, false);
+		str.Format("'%s' is not a member of '%s', and dot access needs a string or any key", name.AddressOf(), odt.Format(outFunc->nameSpace).AddressOf());
+		Error(str, node);
+		return -1;
+	}
+
+	asCArray<asCExprContext*> args;
+	asCExprContext *key = asNEW(asCExprContext)(engine);
+	if( key == 0 )
+		return -1;
+	args.PushLast(key);
+	if( CompileDictionaryKey(node->firstChild, &key->bc) < 0 )
+	{
+		asDELETE(key, asCExprContext);
+		return -1;
+	}
+	key->type.Set(engine->stringType);
+	key->type.isConstant = true;
+	key->type.isRefSafe = true;
+
+	const int r = CompileOpIndexCall(node, ctx, args);
+	for( asUINT n = 0; n < args.GetLength(); n++ )
+		if( args[n] )
+			asDELETE(args[n], asCExprContext);
+	return r < 0 ? -1 : (r == 0 ? 0 : 1);
+}
+
+// SPIKE-PATCH-9: how a `[ ]` (or table dot) post-operator is used, decided from the syntax alone:
+//   1 = the whole left side of `=`            (a creating write)
+//   2 = the whole left side of a compound assignment, or the operand of ++/--  (read-modify-write)
+//   0 = anything else                          (a read)
+// "Whole" means the node is the LAST post-operator of a term that has no pre-operator (other than ++/--) and is
+// the only term of the left expression; `(t[k]) = v`, `t[k].x = v`, `a + t[k]`, `f(t[k])`, `x = t[k]` are reads.
+int asCCompiler::IndexAccessMode(asCScriptNode *node)
+{
+	if( node->next )
+	{
+		// t[k]++ / t[k]--: the post-operator right after this one
+		if( node->next->nodeType == snExprPostOp && (node->next->tokenType == ttInc || node->next->tokenType == ttDec) )
+			return 2;
+		return 0;
+	}
+
+	asCScriptNode *term = node->parent;
+	if( term == 0 || term->nodeType != snExprTerm )
+		return 0;
+
+	// ++t[k] / --t[k]: the pre-operator nearest the value
+	asCScriptNode *vnode = node;
+	while( vnode && vnode->nodeType != snExprValue )
+		vnode = vnode->prev;
+	if( vnode == 0 )
+		return 0;
+	if( vnode->prev )
+		return (vnode->prev->tokenType == ttInc || vnode->prev->tokenType == ttDec) ? 2 : 0;
+
+	asCScriptNode *expr = term->parent;
+	if( expr == 0 || expr->nodeType != snExpression || expr->firstChild != term || term->next )
+		return 0;
+	asCScriptNode *cond = expr->parent;
+	if( cond == 0 || cond->nodeType != snCondition || cond->firstChild != expr || expr->next )
+		return 0;
+	asCScriptNode *asg = cond->parent;
+	if( asg == 0 || asg->nodeType != snAssignment || asg->firstChild != cond || cond->next == 0 )
+		return 0;
+	return cond->next->tokenType == ttAssignment ? 1 : 2;
+}
+
 int asCCompiler::CompileExpressionPostOp(asCScriptNode *node, asCExprContext *ctx)
 {
 	// Don't allow any postfix operators on expressions that take address of class method
@@ -16224,6 +16645,11 @@ int asCCompiler::CompileExpressionPostOp(asCScriptNode *node, asCExprContext *ct
 					r = FindPropertyAccessor(name, ctx, node, 0);
 				if( r != 0 )
 					return r;
+
+				// SPIKE-PATCH-11: a name that is not a member of a table is its string key
+				r = CompileTableDot(node, ctx);
+				if( r != 0 )
+					return r < 0 ? -1 : 0;
 
 				if( !ctx->type.dataType.IsPrimitive() )
 					Dereference(ctx, true);
@@ -16443,34 +16869,9 @@ int asCCompiler::CompileExpressionPostOp(asCScriptNode *node, asCExprContext *ct
 			bool lookForProperty = true;
 			if( propertyName == "" )
 			{
-				bool isConst = ctx->type.dataType.IsObjectConst();
-				asCObjectType *objectType = CastToObjectType(ctx->type.dataType.GetTypeInfo());
-
-				asCArray<int> funcs;
-				builder->GetObjectMethodDescriptions("opIndex", objectType, funcs, isConst);
-				if( funcs.GetLength() > 0 )
-				{
-					// Since there are opIndex methods, the compiler should not look for get/set_opIndex accessors
-					lookForProperty = false;
-
-					// Determine which of opIndex methods that match
-					MatchFunctions(funcs, args, node, "opIndex", 0, objectType, isConst);
-					if( funcs.GetLength() != 1 )
-					{
-						// The error has already been reported by MatchFunctions
-						isOK = false;
-					}
-					else
-					{
-						// Add the default values for arguments not explicitly supplied
-						int r = CompileDefaultAndNamedArgs(node, args, funcs[0], objectType);
-
-						if( r < 0 )
-							isOK = false;
-						else if( MakeFunctionCall(ctx, funcs[0], objectType, args, node, false, 0, ctx->type.stackOffset) < 0 )
-							isOK = false;
-					}
-				}
+				const int oir = CompileOpIndexCall(node, ctx, args);
+				if( oir < 0 ) isOK = false;
+				else if( oir == 1 ) lookForProperty = false;
 			}
 			if( lookForProperty && isOK )
 			{
@@ -19462,12 +19863,13 @@ void asCCompiler::PerformFunctionCall(int funcId, asCExprContext *ctx, bool isCo
 			else if (descr->GetObjectType() && descr->returnType.IsReference() &&
 				descr->parameterTypes.GetLength() == 1 &&
 				(descr->parameterTypes[0].IsIntegerType() || descr->parameterTypes[0].IsUnsignedType()) &&
-				descr->parameterTypes[0].GetSizeInMemoryBytes() == 4 &&
+				(descr->parameterTypes[0].GetSizeInMemoryBytes() == 4 ||
+				 (descr->parameterTypes[0].GetSizeInMemoryBytes() == 8 && engine->IsArrayAt(descr))) &&   // SPIKE-PATCH-5: an int64 index
 				!descr->parameterTypes[0].IsReference())
 			{
 				// ORGLIN: the array's opIndex is computed by the VM itself (asEP_ARRAY_LAYOUT)
-				if( engine->IsArrayAt(descr) )
-					ctx->bc.Call(asBC_ArrAt, descr->id, argSize, 0);
+				if( const int arrLayout = engine->IsArrayAt(descr) )
+					ctx->bc.Call(asBC_ArrAt, descr->id, argSize, asWORD(arrLayout - 1));   // ADR-0048: wArg0 = which layout
 				else
 					ctx->bc.Call(asBC_Thiscall1, descr->id, argSize, 0);
 			}

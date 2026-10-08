@@ -388,7 +388,13 @@ public:
 	// functions behind its opIndex, to recognise every template instance's copy.
 	asSArrayLayout arrayLayout;
 	asFUNCTION_t   arrayAtFunc[2];
-	bool           IsArrayAt(asCScriptFunction *func) const;
+	// ADR-0048: the second array-like layout (asEP_TABLE_LAYOUT). IsArrayAt returns 0 (not served),
+	// 1 (the array layout), 2 (the table layout) or 3 (the table layout, indirect elements); the instructions
+	// record sel = result - 1 (0, 1 or 2).
+	asSArrayLayout tableLayout;
+	asFUNCTION_t   tableAtFunc[2];
+	int            IsArrayAt(asCScriptFunction *func) const;
+	const asSArrayLayout &LayoutOf(int sel) const { return sel ? tableLayout : arrayLayout; }
 
 	// ORGLIN: the application's dynamic value layout (asEP_ANY_LAYOUT); AnyKindOf()
 	// is the asEAnyKind of a registered function (0 = none, or the fast path is off).
@@ -518,6 +524,8 @@ public:
 		int    fstringFormatFunc;				// ORGLIN: function called by f"..." literals (0 = none)
 		bool   loopSuspend;						// ORGLIN: a SUSPEND in every loop (default true)
 		bool   arrayLayoutSet;					// ORGLIN: arrayLayout below is valid
+		bool   tableLayoutSet;					// ORGLIN (ADR-0048): tableLayout is valid
+		bool   tableLiterals;					// ORGLIN (ADR-0048): `{ }` into any / ? builds table<string,any>
 		bool   anyLayoutSet;					// ORGLIN: anyLayout is valid and the any fast path is on
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;

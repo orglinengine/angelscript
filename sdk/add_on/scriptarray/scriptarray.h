@@ -71,9 +71,7 @@ public:
 	void  SetValue(asUINT index, void *value);
 
 	// Copy the contents of one array to another (only if the types are the same)
-	// ORGLIN: returns the array by pointer to match the void opAssign registration
-	// required by the implicit-handle array type.
-	CScriptArray *operator=(const CScriptArray&);
+	CScriptArray &operator=(const CScriptArray&);
 
 	// Compare two arrays
 	bool operator==(const CScriptArray &) const;

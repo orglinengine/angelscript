@@ -54,6 +54,7 @@ struct asSTypeBehaviour
 	{
 		factory = 0;
 		listFactory = 0;
+		listFactoryBrace = 0;
 		copyfactory = 0;
 		construct = 0; 
 		copyconstruct = 0;
@@ -72,6 +73,7 @@ struct asSTypeBehaviour
 
 	int factory;
 	int listFactory; // Used for initialization lists only
+	int listFactoryBrace; // SPIKE-PATCH-2: second list factory, picked for a `{ ... }` literal (listFactory serves `[ ... ]`)
 	int copyfactory;
 	int construct;
 	int copyconstruct;
@@ -159,8 +161,12 @@ public:
 	// behaviour (the object is not auto-attached). Set by RegisterObjectTypeInitializerFinalizer.
 	int                          initializerFinalizerId;
 
+	// SPIKE-PATCH-2: on a list-pattern type, the list factory whose pattern the buffer follows
+	int                          listFactoryId;
+
 	// Used for template types
 	asCArray<asCDataType> templateSubTypes;   // increases refCount for typeinfo held in datatype
+	asCArray<asCString>   templateDefaultNames;   // SPIKE-PATCH-7: default type name per parameter (empty = none)
 	bool                  acceptValueSubType;
 	bool                  acceptRefSubType;
 

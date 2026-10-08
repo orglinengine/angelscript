@@ -29,22 +29,6 @@ void CScriptArray::SetMemoryFunctions(asALLOCFUNC_t allocFunc, asFREEFUNC_t free
 }
 
 static void RegisterScriptArray_Native(asIScriptEngine *engine);
-
-// ORGLIN: the offsets of CScriptArray's protected members, for asEP_ARRAY_LAYOUT.
-// A derived class may name them; nothing is ever constructed.
-struct CScriptArrayLayoutProbe : CScriptArray
-{
-	static int BufferOffset()      { return Offset(&CScriptArrayLayoutProbe::buffer); }
-	static int ElementSizeOffset() { return Offset(&CScriptArrayLayoutProbe::elementSize); }
-	static int SubTypeIdOffset()   { return Offset(&CScriptArrayLayoutProbe::subTypeId); }
-private:
-	template <class M> static int Offset(M CScriptArray::*member)
-	{
-		alignas(CScriptArray) static char probe[sizeof(CScriptArray)];
-		CScriptArray *a = reinterpret_cast<CScriptArray*>(probe);
-		return (int)(reinterpret_cast<char*>(&(a->*member)) - probe);
-	}
-};
 static void RegisterScriptArray_Generic(asIScriptEngine *engine);
 
 struct SArrayBuffer
@@ -327,23 +311,7 @@ static void RegisterScriptArray_Native(asIScriptEngine *engine)
 
 	// The index operator returns the template subtype
 	r = engine->RegisterObjectMethod("array<T>", "T &opIndex(uint index)", asMETHODPR(CScriptArray, At, (asUINT), void*), asCALL_THISCALL); assert( r >= 0 );
-	const int opIndexId = r;
 	r = engine->RegisterObjectMethod("array<T>", "const T &opIndex(uint index) const", asMETHODPR(CScriptArray, At, (asUINT) const, const void*), asCALL_THISCALL); assert( r >= 0 );
-	const int opIndexConstId = r;
-
-	// ORGLIN: tell the VM where the elements are, so `a[i]` needs no native call
-	// (asEP_ARRAY_LAYOUT). At() and the VM agree on the layout below.
-	{
-		asSArrayLayout layout;
-		layout.opIndexFuncIds[0]  = opIndexId;
-		layout.opIndexFuncIds[1]  = opIndexConstId;
-		layout.bufferOffset       = CScriptArrayLayoutProbe::BufferOffset();
-		layout.elementSizeOffset  = CScriptArrayLayoutProbe::ElementSizeOffset();
-		layout.subTypeIdOffset    = CScriptArrayLayoutProbe::SubTypeIdOffset();
-		layout.lengthOffset       = (int)offsetof(SArrayBuffer, numElements);
-		layout.dataOffset         = (int)offsetof(SArrayBuffer, data);
-		r = engine->SetEngineProperty(asEP_ARRAY_LAYOUT, (asPWORD)&layout); assert( r >= 0 );
-	}
 
 	// Support for foreach
 	r = engine->RegisterObjectMethod("array<T>", "uint opForBegin() const", asFUNCTIONPR(CScriptArray_opForBegin, (const CScriptArray *), asUINT), asCALL_CDECL_OBJLAST); assert(r >= 0);
@@ -353,14 +321,11 @@ static void RegisterScriptArray_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("array<T>", "uint opForValue1(uint index) const", asFUNCTIONPR(CScriptArray_opForValue1, (asUINT, const CScriptArray*), asUINT), asCALL_CDECL_OBJLAST); assert(r >= 0);
 
 	// The assignment operator
-	// ORGLIN: void return, not `array<T>&`. A value-returning opAssign is invalid for
-	// an implicit-handle type. Scripts still need `a = b`, so it is registered as void.
-	r = engine->RegisterObjectMethod("array<T>", "void opAssign(const array<T>&in)", asMETHOD(CScriptArray, operator=), asCALL_THISCALL); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("array<T>", "array<T> &opAssign(const array<T>&in)", asMETHOD(CScriptArray, operator=), asCALL_THISCALL); assert( r >= 0 );
 
 	// Other methods
 	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const T&in value)", asMETHODPR(CScriptArray, InsertAt, (asUINT, void *), void), asCALL_THISCALL); assert( r >= 0 );
-	// ORGLIN: `&in` required for implicit-handle array parameters.
-	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const array<T>&in arr)", asMETHODPR(CScriptArray, InsertAt, (asUINT, const CScriptArray &), void), asCALL_THISCALL); assert(r >= 0);
+	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const array<T>& arr)", asMETHODPR(CScriptArray, InsertAt, (asUINT, const CScriptArray &), void), asCALL_THISCALL); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "void insertLast(const T&in value)", asMETHOD(CScriptArray, InsertLast), asCALL_THISCALL); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "void removeAt(uint index)", asMETHOD(CScriptArray, RemoveAt), asCALL_THISCALL); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "void removeLast()", asMETHOD(CScriptArray, RemoveLast), asCALL_THISCALL); assert( r >= 0 );
@@ -415,14 +380,13 @@ static void RegisterScriptArray_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("array<T>", "void pop_back()", asMETHOD(CScriptArray, RemoveLast), asCALL_THISCALL); assert( r >= 0 );
 	// Same as insertAt
 	r = engine->RegisterObjectMethod("array<T>", "void insert(uint index, const T&in value)", asMETHODPR(CScriptArray, InsertAt, (asUINT, void *), void), asCALL_THISCALL); assert(r >= 0);
-	// ORGLIN: `&in` required for implicit-handle array parameters.
-	r = engine->RegisterObjectMethod("array<T>", "void insert(uint index, const array<T>&in arr)", asMETHODPR(CScriptArray, InsertAt, (asUINT, const CScriptArray &), void), asCALL_THISCALL); assert(r >= 0);
+	r = engine->RegisterObjectMethod("array<T>", "void insert(uint index, const array<T>& arr)", asMETHODPR(CScriptArray, InsertAt, (asUINT, const CScriptArray &), void), asCALL_THISCALL); assert(r >= 0);
 	// Same as removeAt
 	r = engine->RegisterObjectMethod("array<T>", "void erase(uint)", asMETHOD(CScriptArray, RemoveAt), asCALL_THISCALL); assert( r >= 0 );
 #endif
 }
 
-CScriptArray *CScriptArray::operator=(const CScriptArray &other)
+CScriptArray &CScriptArray::operator=(const CScriptArray &other)
 {
 	// Only perform the copy if the array types are the same
 	if( &other != this &&
@@ -435,7 +399,7 @@ CScriptArray *CScriptArray::operator=(const CScriptArray &other)
 		CopyBuffer(buffer, other.buffer);
 	}
 
-	return this;
+	return *this;
 }
 
 CScriptArray::CScriptArray(asITypeInfo *ti, void *buf)
@@ -2064,9 +2028,8 @@ static void ScriptArrayAssignment_Generic(asIScriptGeneric *gen)
 {
 	CScriptArray *other = (CScriptArray*)gen->GetArgObject(0);
 	CScriptArray *self = (CScriptArray*)gen->GetObject();
-	// ORGLIN: opAssign is registered as void, so the array pointer returned by
-	// operator= is intentionally discarded here.
 	*self = *other;
+	gen->SetReturnObject(self);
 }
 
 static void ScriptArrayEquals_Generic(asIScriptGeneric *gen)
@@ -2318,12 +2281,10 @@ static void RegisterScriptArray_Generic(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("array<T>", "const T &opForValue0(uint index) const", asFUNCTION(ScriptArrayAt_Generic), asCALL_GENERIC); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "uint opForValue1(uint index) const", asFUNCTION(ScriptArray_opForValue1_Generic), asCALL_GENERIC); assert(r >= 0);
 
-	// ORGLIN: void opAssign (implicit-handle type: no value-returning assignment).
-	r = engine->RegisterObjectMethod("array<T>", "void opAssign(const array<T>&in)", asFUNCTION(ScriptArrayAssignment_Generic), asCALL_GENERIC); assert(r >= 0);
+	r = engine->RegisterObjectMethod("array<T>", "array<T> &opAssign(const array<T>&in)", asFUNCTION(ScriptArrayAssignment_Generic), asCALL_GENERIC); assert(r >= 0);
 
 	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const T&in value)", asFUNCTION(ScriptArrayInsertAt_Generic), asCALL_GENERIC); assert( r >= 0 );
-	// ORGLIN: `&in` required for implicit-handle array parameters.
-	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const array<T>&in arr)", asFUNCTION(ScriptArrayInsertAtArray_Generic), asCALL_GENERIC); assert(r >= 0);
+	r = engine->RegisterObjectMethod("array<T>", "void insertAt(uint index, const array<T>& arr)", asFUNCTION(ScriptArrayInsertAtArray_Generic), asCALL_GENERIC); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "void insertLast(const T&in value)", asFUNCTION(ScriptArrayInsertLast_Generic), asCALL_GENERIC); assert(r >= 0);
 	r = engine->RegisterObjectMethod("array<T>", "void removeAt(uint index)", asFUNCTION(ScriptArrayRemoveAt_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("array<T>", "void removeLast()", asFUNCTION(ScriptArrayRemoveLast_Generic), asCALL_GENERIC); assert( r >= 0 );

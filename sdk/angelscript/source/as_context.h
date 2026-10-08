@@ -163,7 +163,8 @@ public:
 	void DetachEngine();
 
 	void ExecuteNext();
-	void *ArrayElement(void *obj, asUINT index); // ORGLIN: asEP_ARRAY_LAYOUT
+	void *ArrayElement(void *obj, asQWORD index, int sel); // ORGLIN: asEP_ARRAY_LAYOUT (sel 1: asEP_TABLE_LAYOUT)
+	void *ArrayCallNative(void *obj, asQWORD index, asDWORD *bc, asDWORD *&sp, asDWORD *fp, bool isRead, int sel); // SPIKE-PATCH-5/9
 	void CleanStack(bool catchException = false);
 	bool CleanStackFrame(bool catchException = false);
 	void CleanArgsOnStack();

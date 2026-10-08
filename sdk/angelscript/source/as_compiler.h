@@ -302,6 +302,11 @@ protected:
 	int  CompileExpressionTerm(asCScriptNode *node, asCExprContext *out);
 	int  CompileExpressionPreOp(asCScriptNode *node, asCExprContext *out);
 	int  CompileExpressionPostOp(asCScriptNode *node, asCExprContext *out);
+	int  IndexAccessMode(asCScriptNode *node);   // SPIKE-PATCH-9
+	int  CompileOpIndexCall(asCScriptNode *node, asCExprContext *ctx, asCArray<asCExprContext*> &args);   // SPIKE-PATCH-9
+	int  CompileTableDot(asCScriptNode *node, asCExprContext *ctx);   // SPIKE-PATCH-11
+	void CompileTableLiteral(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);   // SPIKE-PATCH-10
+	int  TableLiteralCall(asCScriptNode *node, int objOffset, const asCDataType &hdt, asCObjectType *ot, const char *method, asCArray<asCExprContext*> &args, asCByteCode *bc);   // SPIKE-PATCH-10
 	int  CompileExpressionValue(asCScriptNode *node, asCExprContext *out);
 	int  CompileFunctionCall(asCScriptNode *node, asCExprContext *out, asCObjectType *objectType, bool objIsConst, const asCString &scope = "");
 	int  CompileFStringCall(asCScriptNode *node, asCExprContext *out, asCExprContext *tmpl, const asCString &exprText, const asCArray<int> &exprPos, const asCArray<int> &exprLen); // ORGLIN

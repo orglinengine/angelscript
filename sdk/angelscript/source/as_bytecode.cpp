@@ -1222,11 +1222,14 @@ void asCByteCode::OptimizeLocally(const asCArray<int> &tempVariableOffsets)
 	//   PshV4 i ; PshVPtr a ; ArrAt ; WRTVn s  ->  ArrSetN a, i, s
 	for( asCByteInstruction *c = first; c; c = c->next )
 	{
-		if( c->op != asBC_PshV4 ) continue;
+		if( c->op != asBC_PshV8 && c->op != asBC_PshV4 ) continue;   // SPIKE-PATCH-5
 		asCByteInstruction *p = c->next;
 		if( p == 0 || p->op != asBC_PshVPtr ) continue;
 		asCByteInstruction *a = p->next;
-		if( a == 0 || a->op != asBC_ArrAt ) continue;
+		if( a == 0 || a->op != asBC_ArrAt || a->wArg[0] == 2 ) continue;   // 2: indirect elements are objects, never fused
+		// ADR-0048: the ArrAt records its layout (wArg0); the index push must have that layout's width
+		const int sel = a->wArg[0] ? 1 : 0;
+		if( c->op != (engine->LayoutOf(sel).indexSize == 8 ? asBC_PshV8 : asBC_PshV4) ) continue;
 		// A call is followed by a JitEntry (a resume point for a JIT); the fused
 		// instruction is not a call, so that entry goes with it.
 		asCByteInstruction *jit = a->next;
@@ -1253,6 +1256,7 @@ void asCByteCode::OptimizeLocally(const asCArray<int> &tempVariableOffsets)
 		const short arr = p->wArg[0];
 		const short val = u->wArg[0];
 		c->op = fused;
+		c->sel = (asBYTE)sel;
 		if( fused <= asBC_ArrGet8 )
 		{
 			c->wArg[0] = val; c->wArg[1] = arr; c->wArg[2] = idx;
@@ -2263,7 +2267,7 @@ void asCByteCode::Output(asDWORD *array)
 		if( instr->GetSize() > 0 )
 		{
 			*(asBYTE*)ap = asBYTE(instr->op);
-			*(((asBYTE*)ap)+1) = 0; // Second byte is always zero
+			*(((asBYTE*)ap)+1) = instr->sel; // Second byte is zero, except ORGLIN's ArrGet/ArrSet: which array layout (ADR-0048)
 			switch( asBCInfo[instr->op].type )
 			{
 			case asBCTYPE_NO_ARG:
@@ -3270,6 +3274,7 @@ asCByteInstruction::asCByteInstruction()
 	stackInc      = 0;
 	marked        = false;
 	stackSize     = 0;
+	sel           = 0;
 }
 
 void asCByteInstruction::AddAfter(asCByteInstruction *nextCode)

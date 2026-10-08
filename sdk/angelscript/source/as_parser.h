@@ -132,6 +132,8 @@ protected:
 	asCScriptNode *ParseMixin();
 	asCScriptNode *ParseInitList();
 	asCScriptNode *ParseInitListElement(eTokenType openType);
+	bool           IsBracketKeyEntry(const sToken *open);      // SPIKE-PATCH-10
+	asCScriptNode *ParseBracketKeyEntry();                     // SPIKE-PATCH-10
 	// ORGLIN (ADR-0032): initializer blocks — `Expr { name = value, ... }` after a
 	// constructing expression, in a binding position.
 	asCScriptNode *ParseBindingValue();

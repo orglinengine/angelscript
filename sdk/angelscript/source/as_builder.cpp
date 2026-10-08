@@ -1147,7 +1147,8 @@ int asCBuilder::ParseDataType(const char *datatype, asCDataType *result, asSName
 	return asSUCCESS;
 }
 
-int asCBuilder::ParseTemplateDecl(const char *decl, asCString *name, asCArray<asCString> &subtypeNames)
+#include <cctype>   // SPIKE-PATCH-7
+int asCBuilder::ParseTemplateDecl(const char *decl, asCString *name, asCArray<asCString> &subtypeNames, asCArray<asCString> *subtypeDefaults)
 {
 	Reset();
 
@@ -1166,8 +1167,18 @@ int asCBuilder::ParseTemplateDecl(const char *decl, asCString *name, asCArray<as
 	while( (node = node->next) != 0 )
 	{
 		asCString subtypeName;
-		subtypeName.Assign(&decl[node->tokenPos], node->tokenLength);
+		// the node's source range grows to cover a default (K = string): the name is the identifier characters only
+		asUINT nameLen = 0;
+		while( nameLen < node->tokenLength && (isalnum((unsigned char)decl[node->tokenPos + nameLen]) || decl[node->tokenPos + nameLen] == '_') )
+			nameLen++;
+		subtypeName.Assign(&decl[node->tokenPos], nameLen);
 		subtypeNames.PushLast(subtypeName);
+		if( subtypeDefaults )   // SPIKE-PATCH-7
+		{
+			asCString def;
+			if( node->firstChild ) def.Assign(&decl[node->firstChild->tokenPos], node->firstChild->tokenLength);
+			subtypeDefaults->PushLast(def);
+		}
 	}
 
 	// TODO: template: check for name conflicts
@@ -6898,6 +6909,31 @@ asCObjectType *asCBuilder::GetTemplateInstanceFromNode(asCScriptNode *node, asCS
 
 	if (next)
 		*next = n;
+
+	// SPIKE-PATCH-7: fewer sub types than parameters: the missing LEADING ones come from the template's defaults
+	// (	able<int> is 	able<string,int>)
+	if (subTypes.GetLength() < templateType->templateSubTypes.GetLength() && subTypes.GetLength() > 0)
+	{
+		const asUINT missing = templateType->templateSubTypes.GetLength() - subTypes.GetLength();
+		bool haveAll = missing <= templateType->templateDefaultNames.GetLength();
+		for (asUINT m = 0; haveAll && m < missing; m++)
+			if (templateType->templateDefaultNames[m].GetLength() == 0) haveAll = false;
+		if (haveAll)
+		{
+			asCArray<asCDataType> full;
+			for (asUINT m = 0; m < missing && haveAll; m++)
+			{
+				const int id = engine->GetTypeIdByDecl(templateType->templateDefaultNames[m].AddressOf());
+				if (id < 0) { haveAll = false; break; }
+				full.PushLast(engine->GetDataTypeFromTypeId(id));
+			}
+			if (haveAll)
+			{
+				for (asUINT g = 0; g < subTypes.GetLength(); g++) full.PushLast(subTypes[g]);
+				subTypes = full;
+			}
+		}
+	}
 
 	if (subTypes.GetLength() != templateType->templateSubTypes.GetLength())
 	{

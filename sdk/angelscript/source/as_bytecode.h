@@ -192,6 +192,7 @@ public:
 	asEBCInstr op;
 	asQWORD arg[2];
 	short wArg[3];
+	asBYTE sel;   // ORGLIN (ADR-0048): ArrGet/ArrSet: 0 = array layout, 1 = table layout (written to the instruction's second byte)
 	int size;
 	int stackInc;
 

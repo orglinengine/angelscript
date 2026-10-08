@@ -385,6 +385,31 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		break;
 	}
 
+	// ORGLIN (ADR-0048): table literals into any / ?.
+	case asEP_TABLE_LITERALS:
+		ep.tableLiterals = value != 0;
+		break;
+
+	// ORGLIN (ADR-0048): the table layout.
+	case asEP_TABLE_LAYOUT:
+	{
+		ep.tableLayoutSet = false;
+		tableAtFunc[0] = tableAtFunc[1] = 0;
+		if( value == 0 )
+			break;
+		tableLayout = *(const asSArrayLayout*)value;
+		for( int n = 0; n < 2; n++ )
+		{
+			const int id = tableLayout.opIndexFuncIds[n];
+			if( id <= 0 || id >= (int)scriptFunctions.GetLength() || scriptFunctions[id] == 0 ||
+				scriptFunctions[id]->sysFuncIntf == 0 || scriptFunctions[id]->sysFuncIntf->callConv != ICC_THISCALL )
+				return asINVALID_ARG;
+			tableAtFunc[n] = scriptFunctions[id]->sysFuncIntf->func;
+		}
+		ep.tableLayoutSet = true;
+		break;
+	}
+
 	// ORGLIN: the any layout and its designated functions (explicit ids, no signature matching).
 	case asEP_ANY_LAYOUT:
 	{
@@ -660,6 +685,12 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_ARRAY_LAYOUT:
 		return ep.arrayLayoutSet ? (asPWORD)&arrayLayout : 0;
 
+	case asEP_TABLE_LAYOUT:
+		return ep.tableLayoutSet ? (asPWORD)&tableLayout : 0;
+
+	case asEP_TABLE_LITERALS:
+		return ep.tableLiterals;
+
 	// ORGLIN: the any layout.
 	case asEP_ANY_LAYOUT:
 		return ep.anyLayoutSet ? (asPWORD)&anyLayout : 0;
@@ -810,7 +841,9 @@ asCScriptEngine::asCScriptEngine()
 		ep.initializerBlocks             = false;	// ORGLIN: off by default (language stays unchanged)
 		ep.fstringFormatFunc             = 0;		// ORGLIN: no f-string function (f"..." is a plain string)
 		ep.loopSuspend                   = true;	// ORGLIN: upstream behaviour
-		ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
+		ep.tableLayoutSet                = false;	// ORGLIN (ADR-0048)
+	ep.tableLiterals                 = false;	// ORGLIN (ADR-0048): literals into any / ? stay dictionaries until the content is migrated
+	ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
 		ep.anyLayoutSet                  = false;	// ORGLIN: no any fast path until the application describes its value type
 		// TODO: optimize: Maybe this should be turned off by default? If a debugger is not used
 		//                 then this is just slowing down the execution.
@@ -949,13 +982,44 @@ void asCScriptEngine::DeleteDiscardedModules()
 }
 
 // ORGLIN: is this the application array's opIndex (or a template instance's copy of it)?
-bool asCScriptEngine::IsArrayAt(asCScriptFunction *func) const
+// ADR-0048: 0 = no, 1 = the array layout, 2 = the table layout (the instructions record sel = result - 1).
+int asCScriptEngine::IsArrayAt(asCScriptFunction *func) const
 {
-	if( !ep.arrayLayoutSet || func == 0 || func->sysFuncIntf == 0 )
-		return false;
-	return func->sysFuncIntf->func == arrayAtFunc[0] || func->sysFuncIntf->func == arrayAtFunc[1];
-}
+	if( func == 0 || func->sysFuncIntf == 0 )
+		return 0;
+	int which = 0;
+	if( ep.arrayLayoutSet && (func->sysFuncIntf->func == arrayAtFunc[0] || func->sysFuncIntf->func == arrayAtFunc[1]) )
+		which = 1;
+	else if( ep.tableLayoutSet && (func->sysFuncIntf->func == tableAtFunc[0] || func->sysFuncIntf->func == tableAtFunc[1]) )
+		which = 2;
+	if( which == 0 )
+		return 0;
+	const asSArrayLayout &L = which == 1 ? arrayLayout : tableLayout;
+	// G7: a table instance whose element type is the layout's indirect one (3 = the table layout, indirect)
+	if( which == 2 && L.indirectTypeId && func->objectType && func->objectType->templateSubTypes.GetLength() > 0 &&
+		func->parameterTypes.GetLength() == 1 && func->parameterTypes[0].GetSizeInMemoryBytes() == (L.indexSize == 8 ? 8 : 4) )
+	{
+		const asCDataType &v = func->objectType->templateSubTypes[func->objectType->templateSubTypes.GetLength()-1];
+		if( v.IsObject() && !v.IsObjectHandle() && const_cast<asCScriptEngine*>(this)->GetTypeIdFromDataType(v) == L.indirectTypeId )
+			return 3;
+	}
 
+	// SPIKE-PATCH-5: the index width must be the layout's, and the instance's element type must be one the
+	// VM can address (a primitive, a handle slot, the inline type, or a pointer-stored object per servedFlags)
+	if( func->parameterTypes.GetLength() != 1 ||
+		func->parameterTypes[0].GetSizeInMemoryBytes() != (L.indexSize == 8 ? 8 : 4) )
+		return 0;
+	const asCObjectType *ot = func->objectType;
+	if( ot && ot->templateSubTypes.GetLength() > 0 )
+	{
+		const asCDataType &v = ot->templateSubTypes[ot->templateSubTypes.GetLength()-1];
+		if( !v.IsObject() ) return which;
+		if( v.IsObjectHandle() ) return (L.servedFlags & 1) != 0 ? which : 0;
+		if( const_cast<asCScriptEngine*>(this)->GetTypeIdFromDataType(v) == L.inlineTypeId ) return which;
+		return (L.servedFlags & 2) != 0 ? which : 0;
+	}
+	return which;
+}
 // ORGLIN: the asEAnyKind of a registered function (0 when the fast path is off)
 int asCScriptEngine::AnyKindOf(asCScriptFunction *func) const
 {
@@ -2020,7 +2084,7 @@ int asCScriptEngine::RegisterObjectType(const char *name, int byteSize, asQWORD 
 	if( flags & asOBJ_REF )
 	{
 		// Can optionally have the asOBJ_GC, asOBJ_NOHANDLE, asOBJ_SCOPED, or asOBJ_TEMPLATE flag set, but nothing else
-		if( flags & ~(asOBJ_REF | asOBJ_GC | asOBJ_NOHANDLE | asOBJ_SCOPED | asOBJ_TEMPLATE | asOBJ_NOCOUNT | asOBJ_IMPLICIT_HANDLE) )
+		if( flags & ~(asOBJ_REF | asOBJ_GC | asOBJ_NOHANDLE | asOBJ_SCOPED | asOBJ_TEMPLATE | asOBJ_NOCOUNT | asOBJ_IMPLICIT_HANDLE | asOBJ_TABLE) )
 			return ConfigError(asINVALID_ARG, "RegisterObjectType", name, 0);
 
 		// flags are exclusive
@@ -2118,7 +2182,8 @@ int asCScriptEngine::RegisterObjectType(const char *name, int byteSize, asQWORD 
 	if( flags & asOBJ_TEMPLATE )
 	{
 		asCArray<asCString> subtypeNames;
-		r = bld.ParseTemplateDecl(name, &typeName, subtypeNames);
+		asCArray<asCString> subtypeDefaults;   // SPIKE-PATCH-7
+		r = bld.ParseTemplateDecl(name, &typeName, subtypeNames, &subtypeDefaults);
 		if( r < 0 )
 			return ConfigError(r, "RegisterObjectType", name, 0);
 
@@ -2140,6 +2205,7 @@ int asCScriptEngine::RegisterObjectType(const char *name, int byteSize, asQWORD 
 #endif
 		type->flags      = flags;
 		type->accessMask = defaultAccessMask;
+		type->templateDefaultNames = subtypeDefaults;   // SPIKE-PATCH-7
 
 		// Store it in the object types
 		allRegisteredTypes.Insert(asSNameSpaceNamePair(type->nameSpace, type->name), type);
@@ -2609,7 +2675,8 @@ int asCScriptEngine::RegisterBehaviourToObjectType(asCObjectType *objectType, as
 		// TODO: Verify that the same factory function hasn't been registered already
 
 		// Don't accept duplicates
-		if( behaviour == asBEHAVE_LIST_FACTORY && beh->listFactory )
+		// SPIKE-PATCH-2: a second list factory is accepted (it serves the { ... } literal)
+		if( behaviour == asBEHAVE_LIST_FACTORY && beh->listFactory && beh->listFactoryBrace )
 		{
 			if( listPattern )
 				listPattern->Destroy(this);
@@ -2634,7 +2701,10 @@ int asCScriptEngine::RegisterBehaviourToObjectType(asCObjectType *objectType, as
 		{
 			if( behaviour == asBEHAVE_LIST_FACTORY )
 			{
-				beh->listFactory = func.id;
+				if( beh->listFactory == 0 )
+					beh->listFactory = func.id;
+				else
+					beh->listFactoryBrace = func.id;
 
 				// Store the list pattern for this function
 				r = scriptFunctions[func.id]->RegisterListPattern(decl, listPattern);
@@ -4095,6 +4165,12 @@ asCObjectType *asCScriptEngine::GetTemplateInstanceType(asCObjectType *templateT
 
 		ot->beh.listFactory = func->id;
 	}
+	if( templateType->beh.listFactoryBrace )
+	{
+		asCScriptFunction *func = GenerateFactoryStubForTemplateObjectInstance(templateType, ot, templateType->beh.listFactoryBrace);
+		func->name = "$list";
+		ot->beh.listFactoryBrace = func->id;
+	}
 
 	// Create new template functions for behaviours that may need to know the new object type id
 	int funcId = templateType->beh.destruct;
@@ -4263,19 +4339,21 @@ asCDataType asCScriptEngine::DetermineTypeForTemplate(bool &success, const asCDa
 		// The type is itself a template, so it is necessary to find the correct template instance type
 		asCArray<asCDataType> tmplSubTypes;
 		asCObjectType *origType = CastToObjectType(orig.GetTypeInfo());
-		bool needInstance = true;
+		bool needInstance = false;
 
 		// Find the matching replacements for the subtypes
+		// SPIKE-PATCH-8: a nested instance may MIX concrete and placeholder sub types (	able<string,K>): the
+		// concrete ones are kept, the placeholders replaced; it is only a finished instance when none is left
 		for( asUINT n = 0; n < origType->templateSubTypes.GetLength(); n++ )
 		{
 			if( origType->templateSubTypes[n].GetTypeInfo() == 0 ||
 				!(origType->templateSubTypes[n].GetTypeInfo()->flags & asOBJ_TEMPLATE_SUBTYPE) )
 			{
-				// The template is already an instance so we shouldn't attempt to create another instance
-				needInstance = false;
-				break;
+				tmplSubTypes.PushLast(origType->templateSubTypes[n]);
+				continue;
 			}
 
+			needInstance = true;
 			for( asUINT m = 0; m < templateSubTypes.GetLength(); m++ )
 				if( origType->templateSubTypes[n].GetTypeInfo() == templateSubTypes[m].GetTypeInfo() )
 					tmplSubTypes.PushLast(targetSubTypes[m]);
@@ -7083,7 +7161,7 @@ asCObjectType *asCScriptEngine::GetListPatternType(int listPatternFuncId)
 	// Check if this object type already has a list pattern type
 	for( asUINT n = 0; n < listPatternTypes.GetLength(); n++ )
 	{
-		if( listPatternTypes[n]->templateSubTypes[0].GetTypeInfo() == ot )
+		if( listPatternTypes[n]->templateSubTypes[0].GetTypeInfo() == ot && listPatternTypes[n]->listFactoryId == listPatternFuncId )
 			return listPatternTypes[n];
 	}
 
@@ -7091,6 +7169,7 @@ asCObjectType *asCScriptEngine::GetListPatternType(int listPatternFuncId)
 	asCObjectType *lpt = asNEW(asCObjectType)(this);
 	lpt->templateSubTypes.PushLast(asCDataType::CreateType(ot, false));
 	lpt->flags = asOBJ_LIST_PATTERN;
+	lpt->listFactoryId = listPatternFuncId;
 	listPatternTypes.PushLast(lpt);
 
 	return lpt;
@@ -7104,8 +7183,7 @@ void asCScriptEngine::DestroyList(asBYTE *buffer, const asCObjectType *listPatte
 	// Get the list pattern from the listFactory function
 	// TODO: runtime optimize: Store the used list factory in the listPatternType itself
 	// TODO: runtime optimize: Keep a flag to indicate if there is really a need to free anything
-	asCObjectType *ot = CastToObjectType(listPatternType->templateSubTypes[0].GetTypeInfo());
-	asCScriptFunction *listFactory = scriptFunctions[ot->beh.listFactory];
+	asCScriptFunction *listFactory = scriptFunctions[listPatternType->listFactoryId];
 	asASSERT( listFactory );
 
 	asSListPatternNode *node = listFactory->listPattern;

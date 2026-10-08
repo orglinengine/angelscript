@@ -49,6 +49,7 @@ asCObjectType::asCObjectType() : asCTypeInfo()
 {
 	derivedFrom = 0;
 	initializerFinalizerId = 0;
+	listFactoryId = 0;
 
 	acceptValueSubType = true;
 	acceptRefSubType   = true;
@@ -62,6 +63,7 @@ asCObjectType::asCObjectType(asCScriptEngine *in_engine) : asCTypeInfo(in_engine
 {
 	derivedFrom  = 0;
 	initializerFinalizerId = 0;
+	listFactoryId = 0;
 
 	acceptValueSubType = true;
 	acceptRefSubType = true;
@@ -409,6 +411,7 @@ asUINT asCObjectType::GetBehaviourCount() const
 	if( beh.gcReleaseAllReferences ) count++; 
 	if( beh.templateCallback )       count++;
 	if( beh.listFactory )            count++;
+	if( beh.listFactoryBrace )       count++;
 	if( beh.getWeakRefFlag )         count++;
 
 	// For reference types, the factories are also stored in the constructor
@@ -488,6 +491,12 @@ asIScriptFunction *asCObjectType::GetBehaviourByIndex(asUINT index, asEBehaviour
 		}
 
 		return engine->scriptFunctions[beh.listFactory];
+	}
+
+	if( beh.listFactoryBrace && count++ == index )
+	{
+		if( outBehaviour ) *outBehaviour = asBEHAVE_LIST_FACTORY;
+		return engine->scriptFunctions[beh.listFactoryBrace];
 	}
 
 	if( beh.getWeakRefFlag && count++ == index )
@@ -648,6 +657,10 @@ void asCObjectType::ReleaseAllFunctions()
 	if( beh.listFactory )
 		engine->scriptFunctions[beh.listFactory]->ReleaseInternal();
 	beh.listFactory = 0;
+
+	if( beh.listFactoryBrace )
+		engine->scriptFunctions[beh.listFactoryBrace]->ReleaseInternal();
+	beh.listFactoryBrace = 0;
 
 	if( beh.destruct )
 		engine->scriptFunctions[beh.destruct]->ReleaseInternal();

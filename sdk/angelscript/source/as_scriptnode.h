@@ -98,7 +98,8 @@ enum eScriptNode
 	snTryCatch,
 	snDictionaryKey,  // ORGLIN (ADR-0011): the key of a `{ key = value }` list entry
 	snInitBlock,      // ORGLIN (ADR-0032): `Expr { name = value, ... }` — children: [base, entry...]
-	snInitTarget      // ORGLIN (ADR-0032): leaf value meaning "the object a block is initializing"
+	snInitTarget,     // ORGLIN (ADR-0032): leaf value meaning "the object a block is initializing"
+	snTableKey        // SPIKE-PATCH-10: the evaluated key of a `[expr] = value` list entry (child: the key expression)
 };
 
 struct sToken

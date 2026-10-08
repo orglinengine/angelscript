@@ -5,21 +5,6 @@
 
 BEGIN_AS_NAMESPACE
 
-// ORGLIN (item 5): Cache primitive type sizes so Set/Get/constructor don't call
-// engine->GetSizeOfPrimitiveType() on every operation. The type IDs are fixed
-// constants, so a static table is both safe and allocation-free.
-static int CachedSizeOfPrimitiveType(int typeId)
-{
-	if( typeId >= 0 && typeId <= asTYPEID_DOUBLE )
-	{
-		static const int sizes[] = { 0, 1, 1, 2, 4, 8, 1, 2, 4, 8, 4, 8 };
-		return sizes[typeId];
-	}
-	if( typeId > asTYPEID_DOUBLE && (typeId & asTYPEID_MASK_OBJECT) == 0 )
-		return 4;
-	return 0;
-}
-
 using namespace std;
 
 //------------------------------------------------------------------------
@@ -202,8 +187,7 @@ CScriptDictionary::CScriptDictionary(asBYTE *buffer)
 		}
 		else
 		{
-			// ORGLIN (item 5): use cached size.
-			buffer += CachedSizeOfPrimitiveType(typeId);
+			buffer += engine->GetSizeOfPrimitiveType(typeId);
 		}
 	}
 }
@@ -702,37 +686,20 @@ void CScriptDictValue::Set(void *value, int typeId)
 	}
 	else if( typeId & asTYPEID_MASK_OBJECT )
 	{
-		// ORGLIN: an implicit-handle object arg carries the VALUE typeId (no
-		// asTYPEID_OBJHANDLE) and the object pointer directly (no handle slot to
-		// deref). Store the handle instead of attempting a value copy, which fails
-		// for ref types whose opAssign was removed (see the implicit-handle note at
-		// RegisterObjectType("dictionary") below).
-		// (Ported onto upstream's engine-member refactor: `m_engine`, and the
-		// `engine` parameter gone from Set/Get.)
-		asITypeInfo *objType = m_engine->GetTypeInfoById(typeId);
-		if( objType && (objType->GetFlags() & asOBJ_IMPLICIT_HANDLE) )
+		// Create a copy of the object
+		m_valueObj = m_engine->CreateScriptObjectCopy(value, m_engine->GetTypeInfoById(typeId));
+		if( m_valueObj == 0 )
 		{
-			m_valueObj = value;
-			m_engine->AddRefScriptObject(m_valueObj, objType);
-		}
-		else
-		{
-			// Create a copy of the object
-			m_valueObj = m_engine->CreateScriptObjectCopy(value, objType);
-			if( m_valueObj == 0 )
-			{
-				asIScriptContext *ctx = asGetActiveContext();
-				if( ctx )
-					ctx->SetException("Cannot create copy of object");
-			}
+			asIScriptContext *ctx = asGetActiveContext();
+			if( ctx )
+				ctx->SetException("Cannot create copy of object");
 		}
 	}
 	else
 	{
 		// Copy the primitive value
 		// We receive a pointer to the value.
-		// ORGLIN (item 5): use cached size.
-		int size = CachedSizeOfPrimitiveType(typeId);
+		int size = m_engine->GetSizeOfPrimitiveType(typeId);
 		memcpy(&m_valueInt, value, size);
 	}
 }
@@ -807,8 +774,7 @@ bool CScriptDictValue::Get(void *value, int typeId) const
 	{
 		if( m_typeId == typeId )
 		{
-			// ORGLIN (item 5): use cached size.
-			int size = CachedSizeOfPrimitiveType(typeId);
+			int size = m_engine->GetSizeOfPrimitiveType(typeId);
 			memcpy(value, &m_valueInt, size);
 			return true;
 		}
@@ -915,8 +881,7 @@ bool CScriptDictValue::Get(void *value, int typeId) const
 			{
 				// Compare only the bytes that were actually set
 				asQWORD zero = 0;
-				// ORGLIN (item 5): use cached size.
-				int size = CachedSizeOfPrimitiveType(m_typeId);
+				int size = m_engine->GetSizeOfPrimitiveType(m_typeId);
 				*(bool*)value = memcmp(&m_valueInt, &zero, size) == 0 ? false : true;
 			}
 			return true;
@@ -1297,23 +1262,15 @@ void RegisterScriptDictionary_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("dictionaryValue", "void opConv(?&out)", asFUNCTIONPR(CScriptDictValue_opCast, (void *, int, CScriptDictValue*), void), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionaryValue", "int64 opConv()", asFUNCTIONPR(CScriptDictValue_opConvInt, (CScriptDictValue*), asINT64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionaryValue", "double opConv()", asFUNCTIONPR(CScriptDictValue_opConvDouble, (CScriptDictValue*), double), asCALL_CDECL_OBJLAST); assert( r >= 0 );
-	// ORGLIN EXPERIMENT: the IMPLICIT forms, so a dict value behaves like the value it
-	// holds in an expression — `d["k"] + 1`, `int v = d["k"]`. Without these the
-	// author must write `int(d["k"])` everywhere, which makes dictionary reads feel
-	// unlike every other type.
-	r = engine->RegisterObjectMethod("dictionaryValue", "int64 opImplConv()", asFUNCTIONPR(CScriptDictValue_opConvInt, (CScriptDictValue*), asINT64), asCALL_CDECL_OBJLAST); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("dictionaryValue", "double opImplConv()", asFUNCTIONPR(CScriptDictValue_opConvDouble, (CScriptDictValue*), double), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
-	// ORGLIN: dictionary is an implicit-handle type so scripts author it without
-	// `@` (dictionary x, not dictionary @x) and nesting dict writes work.
-	r = engine->RegisterObjectType("dictionary", sizeof(CScriptDictionary), asOBJ_REF | asOBJ_GC | asOBJ_IMPLICIT_HANDLE); assert( r >= 0 );
+	r = engine->RegisterObjectType("dictionary", sizeof(CScriptDictionary), asOBJ_REF | asOBJ_GC); assert( r >= 0 );
 	// Use the generic interface to construct the object since we need the engine pointer, we could also have retrieved the engine pointer from the active context
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_FACTORY, "dictionary@ f()", asFUNCTION(ScriptDictionaryFactory_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_LIST_FACTORY, "dictionary @f(int &in) {repeat {string, ?}}", asFUNCTION(ScriptDictionaryListFactory_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_ADDREF, "void f()", asMETHOD(CScriptDictionary,AddRef), asCALL_THISCALL); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_RELEASE, "void f()", asMETHOD(CScriptDictionary,Release), asCALL_THISCALL); assert( r >= 0 );
 
-	// ORGLIN: opAssign removed -- value assignment is invalid for an implicit-handle type.
+	r = engine->RegisterObjectMethod("dictionary", "dictionary &opAssign(const dictionary &in)", asMETHODPR(CScriptDictionary, operator=, (const CScriptDictionary &), CScriptDictionary&), asCALL_THISCALL); assert( r >= 0 );
 
 	r = engine->RegisterObjectMethod("dictionary", "void set(const string &in, const ?&in)", asMETHODPR(CScriptDictionary,Set,(const dictKey_t&,void*,int),void), asCALL_THISCALL); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionary", "bool get(const string &in, ?&out) const", asMETHODPR(CScriptDictionary,Get,(const dictKey_t&,void*,int) const,bool), asCALL_THISCALL); assert( r >= 0 );
@@ -1398,14 +1355,13 @@ void RegisterScriptDictionary_Generic(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("dictionaryValue", "int64 opConv()", asFUNCTION(CScriptDictValue_opConvInt_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionaryValue", "double opConv()", asFUNCTION(CScriptDictValue_opConvDouble_Generic), asCALL_GENERIC); assert( r >= 0 );
 
-	// ORGLIN: implicit-handle dictionary (see the native registration above).
-	r = engine->RegisterObjectType("dictionary", sizeof(CScriptDictionary), asOBJ_REF | asOBJ_GC | asOBJ_IMPLICIT_HANDLE); assert( r >= 0 );
+	r = engine->RegisterObjectType("dictionary", sizeof(CScriptDictionary), asOBJ_REF | asOBJ_GC); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_FACTORY, "dictionary@ f()", asFUNCTION(ScriptDictionaryFactory_Generic), asCALL_GENERIC); assert( r>= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_LIST_FACTORY, "dictionary @f(int &in) {repeat {string, ?}}", asFUNCTION(ScriptDictionaryListFactory_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_ADDREF, "void f()", asFUNCTION(ScriptDictionaryAddRef_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectBehaviour("dictionary", asBEHAVE_RELEASE, "void f()", asFUNCTION(ScriptDictionaryRelease_Generic), asCALL_GENERIC); assert( r >= 0 );
 
-	// ORGLIN: opAssign removed -- value assignment is invalid for an implicit-handle type.
+	r = engine->RegisterObjectMethod("dictionary", "dictionary &opAssign(const dictionary &in)", asFUNCTION(ScriptDictionaryAssign_Generic), asCALL_GENERIC); assert( r >= 0 );
 
 	r = engine->RegisterObjectMethod("dictionary", "void set(const string &in, const ?&in)", asFUNCTION(ScriptDictionarySet_Generic), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("dictionary", "bool get(const string &in, ?&out) const", asFUNCTION(ScriptDictionaryGet_Generic), asCALL_GENERIC); assert( r >= 0 );

@@ -2242,17 +2242,49 @@ void asCContext::CallInterfaceMethod(asCScriptFunction *func)
 
 // ORGLIN: the address of element `index` of an array object laid out as described by
 // asEP_ARRAY_LAYOUT, or 0 when the object is null or the index is out of range.
-inline void *asCContext::ArrayElement(void *obj, asUINT index)
+inline void *asCContext::ArrayElement(void *obj, asQWORD index, int sel)
 {
 	if( obj == 0 ) return 0;
+	if( sel )
+	{
+		// ADR-0048: the table layout. The object itself holds the element pointer and the count.
+		const asSArrayLayout &T = m_engine->tableLayout;
+		if( index >= (asQWORD)*(asUINT*)((asBYTE*)obj + T.lengthOffset) ) return 0;
+		asBYTE *elem = *(asBYTE**)((asBYTE*)obj + T.bufferOffset) + (asPWORD)index * (asUINT)*(int*)((asBYTE*)obj + T.elementSizeOffset);
+		if( sel == 2 )
+		{
+			// G7: an indirect element; a slot of another tag goes to the registered opIndex
+			if( *elem != (asBYTE)T.indirectTag ) return 0;
+			return *(void**)(elem + T.dataOffset);
+		}
+		return elem;
+	}
 	const asSArrayLayout &L = m_engine->arrayLayout;
 	asBYTE *buf = *(asBYTE**)((asBYTE*)obj + L.bufferOffset);
-	if( buf == 0 || index >= *(asUINT*)(buf + L.lengthOffset) ) return 0;
+	if( buf == 0 || index >= (asQWORD)*(asUINT*)(buf + L.lengthOffset) ) return 0;
 	asBYTE *elem = buf + L.dataOffset + (asPWORD)index * (asUINT)*(int*)((asBYTE*)obj + L.elementSizeOffset);
 	const int subTypeId = *(int*)((asBYTE*)obj + L.subTypeIdOffset);
-	if( (subTypeId & asTYPEID_MASK_OBJECT) && !(subTypeId & asTYPEID_OBJHANDLE) )
+	if( (subTypeId & asTYPEID_MASK_OBJECT) && !(subTypeId & asTYPEID_OBJHANDLE) && subTypeId != L.inlineTypeId )
 		return *(void**)elem;
 	return elem;
+}
+
+// SPIKE-PATCH-5: an index the fast path cannot serve (out of range, a sparse key, an append) is handed to the
+// registered native opIndex, as asBC_ArrAt does; returns the element address, or 0 when it raised an exception.
+void *asCContext::ArrayCallNative(void *obj, asQWORD index, asDWORD *bc, asDWORD *&sp, asDWORD *fp, bool isRead, int sel)
+{
+	const asSArrayLayout &L = m_engine->LayoutOf(sel);
+	const bool wide = L.indexSize == 8;
+	if( wide ) { sp -= 2; *(asQWORD*)sp = index; }
+	else       { sp -= 1; *(asDWORD*)sp = (asDWORD)index; }
+	sp -= AS_PTR_SIZE; *(void**)sp = obj;
+	m_regs.programPointer    = bc;
+	m_regs.stackPointer      = sp;
+	m_regs.stackFramePointer = fp;
+	// SPIKE-PATCH-9: a read goes to the const (throwing) function when the type registered one
+	sp += CallSystemFunction((isRead && L.opIndexFuncIds[1]) ? L.opIndexFuncIds[1] : L.opIndexFuncIds[0], this);
+	if( m_status != asEXECUTION_ACTIVE ) return 0;
+	return (void*)(asPWORD)m_regs.valueRegister;
 }
 
 void asCContext::ExecuteNext()
@@ -2959,9 +2991,16 @@ static const void *const dispatch_table[256] = {
 		// The same stack as the opIndex call it replaces: the object on top, the index under it
 		{
 			void *obj = *(void**)l_sp;
-			void *elem = ArrayElement(obj, *(asUINT*)(l_sp + AS_PTR_SIZE));
-			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj)
-			l_sp += AS_PTR_SIZE + 1;
+			const int sel = asBC_WORDARG0(l_bc);   // ADR-0048: which layout (2: the table's indirect elements)
+			const bool wide = m_engine->LayoutOf(sel).indexSize == 8;   // SPIKE-PATCH-5
+			void *elem = ArrayElement(obj, wide ? *(asQWORD*)(l_sp + AS_PTR_SIZE) : (asQWORD)*(asUINT*)(l_sp + AS_PTR_SIZE), sel);
+			if( elem == 0 )
+			{
+				// SPIKE-PATCH-5: not addressable (out of range, append, sparse key): the registered function decides
+				if( obj != 0 ) goto any_callsys;
+				AS_ORGLIN_ARRAY_FAIL(obj)
+			}
+			l_sp += AS_PTR_SIZE + (wide ? 2 : 1);
 			*(asPWORD*)&m_regs.valueRegister = (asPWORD)elem;
 			l_bc += 2;
 		}
@@ -2971,8 +3010,16 @@ static const void *const dispatch_table[256] = {
 #define AS_ORGLIN_ARRAY_GET(T) \
 		{ \
 			void *obj = *(void**)(l_fp - asBC_SWORDARG1(l_bc)); \
-			void *elem = ArrayElement(obj, *(asUINT*)(l_fp - asBC_SWORDARG2(l_bc))); \
-			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+			const int sel = *(((asBYTE*)l_bc)+1); \
+			const bool wide = m_engine->LayoutOf(sel).indexSize == 8; \
+			const asQWORD idx = wide ? *(asQWORD*)(l_fp - asBC_SWORDARG2(l_bc)) : (asQWORD)*(asUINT*)(l_fp - asBC_SWORDARG2(l_bc)); \
+			void *elem = ArrayElement(obj, idx, sel); \
+			if( elem == 0 ) \
+			{ \
+				if( obj == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+				elem = ArrayCallNative(obj, idx, l_bc, l_sp, l_fp, true, sel); \
+				if( elem == 0 ) { m_regs.programPointer = l_bc; m_regs.stackPointer = l_sp; m_regs.stackFramePointer = l_fp; return; } \
+			} \
 			asDWORD *dst = l_fp - asBC_SWORDARG0(l_bc); \
 			if( sizeof(T) < 4 ) *dst = 0; \
 			*(T*)dst = *(T*)elem; \
@@ -2988,8 +3035,16 @@ static const void *const dispatch_table[256] = {
 #define AS_ORGLIN_ARRAY_SET(T) \
 		{ \
 			void *obj = *(void**)(l_fp - asBC_SWORDARG0(l_bc)); \
-			void *elem = ArrayElement(obj, *(asUINT*)(l_fp - asBC_SWORDARG1(l_bc))); \
-			if( elem == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+			const int sel = *(((asBYTE*)l_bc)+1); \
+			const bool wide = m_engine->LayoutOf(sel).indexSize == 8; \
+			const asQWORD idx = wide ? *(asQWORD*)(l_fp - asBC_SWORDARG1(l_bc)) : (asQWORD)*(asUINT*)(l_fp - asBC_SWORDARG1(l_bc)); \
+			void *elem = ArrayElement(obj, idx, sel); \
+			if( elem == 0 ) \
+			{ \
+				if( obj == 0 ) AS_ORGLIN_ARRAY_FAIL(obj) \
+				elem = ArrayCallNative(obj, idx, l_bc, l_sp, l_fp, false, sel); \
+				if( elem == 0 ) { m_regs.programPointer = l_bc; m_regs.stackPointer = l_sp; m_regs.stackFramePointer = l_fp; return; } \
+			} \
 			*(T*)elem = *(T*)(l_fp - asBC_SWORDARG2(l_bc)); \
 			l_bc += 2; \
 		}

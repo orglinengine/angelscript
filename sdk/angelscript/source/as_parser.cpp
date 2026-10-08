@@ -402,6 +402,12 @@ bool asCParser::ParseTemplateDeclTypeList(asCScriptNode* node, bool required)
 	if (isSyntaxError) return false;
 
 	GetToken(&t);
+	if (t.type == ttAssignment)   // SPIKE-PATCH-7: class K = string, the default of a leading template parameter
+	{
+		node->lastChild->AddChildLast(ParseIdentifier());
+		if (isSyntaxError) return false;
+		GetToken(&t);
+	}
 
 	while (t.type == ttListSeparator)
 	{
@@ -411,6 +417,12 @@ bool asCParser::ParseTemplateDeclTypeList(asCScriptNode* node, bool required)
 		node->AddChildLast(ParseIdentifier());
 		if (isSyntaxError) return false;
 		GetToken(&t);
+		if (t.type == ttAssignment)   // SPIKE-PATCH-7
+		{
+			node->lastChild->AddChildLast(ParseIdentifier());
+			if (isSyntaxError) return false;
+			GetToken(&t);
+		}
 	}
 
 	// End with '>'
@@ -4336,6 +4348,29 @@ asCScriptNode *asCParser::ParseInitList()
 				// Statement block is finished
 				return node;
 			}
+			else if( t1.type == ttOpenBracket && openType == ttStartStatementBlock && engine->ep.dictionaryLiterals &&
+					 IsBracketKeyEntry(&t1) )
+			{
+				// SPIKE-PATCH-10: `[expr] = value`, the evaluated-key entry of a brace literal
+				RewindTo(&t1);
+				node->AddChildLast(ParseBracketKeyEntry());
+				if( isSyntaxError ) return node;
+
+				GetToken(&t1);
+				if( t1.type == ttListSeparator )
+					continue;
+				else if( t1.type == closeType )
+				{
+					node->UpdateSourcePos(t1.pos, t1.length);
+					return node;
+				}
+				else
+				{
+					Error(ExpectedTokens("}", ","), &t1);
+					Error(InsteadFound(t1), &t1);
+					return node;
+				}
+			}
 			else if( t1.type == ttStartStatementBlock ||
 					 (t1.type == ttOpenBracket && engine->ep.bracketListLiterals) )
 			{
@@ -4387,6 +4422,64 @@ asCScriptNode *asCParser::ParseInitList()
 		}
 	}
 	UNREACHABLE_RETURN;
+}
+
+// SPIKE-PATCH-10: is the `[` just read the start of a `[expr] = value` entry? A token-level look-ahead (no
+// parsing, so no diagnostics): find the matching `]` and see whether `=` follows. The tokenizer is left past the
+// scan; the caller rewinds to the `[` either way (a nested `[a, b]` list is parsed from there).
+bool asCParser::IsBracketKeyEntry(const sToken *open)
+{
+	(void)open;
+	sToken t;
+	int level = 0;
+	for(;;)
+	{
+		GetToken(&t);
+		if( t.type == ttEnd )
+			return false;
+		if( t.type == ttOpenBracket || t.type == ttOpenParenthesis || t.type == ttStartStatementBlock )
+			level++;
+		else if( t.type == ttCloseParenthesis || t.type == ttEndStatementBlock )
+			level--;
+		else if( t.type == ttCloseBracket )
+		{
+			if( level == 0 )
+				break;
+			level--;
+		}
+		if( level < 0 )
+			return false;
+	}
+	GetToken(&t);
+	return t.type == ttAssignment;
+}
+
+// SPIKE-PATCH-10: `[key] = value`. The key is parsed at CONDITION level (not as an assignment), so the `=`
+// after `]` belongs to the entry. The pair is an snInitList [snTableKey(key expression), value], the same
+// two-child shape as the `name = value` pair, so a walker tells the three entry kinds apart by the first child.
+asCScriptNode *asCParser::ParseBracketKeyEntry()
+{
+	asCScriptNode *pair = CreateNode(snInitList);
+	asCScriptNode *key = CreateNode(snTableKey);
+	if( pair == 0 || key == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);   // '['
+	pair->UpdateSourcePos(t.pos, t.length);
+	key->AddChildLast(ParseCondition());
+	if( isSyntaxError ) return pair;
+
+	GetToken(&t);
+	if( t.type != ttCloseBracket )
+	{
+		Error(ExpectedToken("]"), &t);
+		Error(InsteadFound(t), &t);
+		return pair;
+	}
+	GetToken(&t);   // '='
+	pair->AddChildLast(key);
+	pair->AddChildLast(ParseAssignment());
+	return pair;
 }
 
 // ORGLIN (ADR-0011): one entry of a list literal. Normally this is just an
