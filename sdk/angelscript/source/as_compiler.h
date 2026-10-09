@@ -292,6 +292,12 @@ protected:
 	bool SplitFPattern(asCScriptNode *piece, asCString &program, asCArray<int> &markers, asCArray<asCString> &names);
 	void CompileMatchGuard(asCScriptNode *g, asCByteCode *bc, int failLabel);
 	void CompileRedoStatement(asCScriptNode *node, asCByteCode *bc);
+	// ORGLIN (ADR-0051): the coroutine keywords. yield is a statement; spawn and await are terms.
+	void CompileYieldStatement(asCScriptNode *node, asCByteCode *bc);
+	int  CompileSpawn(asCScriptNode *node, asCExprContext *ctx);
+	int  CompileAwait(asCScriptNode *node, asCExprContext *ctx);
+	bool CoSuspendAllowed(const char *word, asCScriptNode *node);
+	int  m_initBlockDepth;   // > 0 while an initializer block is compiled (it cannot suspend)
 	void CompileCase(asCScriptNode *node, asCByteCode *bc, bool *hasReturn, bool *hasBreak);
 	void CompileForStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileForEachStatement(asCScriptNode* node, asCByteCode* bc);
@@ -507,6 +513,7 @@ protected:
 		int               redoLabel;        // match
 		sVariable        *snapshot;         // match: the per-pass hidden copy of the scrutinee (destroyed by redo), or 0
 		int               redoCounter;      // match: stack offset of the pass counter, 0 = none yet
+		int               redoEpoch;        // match: stack offset of the yield epoch last seen (ADR-0051), 0 = none yet
 		asCByteCode      *prologue;         // match: code that runs once per entry of the match
 	};
 	asCArray<sJumpTarget> jumpTargets;

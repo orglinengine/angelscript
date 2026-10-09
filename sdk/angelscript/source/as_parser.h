@@ -113,6 +113,12 @@ protected:
 	asCScriptNode *ParseRedo();
 	bool IsMatchStatement();
 	bool IsRedoStatement();
+	bool IsYieldStatement();		// ORGLIN (ADR-0051)
+	bool IsAwaitExpression();
+	bool IsSpawnExpression();
+	asCScriptNode *ParseYield();
+	asCScriptNode *ParseAwait();
+	asCScriptNode *ParseSpawn();
 	asCScriptNode *ParseCase();
 	asCScriptNode *ParseIf();
 	asCScriptNode *ParseFor();

@@ -262,7 +262,40 @@ enum asEEngineProp
 	// points at `match`. Off restores the classic switch statement untouched.
 	asEP_DISABLE_SWITCH                     = 53,
 
+	// ORGLIN (ADR-0051): the coroutine keywords `yield`, `await` and `spawn` (contextual words, never
+	// reserved). The value is a pointer to an asSCoroutineSupport (copied by the engine), or 0 for off.
+	asEP_COROUTINE_SUPPORT                  = 54,
+
 	asEP_LAST_PROPERTY
+};
+
+// ORGLIN (ADR-0051): what the coroutine keywords call. The keywords only parse, type-check and emit
+// calls; the suspension itself is the application's (a registered function calls Suspend() on the
+// active context, which the VM honours when the function returns). Function ids are registered
+// functions, type ids are registered object types; all must be provided.
+//   yieldFunc         void f()                          resume at the next tick
+//   awaitFactFunc     void f(const NextFact &in)        wait for a bus fact; the result is read by takeFactFunc after the resume
+//   takeFactFunc      table<any>@ f()                   the fact the wait delivered
+//   awaitJoinFunc     void f(Coroutine@)                wait for a coroutine to end
+//   spawnFunc         Coroutine@ f(int funcId)          start funcId with the arguments put since the last spawn
+//   spawnOwnedFunc    Coroutine@ f(int funcId, const string &in owner)
+//   argPutFunc        void f(const ?&in)                stage one argument (already converted to the parameter type)
+//   redoOverflowFunc  void f(int &counter, int &epoch)  the redo cap with the yield epoch (0 = the match one, no reset)
+//   coroutineTypeId   the type `spawn` yields and `await` joins
+//   nextFactTypeId    the type `await` waits on for a fact
+struct asSCoroutineSupport
+{
+	int size;                // sizeof(asSCoroutineSupport), checked by the engine
+	int yieldFunc;
+	int awaitFactFunc;
+	int takeFactFunc;
+	int awaitJoinFunc;
+	int spawnFunc;
+	int spawnOwnedFunc;
+	int argPutFunc;
+	int redoOverflowFunc;
+	int coroutineTypeId;
+	int nextFactTypeId;
 };
 
 // ORGLIN (ADR-0049): what `match` needs from the application. Function ids are registered

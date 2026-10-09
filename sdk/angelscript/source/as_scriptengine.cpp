@@ -409,6 +409,27 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		tok.InitJumpTable();
 		break;
 
+	// ORGLIN (ADR-0051): coroutine support. The ids are checked here so the compiler can trust them.
+	case asEP_COROUTINE_SUPPORT:
+		if( value != 0 )
+		{
+			const asSCoroutineSupport &in = *(const asSCoroutineSupport*)value;
+			if( in.size != (int)sizeof(asSCoroutineSupport) )
+				return asINVALID_ARG;
+			const int ids[] = { in.yieldFunc, in.awaitFactFunc, in.takeFactFunc, in.awaitJoinFunc, in.spawnFunc, in.spawnOwnedFunc, in.argPutFunc };
+			for( asUINT n = 0; n < sizeof(ids)/sizeof(ids[0]); n++ )
+				if( ids[n] <= 0 || ids[n] >= (int)scriptFunctions.GetLength() || scriptFunctions[ids[n]] == 0 )
+					return asINVALID_ARG;
+			if( in.redoOverflowFunc < 0 || in.redoOverflowFunc >= (int)scriptFunctions.GetLength() ||
+				(in.redoOverflowFunc > 0 && scriptFunctions[in.redoOverflowFunc] == 0) )
+				return asINVALID_ARG;
+			if( GetTypeInfoById(in.coroutineTypeId) == 0 || GetTypeInfoById(in.nextFactTypeId) == 0 )
+				return asINVALID_ARG;
+			coCfg = in;
+		}
+		ep.coroutineSupport = value != 0;
+		break;
+
 	// ORGLIN (ADR-0049 M5): switch is a compile error that points at match.
 	case asEP_DISABLE_SWITCH:
 		ep.disableSwitch = value != 0;
@@ -721,6 +742,9 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_DISABLE_SWITCH:
 		return ep.disableSwitch;
 
+	case asEP_COROUTINE_SUPPORT:
+		return ep.coroutineSupport ? (asPWORD)&coCfg : 0;
+
 	// ORGLIN: the any layout.
 	case asEP_ANY_LAYOUT:
 		return ep.anyLayoutSet ? (asPWORD)&anyLayout : 0;
@@ -877,6 +901,9 @@ asCScriptEngine::asCScriptEngine()
 		memset(&matchCfg, 0, sizeof(matchCfg));
 		matchCfg.size                    = (int)sizeof(asSMatchSupport);
 		matchCfg.redoLimit               = 1000;
+		ep.coroutineSupport              = false;	// ORGLIN (ADR-0051)
+		memset(&coCfg, 0, sizeof(coCfg));
+		coCfg.size                       = (int)sizeof(asSCoroutineSupport);
 	ep.tableLiterals                 = false;	// ORGLIN (ADR-0048): literals into any / ? stay dictionaries until the content is migrated
 	ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
 		ep.anyLayoutSet                  = false;	// ORGLIN: no any fast path until the application describes its value type

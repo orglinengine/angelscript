@@ -82,6 +82,14 @@ BEGIN_AS_NAMESPACE
 //       Instead the compiler should keep track of references in TypeInfo, where it should also state how the reference
 //       is currently stored, i.e. in variable, in register, on stack, etc.
 
+// ORGLIN (ADR-0051): counts the initializer blocks being compiled (a suspension cannot be inside one).
+struct asCCoDepth
+{
+	int &d;
+	asCCoDepth(int &depth) : d(depth) { d++; }
+	~asCCoDepth() { d--; }
+};
+
 asCCompiler::asCCompiler(asCScriptEngine *_engine) : byteCode(_engine)
 {
 	hasCompileErrors           = false;
@@ -97,6 +105,7 @@ asCCompiler::asCCompiler(asCScriptEngine *_engine) : byteCode(_engine)
 	m_hasReturned              = false;
 	m_classDecl                = 0;
 	m_globalVar                = 0;
+	m_initBlockDepth           = 0;
 	isCompilingDefaultArg      = false;
 	isProcessingDeferredParams = false;
 	noCodeOutput               = 0;
@@ -138,6 +147,7 @@ void asCCompiler::Reset(asCBuilder *in_builder, asCScriptCode *in_script, asCScr
 	m_hasReturned         = false;
 	m_classDecl           = 0;
 	m_globalVar           = 0;
+	m_initBlockDepth      = 0;
 
 	nextLabel = 0;
 	jumpTargets.SetLength(0);
@@ -4060,6 +4070,7 @@ bool asCCompiler::CompileInitializationWithAssignment(asCByteCode* bc, const asC
 bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, const asCDataType &type, asCScriptNode *errNode, int offset, asQWORD *constantValue, EVarGlobOrMem isVarGlobOrMem)
 {
 	asASSERT(node->nodeType == snInitBlock);
+	asCCoDepth noSuspend(m_initBlockDepth);
 
 	bool direct = (isVarGlobOrMem == asVGM_VARIABLE);
 	int targetOffset = direct ? offset : AllocateVariable(type, true);
@@ -4114,6 +4125,7 @@ bool asCCompiler::CompileInitializerBlock(asCScriptNode *node, asCByteCode *bc, 
 int asCCompiler::CompileInitBlockValue(asCScriptNode *block, asCExprContext *ctx, asCScriptNode *errNode, bool attach)
 {
 	asASSERT(block->nodeType == snInitBlock);
+	asCCoDepth noSuspend(m_initBlockDepth);
 
 	asCExprContext built(engine), attached(engine);
 	asCExprContext *base = &built;
@@ -5796,6 +5808,8 @@ void asCCompiler::CompileStatement(asCScriptNode *statement, bool *hasReturn, as
 		CompileRedoStatement(statement, bc);
 		*hasReturn = true;	// no path leaves a redo (ADR-0049 5.4)
 	}
+	else if (statement->nodeType == snYield)
+		CompileYieldStatement(statement, bc);
 	else if (statement->nodeType == snTryCatch)
 		CompileTryCatch(statement, hasReturn, bc);
 	else if (statement->nodeType == snReturn)
@@ -6153,6 +6167,7 @@ void asCCompiler::PushJumpTarget(int kind, int breakLabel, int continueLabel, co
 	t.redoLabel     = -1;
 	t.snapshot      = 0;
 	t.redoCounter   = 0;
+	t.redoEpoch     = 0;
 	t.prologue      = 0;
 	jumpTargets.PushLast(t);
 }
@@ -6286,6 +6301,7 @@ static bool asMatchPlainPattern(asCScriptNode *n, bool *hasName)
 	{
 	case snFunctionCall: case snConstructCall: case snExprOperator: case snArgList: case snCast:
 	case snInitList: case snInitBlock: case snListPattern: case snCondition: case snAssignment:
+	case snSpawn: case snAwait:
 		return false;
 	case snExprPostOp:
 		if( n->tokenType != ttDot ) return false;
@@ -7152,13 +7168,33 @@ void asCCompiler::CompileRedoStatement(asCScriptNode *node, asCByteCode *bc)
 		jumpTargets[ti].prologue->InstrSHORT_DW(asBC_SetV4, (short)off, 0);
 	}
 
+	// ORGLIN (ADR-0051): with coroutines the overflow also gets the yield epoch last seen by this entry of the match
+	// (a hidden int, zero at entry): a yield since then forgives the overflow and restarts the count.
+	const bool withEpoch = engine->ep.coroutineSupport && engine->coCfg.redoOverflowFunc != 0;
+	if( withEpoch && jumpTargets[ti].redoEpoch == 0 )
+	{
+		asCDataType intDt = asCDataType::CreatePrimitive(ttInt, false);
+		int off = AllocateVariable(intDt, false);
+		jumpTargets[ti].scope->DeclareVariable("", intDt, off, false);
+		jumpTargets[ti].redoEpoch = off;
+		jumpTargets[ti].prologue->InstrSHORT_DW(asBC_SetV4, (short)off, 0);
+	}
+
 	const int counter = jumpTargets[ti].redoCounter;
 	const int okLabel = nextLabel++;
 	bc->InstrSHORT(asBC_IncVi, (short)counter);
 	bc->InstrW_DW(asBC_CMPIi, counter, (asDWORD)engine->matchCfg.redoLimit);
 	bc->InstrDWORD(asBC_JNP, okLabel);
 	asCExprContext call(engine);
-	PerformFunctionCall(engine->matchCfg.redoOverflowFunc, &call);
+	if( withEpoch )
+	{
+		// arguments are pushed last to first
+		bc->InstrSHORT(asBC_PSF, (short)jumpTargets[ti].redoEpoch);
+		bc->InstrSHORT(asBC_PSF, (short)counter);
+		PerformFunctionCall(engine->coCfg.redoOverflowFunc, &call);
+	}
+	else
+		PerformFunctionCall(engine->matchCfg.redoOverflowFunc, &call);
 	bc->AddCode(&call.bc);
 	bc->Label((short)okLabel);
 
@@ -7177,6 +7213,232 @@ void asCCompiler::CompileRedoStatement(asCScriptNode *node, asCByteCode *bc)
 	}
 
 	bc->InstrINT(asBC_JMP, jumpTargets[ti].redoLabel);
+}
+
+// ORGLIN (ADR-0051) ---------------------------------------------------------------------------------------------
+// The coroutine keywords only parse, type-check and emit CALLS of the application's registered functions
+// (asSCoroutineSupport). The suspension is the function's: it calls Suspend() on the active context and the VM
+// honours that right after the registered function returns, so no opcode and no line cue is involved.
+
+// A suspension is refused where the object would be half-built (constructor, destructor, initializer block).
+bool asCCompiler::CoSuspendAllowed(const char *word, asCScriptNode *node)
+{
+	asCString msg;
+	if( m_isConstructor || (outFunc && outFunc->traits.GetTrait(asTRAIT_DESTRUCTOR)) )
+		msg.Format(TXT_YIELD_IN_CTOR_s, word);
+	else if( m_initBlockDepth > 0 )
+		msg.Format(TXT_YIELD_IN_INITBLOCK_s, word);
+	else
+		return true;
+	Error(msg, node);
+	return false;
+}
+
+// `yield`: suspend until the next tick.
+void asCCompiler::CompileYieldStatement(asCScriptNode *node, asCByteCode *bc)
+{
+	if( !CoSuspendAllowed("yield", node) )
+		return;
+
+	asCArray<asCExprContext*> noArgs;
+	asCExprContext call(engine);
+	if( MakeFunctionCall(&call, engine->coCfg.yieldFunc, 0, noArgs, node) < 0 )
+		return;
+	ProcessDeferredParams(&call);
+	call.bc.OptimizeLocally(tempVariableOffsets);
+	bc->AddCode(&call.bc);
+}
+
+// `await e`: e is a Bus.next(...) (the result is the fact as a table<any>) or a Coroutine (a join, no result).
+// The wait is one call that suspends; the fact is taken by a second call once the coroutine has resumed.
+int asCCompiler::CompileAwait(asCScriptNode *node, asCExprContext *ctx)
+{
+	ctx->type.SetDummy();
+	if( !CoSuspendAllowed("await", node) )
+		return -1;
+
+	asCExprContext *operand = asNEW(asCExprContext)(engine);
+	int r = CompileExpressionTerm(node->firstChild, operand);
+	if( r >= 0 )
+		r = ProcessPropertyGetAccessor(operand, node);
+	if( r < 0 )
+	{
+		asDELETE(operand, asCExprContext);
+		return -1;
+	}
+
+	const asCTypeInfo *ti = operand->type.dataType.GetTypeInfo();
+	const bool isFact = ti && (const asITypeInfo*)ti == engine->GetTypeInfoById(engine->coCfg.nextFactTypeId);
+	const bool isJoin = ti && (const asITypeInfo*)ti == engine->GetTypeInfoById(engine->coCfg.coroutineTypeId);
+	if( !isFact && !isJoin )
+	{
+		Error(TXT_AWAIT_OPERAND, node);
+		asDELETE(operand, asCExprContext);
+		return -1;
+	}
+
+	asCArray<asCExprContext*> args;
+	args.PushLast(operand);
+	asCExprContext wait(engine);
+	r = MakeFunctionCall(&wait, isFact ? engine->coCfg.awaitFactFunc : engine->coCfg.awaitJoinFunc, 0, args, node);
+	asDELETE(operand, asCExprContext);
+	if( r < 0 )
+		return -1;
+
+	if( isJoin )
+	{
+		MergeExprBytecodeAndType(ctx, &wait);
+		return 0;
+	}
+
+	asCArray<asCExprContext*> noArgs;
+	asCExprContext take(engine);
+	if( MakeFunctionCall(&take, engine->coCfg.takeFactFunc, 0, noArgs, node) < 0 )
+		return -1;
+	MergeExprBytecode(ctx, &wait);
+	MergeExprBytecodeAndType(ctx, &take);
+	return 0;
+}
+
+// `spawn f(args) [owner e]`: a real call, checked like one. The arguments are matched against f's overloads, converted
+// to the parameter types, evaluated here in order and staged one by one (a put call each); then the spawn call starts
+// the function on its own context with them. The result is the Coroutine.
+int asCCompiler::CompileSpawn(asCScriptNode *node, asCExprContext *ctx)
+{
+	ctx->type.SetDummy();
+	asCScriptNode *call = node->firstChild;
+	asCScriptNode *ownerNode = call->next;
+
+	asCScriptNode *nm = call->firstChild;
+	if( nm->nodeType == snScope ) nm = nm->next;
+	asCString name(&script->code[nm->tokenPos], nm->tokenLength);
+	asCString scope = builder->GetScopeFromNode(call->firstChild, script);
+
+	asCExprContext lookup(engine);
+	SYMBOLTYPE st = SymbolLookup(name, scope, 0, &lookup, call);
+	if( st < 0 )
+		return -1;
+	asCString msg;
+	if( st == SL_NOMATCH )
+	{
+		msg.Format(TXT_NO_MATCHING_SYMBOL_s, (scope == "" ? name : scope + "::" + name).AddressOf());
+		Error(msg, call);
+		return -1;
+	}
+	if( st == SL_CLASSMETHOD )
+	{
+		Error(TXT_SPAWN_ONLY_SCRIPT, call);
+		return -1;
+	}
+	if( st != SL_GLOBALFUNC )
+	{
+		msg.Format(TXT_SPAWN_NOT_FUNCTION_s, name.AddressOf());
+		Error(msg, call);
+		return -1;
+	}
+
+	asCArray<int> funcs;
+	for( asCExprContext *e = &lookup; e; e = e->next )
+	{
+		int n = e->methodName.FindLast("::");
+		asSNameSpace *ns = engine->FindNameSpace(e->methodName.SubString(0, n).AddressOf());
+		builder->GetFunctionDescriptions(name.AddressOf(), funcs, ns);
+	}
+
+	asCArray<asCExprContext*> args;
+	asCArray<asSNamedArgument> namedArgs;
+	int result = -1;
+	if( CompileArgumentList(call->lastChild, args, namedArgs) >= 0 )
+	{
+		MatchFunctions(funcs, args, call, name.AddressOf(), &namedArgs, 0, false, false, true, scope);
+		if( funcs.GetLength() == 1 && CompileDefaultAndNamedArgs(call, args, funcs[0], 0, &namedArgs) == asSUCCESS )
+		{
+			asCScriptFunction *target = builder->GetFunctionDescription(funcs[0]);
+			bool ok = true;
+			if( target->funcType != asFUNC_SCRIPT || target->objectType )
+			{
+				Error(TXT_SPAWN_ONLY_SCRIPT, call);
+				ok = false;
+			}
+			else if( !target->returnType.IsEqualExceptConst(asCDataType::CreatePrimitive(ttVoid, false)) )
+			{
+				msg.Format(TXT_SPAWN_RETURNS_s, name.AddressOf());
+				Error(msg, call);
+				ok = false;
+			}
+			for( asUINT n = 0; ok && n < args.GetLength(); n++ )
+			{
+				const asCDataType &pt = target->parameterTypes[n];
+				const asCTypeInfo *pti = pt.GetTypeInfo();
+				bool bad = target->inOutFlags[n] == asTM_OUTREF || target->inOutFlags[n] == asTM_INOUTREF;
+				// a value type is copied into the coroutine (a reference type is shared, as in a call)
+				if( !bad && pt.IsObject() && !pt.IsObjectHandle() && pti && (pti->flags & asOBJ_VALUE) )
+				{
+					const asCObjectType *ot = CastToObjectType(const_cast<asCTypeInfo*>(pti));
+					if( ot && !ot->beh.copyfactory && !ot->beh.copyconstruct && !(ot->flags & asOBJ_POD) )
+						bad = true;
+				}
+				if( bad )
+				{
+					msg.Format(TXT_SPAWN_PARAM_s, target->parameterNames[n].AddressOf());
+					Error(msg, call);
+					ok = false;
+				}
+			}
+
+			// stage the arguments in order, each converted to its parameter type
+			for( asUINT n = 0; ok && n < args.GetLength(); n++ )
+			{
+				asCDataType dt = target->parameterTypes[n];
+				dt.MakeReference(false);
+				dt.MakeReadOnly(false);
+				ImplicitConversion(args[n], dt, call, asIC_IMPLICIT_CONV);
+				asCArray<asCExprContext*> one;
+				one.PushLast(args[n]);
+				asCExprContext put(engine);
+				if( MakeFunctionCall(&put, engine->coCfg.argPutFunc, 0, one, call) < 0 )
+				{
+					ok = false;
+					break;
+				}
+				MergeExprBytecode(ctx, &put);
+			}
+
+			if( ok )
+			{
+				asCExprContext idArg(engine);
+				idArg.type.SetConstantDW(asCDataType::CreatePrimitive(ttInt, true), (asDWORD)target->id);
+				asCArray<asCExprContext*> spawnArgs;
+				spawnArgs.PushLast(&idArg);
+				asCExprContext ownerArg(engine);
+				int spawnFunc = engine->coCfg.spawnFunc;
+				if( ownerNode )
+				{
+					if( CompileExpression(ownerNode, &ownerArg) >= 0 )
+					{
+						spawnArgs.PushLast(&ownerArg);
+						spawnFunc = engine->coCfg.spawnOwnedFunc;
+					}
+					else
+						ok = false;
+				}
+				asCExprContext started(engine);
+				if( ok && MakeFunctionCall(&started, spawnFunc, 0, spawnArgs, node) >= 0 )
+				{
+					MergeExprBytecodeAndType(ctx, &started);
+					result = 0;
+				}
+			}
+		}
+	}
+
+	for( asUINT n = 0; n < args.GetLength(); n++ )
+		if( args[n] )
+			asDELETE(args[n], asCExprContext);
+	for( asUINT n = 0; n < namedArgs.GetLength(); n++ )
+		if( namedArgs[n].ctx )
+			asDELETE(namedArgs[n].ctx, asCExprContext);
+	return result;
 }
 
 void asCCompiler::CompileCase(asCScriptNode *node, asCByteCode *bc, bool *hasReturn, bool *hasBreak)
@@ -13341,6 +13603,12 @@ int asCCompiler::CompileExpressionTerm(asCScriptNode *node, asCExprContext *ctx)
 			return 0;
 		}
 	}
+
+	// ORGLIN (ADR-0051): `spawn` and `await` are whole terms
+	if (node->firstChild && node->firstChild->nodeType == snSpawn)
+		return CompileSpawn(node->firstChild, ctx);
+	if (node->firstChild && node->firstChild->nodeType == snAwait)
+		return CompileAwait(node->firstChild, ctx);
 
 	// Set the type as a dummy by default, in case of any compiler errors
 	ctx->type.SetDummy();

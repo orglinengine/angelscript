@@ -2351,6 +2351,18 @@ asCScriptNode *asCParser::ParseExprTerm()
 	// It wasn't an initialization, so it must be an ordinary expression term
 	RewindTo(&t);
 
+	// ORGLIN (ADR-0051): `spawn f(args) [owner e]` and `await e` are whole terms (an operand each, no post operators).
+	if( IsSpawnExpression() )
+	{
+		node->AddChildLast(ParseSpawn());
+		return node;
+	}
+	if( IsAwaitExpression() )
+	{
+		node->AddChildLast(ParseAwait());
+		return node;
+	}
+
 	for(;;)
 	{
 		GetToken(&t);
@@ -4216,6 +4228,11 @@ asCScriptNode *asCParser::ParseStatementBlock()
 					node->AddChildLast(ParseMatch());
 				else if( IsRedoStatement() )
 					node->AddChildLast(ParseRedo());
+				// ORGLIN (ADR-0051): `spawn f(x)` has the shape of the declaration `T f(x)`, so these come first too.
+				else if( IsYieldStatement() )
+					node->AddChildLast(ParseYield());
+				else if( IsSpawnExpression() || IsAwaitExpression() )
+					node->AddChildLast(ParseExpressionStatement());
 				else if( IsVarDecl() )
 					node->AddChildLast(ParseDeclaration());
 				else
@@ -5014,6 +5031,10 @@ asCScriptNode *asCParser::ParseStatement()
 		return ParseMatch();
 	else if (IsRedoStatement())
 		return ParseRedo();
+	else if (IsYieldStatement())
+		return ParseYield();
+	else if (IsSpawnExpression() || IsAwaitExpression())
+		return ParseExpressionStatement();
 	else if (t1.type == ttTry)
 		return ParseTryCatch();
 	else
@@ -5141,6 +5162,117 @@ asCScriptNode *asCParser::ParseRedo()
 
 	GetToken(&t);
 	if( t.type == ttEndStatementBlock || t.type == ttEnd || (t.type != ttEndStatement && OptionalStatementTerminatorIsNewLine(t)) )
+		RewindTo(&t);
+	return node;
+}
+
+// ORGLIN (ADR-0051): contextual `yield`: the identifier alone, ended by `;`, a line break or `}`.
+// `yield = 1`, `yield()` and `x.yield()` on the same line are not it.
+bool asCParser::IsYieldStatement()
+{
+	if( !engine->ep.coroutineSupport ) return false;
+
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if( IdentifierIs(t, "yield") )
+	{
+		GetToken(&t1);
+		ok = t1.type == ttEndStatement || t1.type == ttEndStatementBlock || t1.type == ttEnd ||
+		     OptionalStatementTerminatorIsNewLine(t1);
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+asCScriptNode *asCParser::ParseYield()
+{
+	asCScriptNode *node = CreateNode(snYield);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+
+	GetToken(&t);
+	if( t.type == ttEndStatementBlock || t.type == ttEnd || (t.type != ttEndStatement && OptionalStatementTerminatorIsNewLine(t)) )
+		RewindTo(&t);
+	return node;
+}
+
+// ORGLIN (ADR-0051): contextual `await`: the identifier followed on the SAME line by something that starts an
+// operand and is not `(` (`await(x)` is a call, `await - 1` and `await = 1` are the variable).
+bool asCParser::IsAwaitExpression()
+{
+	if( !engine->ep.coroutineSupport ) return false;
+
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if( t.type == ttIdentifier && IdentifierIs(t, "await") )
+	{
+		GetToken(&t1);
+		ok = !OptionalStatementTerminatorIsNewLine(t1) &&
+		     (t1.type == ttIdentifier || t1.type == ttScope || IsConstant(t1.type) || IsRealType(t1.type) || t1.type == ttCast);
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+// ORGLIN (ADR-0051): contextual `spawn`: the identifier followed on the same line by a function call
+// (`name(`, `scope::name(` or `scope.name(`). Two adjacent names can only be a declaration `T x`, and no type
+// is named `spawn`, so this is unambiguous; `spawn(x)`, `spawn = 1`, `spawn.x` and `int spawn` are not it.
+bool asCParser::IsSpawnExpression()
+{
+	if( !engine->ep.coroutineSupport ) return false;
+
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if( t.type == ttIdentifier && IdentifierIs(t, "spawn") )
+	{
+		GetToken(&t1);
+		RewindTo(&t1);
+		ok = !OptionalStatementTerminatorIsNewLine(t1) && IsFunctionCall(false);
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+// AWAIT ::= 'await' EXPRTERM        children: [operand]
+asCScriptNode *asCParser::ParseAwait()
+{
+	asCScriptNode *node = CreateNode(snAwait);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+
+	node->AddChildLast(ParseExprTerm());
+	return node;
+}
+
+// SPAWN ::= 'spawn' FUNCCALL ('owner' EXPR)?        children: [snFunctionCall, owner snExpression]
+// `owner` is a word only here, on the line of the call's closing parenthesis.
+asCScriptNode *asCParser::ParseSpawn()
+{
+	asCScriptNode *node = CreateNode(snSpawn);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+
+	node->AddChildLast(ParseFunctionCall());
+	if( isSyntaxError ) return node;
+
+	GetToken(&t);
+	if( t.type == ttIdentifier && IdentifierIs(t, "owner") && !OptionalStatementTerminatorIsNewLine(t) )
+	{
+		node->AddChildLast(ParseExpression());
+	}
+	else
 		RewindTo(&t);
 	return node;
 }

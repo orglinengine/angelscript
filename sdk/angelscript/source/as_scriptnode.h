@@ -102,7 +102,10 @@ enum eScriptNode
 	snTableKey,       // SPIKE-PATCH-10: the evaluated key of a `[expr] = value` list entry (child: the key expression)
 	snMatch,          // ORGLIN (ADR-0049): children [scrutinee, arm...]
 	snMatchArm,       // ORGLIN (ADR-0049): children [pattern...] [snCondition(guard)]? body
-	snRedo           // ORGLIN (ADR-0049)
+	snRedo,          // ORGLIN (ADR-0049)
+	snYield,         // ORGLIN (ADR-0051): statement
+	snAwait,         // ORGLIN (ADR-0051): in an snExprTerm; children [operand snExprTerm]
+	snSpawn          // ORGLIN (ADR-0051): in an snExprTerm; children [snFunctionCall] [owner snExpression]?
 };
 
 struct sToken
