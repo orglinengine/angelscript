@@ -8833,6 +8833,13 @@ void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
 	ProcessDeferredParams(&rangeExpr);
 	rangeExpr.bc.OptimizeLocally(tempVariableOffsets);
 
+	// the iterable's address: a reference type (or a value type placed on the heap) holds a pointer in its variable, a
+	// value type on the stack (an `any`) is the variable itself
+	const bool rangeOnStack = !IsVariableOnHeap(rangeOffset);
+	auto pushRange = [&](asCByteCode &code) {
+		code.InstrSHORT(rangeOnStack ? asBC_PSF : asBC_PshVPtr, short(rangeOffset));
+	};
+
 	int conditionLabel = nextLabel++;
 	int afterLabel = nextLabel++;
 	int continueLabel = nextLabel++;
@@ -8861,7 +8868,7 @@ void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
 		arg.exprNode = node;
 	};
 	auto callWithIter = [&](asCExprContext &e, int funcId, asCScriptNode *errNode) {
-		e.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		pushRange(e.bc);
 		asCArray<asCExprContext*> args;
 		asCExprContext arg(engine);
 		iterArg(arg);
@@ -8873,7 +8880,7 @@ void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
 
 	asCExprContext opForBeginExpr(engine);
 	{
-		opForBeginExpr.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		pushRange(opForBeginExpr.bc);
 		asCArray<asCExprContext*> args;
 		int r = MakeFunctionCall(&opForBeginExpr, opForBeginId, rangeOT, args, node->firstChild);
 		UNUSED_VAR(r);
@@ -8890,7 +8897,7 @@ void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
 		if( DeclareVariable("", i64Dt, lenOffset, &initBC, node) < 0 )
 			return;
 		asCExprContext lenExpr(engine);
-		lenExpr.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		pushRange(lenExpr.bc);
 		asCArray<asCExprContext*> args;
 		int r = MakeFunctionCall(&lenExpr, lengthId, rangeOT, args, node->firstChild);
 		UNUSED_VAR(r);
@@ -8991,7 +8998,7 @@ void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
 			else
 			{
 				// range[index]: the VM's own element read
-				e.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+				pushRange(e.bc);
 				asCArray<asCExprContext*> args;
 				asCExprContext arg(engine);
 				arg.type.SetVariable(i64Dt, idxOffset, false);
@@ -17328,6 +17335,22 @@ int asCCompiler::DeduceTemplateFunctions(asCArray<int>& funcs, asCArray<asCExprC
 				msg.Format(TXT_INSTANCING_INVLD_TMPL_TYPE_s_s, func->name.AddressOf(), subTypes.AddressOf());
 				Error(msg, node);
 				return -1;
+			}
+			// The instance of a template method that is the same call as a plain overload of the same name (`get<any>`
+			// next to `any get(K, any)`) adds nothing: the plain overload stays, so the call is not ambiguous
+			bool same = false;
+			asCScriptFunction* inst = builder->GetFunctionDescription(id);
+			for( asUINT o = 0; o < funcs.GetLength() && !same; o++ )
+			{
+				asCScriptFunction* other = builder->GetFunctionDescription(funcs[o]);
+				if( o != i && other->funcType != asFUNC_TEMPLATE && other->IsSignatureExceptNameAndReturnTypeEqual(inst) )
+					same = true;
+			}
+			if( same )
+			{
+				funcs[i] = funcs[funcs.GetLength() - 1];
+				funcs.PopLast();
+				continue;
 			}
 			funcs[i] = id;
 			i++;

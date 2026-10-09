@@ -4322,6 +4322,24 @@ asCObjectType *asCScriptEngine::GetTemplateInstanceType(asCObjectType *templateT
 		funcId = ot->methods[n];
 		func = scriptFunctions[funcId];
 
+		// ORGLIN: a template method (`T get<T>(...)`) of a template type with a value type V exists only on the
+		// instances whose V is `any`: there the typed read is the way to get a number or a string out of an `any`
+		// slot. On any other V the plain `V get(...)` already is that read.
+		if( func->funcType == asFUNC_TEMPLATE )
+		{
+			const asCDataType &last = ot->templateSubTypes[ot->templateSubTypes.GetLength()-1];
+			asCObjectType *lastOt = CastToObjectType(last.GetTypeInfo());
+			const bool lastIsAny = lastOt && !last.IsObjectHandle() && (lastOt->flags & asOBJ_VALUE) &&
+				lastOt->templateSubTypes.GetLength() == 0 && lastOt->name == "any";
+			if( !lastIsAny )
+			{
+				scriptFunctions[funcId]->ReleaseInternal();
+				ot->methods.RemoveIndex(n);
+				n--;
+				continue;
+			}
+		}
+
 		if( GenerateFunctionForTemplateObjectInstance(templateType, ot, func, &func) )
 		{
 			// Release the old function, the new one already has its ref count set to 1
@@ -4660,13 +4678,23 @@ bool asCScriptEngine::GenerateFunctionForTemplateObjectInstance(asCObjectType *t
 
 	func2->name     = func->name;
 
+	// ORGLIN: a template method (`T get<T>(const K &in, const T &in)`) of a template type keeps its own T: the type's
+	// sub types are replaced and T maps to itself (it is deduced or given at the call)
+	asCArray<asCDataType> fromSubTypes = templateType->templateSubTypes;
+	asCArray<asCDataType> toSubTypes = ot->templateSubTypes;
+	for( asUINT t = 0; t < func->templateSubTypes.GetLength(); t++ )
+	{
+		fromSubTypes.PushLast(func->templateSubTypes[t]);
+		toSubTypes.PushLast(func->templateSubTypes[t]);
+	}
+
 	bool foundType, foundAllTypes = true;
-	func2->returnType = DetermineTypeForTemplate(foundType, func->returnType, templateType->templateSubTypes, ot->templateSubTypes, ot->module, templateType, ot);
+	func2->returnType = DetermineTypeForTemplate(foundType, func->returnType, fromSubTypes, toSubTypes, ot->module, templateType, ot);
 	if( !foundType ) foundAllTypes = false;
 	func2->parameterTypes.SetLength(func->parameterTypes.GetLength());
 	for( asUINT p = 0; p < func->parameterTypes.GetLength(); p++ )
 	{
-		func2->parameterTypes[p] = DetermineTypeForTemplate(foundType, func->parameterTypes[p], templateType->templateSubTypes, ot->templateSubTypes, ot->module, templateType, ot);
+		func2->parameterTypes[p] = DetermineTypeForTemplate(foundType, func->parameterTypes[p], fromSubTypes, toSubTypes, ot->module, templateType, ot);
 		if( !foundType ) foundAllTypes = false;
 	}
 
@@ -4675,6 +4703,11 @@ bool asCScriptEngine::GenerateFunctionForTemplateObjectInstance(asCObjectType *t
 		func2->DestroyHalfCreated();
 		return false;
 	}
+
+	func2->templateSubTypes = func->templateSubTypes;
+	for( asUINT t = 0; t < func2->templateSubTypes.GetLength(); t++ )
+		if( func2->templateSubTypes[t].GetTypeInfo() )
+			func2->templateSubTypes[t].GetTypeInfo()->AddRefInternal();
 
 	for (asUINT n = 0; n < func->defaultArgs.GetLength(); n++)
 		if (func->defaultArgs[n])
