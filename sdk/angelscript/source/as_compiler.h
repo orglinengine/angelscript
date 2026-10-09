@@ -283,6 +283,15 @@ protected:
 	void CompileStatement(asCScriptNode *statement, bool *hasReturn, asCByteCode *bc);
 	void CompileIfStatement(asCScriptNode *node, bool *hasReturn, asCByteCode *bc);
 	void CompileSwitchStatement(asCScriptNode *node, bool *hasReturn, asCByteCode *bc);
+	// ORGLIN (ADR-0049): the integer dispatch shared by switch and match, and the match statement
+	void CompileIntDispatch(asCByteCode *bc, int offset, asCArray<int> &caseValues, asCArray<int> &caseLabels, int defaultLabel);
+	void CompileMatchStatement(asCScriptNode *node, bool *hasReturn, asCByteCode *bc);
+	bool IsLocalVariableName(asCScriptNode *n);
+	bool MatchGuardsMention(asCScriptNode *snode, asCScriptNode *name);
+	bool MatchPatternIsReadOnly(asCScriptNode *pat, asCExprContext &c);
+	bool SplitFPattern(asCScriptNode *piece, asCString &program, asCArray<int> &markers, asCArray<asCString> &names);
+	void CompileMatchGuard(asCScriptNode *g, asCByteCode *bc, int failLabel);
+	void CompileRedoStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileCase(asCScriptNode *node, asCByteCode *bc, bool *hasReturn, bool *hasBreak);
 	void CompileForStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileForEachStatement(asCScriptNode* node, asCByteCode* bc);
@@ -484,8 +493,29 @@ protected:
 	sClassDeclaration           *m_classDecl;
 	sGlobalVariableDescription  *m_globalVar;
 
-	asCArray<int> breakLabels;
-	asCArray<int> continueLabels;
+	// ORGLIN (ADR-0049): one stack of named jump targets for loops, switch and match. break/continue/redo
+	// find their target here; a jump destroys every variable declared inside the target's scope.
+	enum { jtLoop, jtSwitch, jtMatch };
+	struct sJumpTarget
+	{
+		int               kind;
+		asCString         name;             // a loop's label, "" when it has none
+		int               breakLabel;
+		int               continueLabel;    // -1: none (a classic switch is transparent to continue; a match arm reports continueError)
+		asCString         continueError;    // match: the text reported when continueLabel < 0
+		asCVariableScope *scope;
+		int               redoLabel;        // match
+		sVariable        *snapshot;         // match: the per-pass hidden copy of the scrutinee (destroyed by redo), or 0
+		int               redoCounter;      // match: stack offset of the pass counter, 0 = none yet
+		asCByteCode      *prologue;         // match: code that runs once per entry of the match
+	};
+	asCArray<sJumpTarget> jumpTargets;
+	void PushJumpTarget(int kind, int breakLabel, int continueLabel, const asCString &name = asCString(""));
+	void PopJumpTarget();
+	int  FindLoopTarget(const asCString &name);
+	bool InsideLoop();
+	void DestroyVariablesUntil(asCVariableScope *scope, asCByteCode *bc);
+	asCString TakeLoopLabel(asCScriptNode *loop);
 
 	int AllocateVariable(const asCDataType &type, bool isTemporary, bool forceOnHeap = false, bool asReference = false);
 	int AllocateVariableNotIn(const asCDataType &type, bool isTemporary, bool forceOnHeap, asCExprContext *ctx);

@@ -140,8 +140,7 @@ void asCCompiler::Reset(asCBuilder *in_builder, asCScriptCode *in_script, asCScr
 	m_globalVar           = 0;
 
 	nextLabel = 0;
-	breakLabels.SetLength(0);
-	continueLabels.SetLength(0);
+	jumpTargets.SetLength(0);
 
 	numLambdas = 0;
 
@@ -5790,6 +5789,13 @@ void asCCompiler::CompileStatement(asCScriptNode *statement, bool *hasReturn, as
 		CompileContinueStatement(statement, bc);
 	else if (statement->nodeType == snSwitch)
 		CompileSwitchStatement(statement, hasReturn, bc);
+	else if (statement->nodeType == snMatch)
+		CompileMatchStatement(statement, hasReturn, bc);
+	else if (statement->nodeType == snRedo)
+	{
+		CompileRedoStatement(statement, bc);
+		*hasReturn = true;	// no path leaves a redo (ADR-0049 5.4)
+	}
 	else if (statement->nodeType == snTryCatch)
 		CompileTryCatch(statement, hasReturn, bc);
 	else if (statement->nodeType == snReturn)
@@ -5798,7 +5804,133 @@ void asCCompiler::CompileStatement(asCScriptNode *statement, bool *hasReturn, as
 		*hasReturn = true;
 	}
 	else
+	{
+		// ORGLIN (ADR-0049): a statement node without a case here would silently compile to nothing in a release build
+		Error("internal: unhandled statement node", statement);
 		asASSERT(false);
+	}
+}
+
+// ORGLIN (ADR-0049): the integer dispatch of CompileSwitchStatement, MOVED here unchanged so that
+// CompileMatchStatement reuses it (sorted values -> ranges -> bounds checks -> JMPP table; holes and
+// out-of-range values jump to defaultLabel). offset is the int/uint variable holding the value.
+void asCCompiler::CompileIntDispatch(asCByteCode *bc, int offset, asCArray<int> &caseValues, asCArray<int> &caseLabels, int defaultLabel)
+{
+	// Sort the case values by increasing value. Do the sort together with the labels
+	// A simple bubble sort is sufficient since we don't expect a huge number of values
+	for( asUINT fwd = 1; fwd < caseValues.GetLength(); fwd++ )
+	{
+		for( int bck = fwd - 1; bck >= 0; bck-- )
+		{
+			int bckp = bck + 1;
+			if( caseValues[bck] > caseValues[bckp] )
+			{
+				// Swap the values in both arrays
+				int swap = caseValues[bckp];
+				caseValues[bckp] = caseValues[bck];
+				caseValues[bck] = swap;
+
+				swap = caseLabels[bckp];
+				caseLabels[bckp] = caseLabels[bck];
+				caseLabels[bck] = swap;
+			}
+			else
+				break;
+		}
+	}
+
+	// Find ranges of consecutive numbers
+	asCArray<int> ranges;
+	ranges.PushLast(0);
+	asUINT n;
+	for( n = 1; n < caseValues.GetLength(); ++n )
+	{
+		// We can join numbers that are less than 5 numbers
+		// apart since the output code will still be smaller
+		// Do this comparison using int64 so we don't get errors with large 32bit numbers
+		if( asINT64(caseValues[n]) > asINT64(caseValues[n-1]) + 5 )
+			ranges.PushLast(n);
+	}
+
+	// If the value is larger than the largest case value, jump to default
+	// TODO: optimize: If the largest value is already the max value of int32, i.e. 2147483647, then there is no need to do this check
+	int tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
+	bc->InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[caseValues.GetLength()-1]);
+	bc->InstrW_W(asBC_CMPi, offset, tmpOffset);
+	bc->InstrDWORD(asBC_JP, defaultLabel);
+	ReleaseTemporaryVariable(tmpOffset, bc);
+
+	// TODO: runtime optimize: We could possibly optimize this even more by doing a
+	//                         binary search instead of a linear search through the ranges
+
+	// For each range
+	int range;
+	for( range = 0; range < (int)ranges.GetLength(); range++ )
+	{
+		// Find the largest value in this range
+		int maxRange = caseValues[ranges[range]];
+		int index = ranges[range]+1;
+		for( ; (index < (int)caseValues.GetLength()) && (asINT64(caseValues[index]) <= asINT64(maxRange) + 5); index++ )
+			maxRange = caseValues[index];
+
+		// If there are only 2 numbers then it is better to compare them directly
+		if( index - ranges[range] > 2 )
+		{
+			// If the value is smaller than the smallest case value in the range, jump to default
+			tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
+			bc->InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[ranges[range]]);
+			bc->InstrW_W(asBC_CMPi, offset, tmpOffset);
+			bc->InstrDWORD(asBC_JS, defaultLabel);
+			ReleaseTemporaryVariable(tmpOffset, bc);
+
+			int nextRangeLabel = nextLabel++;
+			// If this is the last range we don't have to make this test
+			if( range < (int)ranges.GetLength() - 1 )
+			{
+				// If the value is larger than the largest case value in the range, jump to the next range
+				tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
+				bc->InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, maxRange);
+				bc->InstrW_W(asBC_CMPi, offset, tmpOffset);
+				bc->InstrDWORD(asBC_JP, nextRangeLabel);
+				ReleaseTemporaryVariable(tmpOffset, bc);
+			}
+
+			// Jump forward according to the value
+			tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
+			bc->InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[ranges[range]]);
+			bc->InstrW_W_W(asBC_SUBi, tmpOffset, offset, tmpOffset);
+			ReleaseTemporaryVariable(tmpOffset, bc);
+			bc->JmpP(tmpOffset, maxRange - caseValues[ranges[range]]);
+
+			// Add the list of jumps to the correct labels (any holes, jump to default)
+			index = ranges[range];
+			for( int i = caseValues[index]; ; i++ )
+			{
+				if( caseValues[index] == i )
+					bc->InstrINT(asBC_JMP, caseLabels[index++]);
+				else
+					bc->InstrINT(asBC_JMP, defaultLabel);
+				if (i == maxRange) break;
+			}
+
+			bc->Label((short)nextRangeLabel);
+		}
+		else
+		{
+			// Simply make a comparison with each value
+			for( int i = ranges[range]; i < index; ++i )
+			{
+				tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
+				bc->InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[i]);
+				bc->InstrW_W(asBC_CMPi, offset, tmpOffset);
+				bc->InstrDWORD(asBC_JZ, caseLabels[i]);
+				ReleaseTemporaryVariable(tmpOffset, bc);
+			}
+		}
+	}
+
+	// Catch any value that falls trough
+	bc->InstrINT(asBC_JMP, defaultLabel);
 }
 
 void asCCompiler::CompileSwitchStatement(asCScriptNode *snode, bool *hasReturn, asCByteCode *bc)
@@ -5809,11 +5941,11 @@ void asCCompiler::CompileSwitchStatement(asCScriptNode *snode, bool *hasReturn, 
 
 	// Reserve label for break statements
 	int breakLabel = nextLabel++;
-	breakLabels.PushLast(breakLabel);
 
 	// Add a variable scope that will be used by CompileBreak
 	// to know where to stop deallocating variables
 	AddVariableScope(true, false);
+	PushJumpTarget(jtSwitch, breakLabel, -1);
 
 	//---------------------------
 	// Compile the switch expression
@@ -5934,121 +6066,8 @@ void asCCompiler::CompileSwitchStatement(asCScriptNode *snode, bool *hasReturn, 
 	// with jumps to the case code
 	//------------------------------------
 
-	// Sort the case values by increasing value. Do the sort together with the labels
-	// A simple bubble sort is sufficient since we don't expect a huge number of values
-	for( asUINT fwd = 1; fwd < caseValues.GetLength(); fwd++ )
-	{
-		for( int bck = fwd - 1; bck >= 0; bck-- )
-		{
-			int bckp = bck + 1;
-			if( caseValues[bck] > caseValues[bckp] )
-			{
-				// Swap the values in both arrays
-				int swap = caseValues[bckp];
-				caseValues[bckp] = caseValues[bck];
-				caseValues[bck] = swap;
-
-				swap = caseLabels[bckp];
-				caseLabels[bckp] = caseLabels[bck];
-				caseLabels[bck] = swap;
-			}
-			else
-				break;
-		}
-	}
-
-	// Find ranges of consecutive numbers
-	asCArray<int> ranges;
-	ranges.PushLast(0);
-	asUINT n;
-	for( n = 1; n < caseValues.GetLength(); ++n )
-	{
-		// We can join numbers that are less than 5 numbers
-		// apart since the output code will still be smaller
-		// Do this comparison using int64 so we don't get errors with large 32bit numbers
-		if( asINT64(caseValues[n]) > asINT64(caseValues[n-1]) + 5 )
-			ranges.PushLast(n);
-	}
-
-	// If the value is larger than the largest case value, jump to default
-	// TODO: optimize: If the largest value is already the max value of int32, i.e. 2147483647, then there is no need to do this check
-	int tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
-	expr.bc.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[caseValues.GetLength()-1]);
-	expr.bc.InstrW_W(asBC_CMPi, offset, tmpOffset);
-	expr.bc.InstrDWORD(asBC_JP, defaultLabel);
-	ReleaseTemporaryVariable(tmpOffset, &expr.bc);
-
-	// TODO: runtime optimize: We could possibly optimize this even more by doing a
-	//                         binary search instead of a linear search through the ranges
-
-	// For each range
-	int range;
-	for( range = 0; range < (int)ranges.GetLength(); range++ )
-	{
-		// Find the largest value in this range
-		int maxRange = caseValues[ranges[range]];
-		int index = ranges[range]+1;
-		for( ; (index < (int)caseValues.GetLength()) && (asINT64(caseValues[index]) <= asINT64(maxRange) + 5); index++ )
-			maxRange = caseValues[index];
-
-		// If there are only 2 numbers then it is better to compare them directly
-		if( index - ranges[range] > 2 )
-		{
-			// If the value is smaller than the smallest case value in the range, jump to default
-			tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
-			expr.bc.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[ranges[range]]);
-			expr.bc.InstrW_W(asBC_CMPi, offset, tmpOffset);
-			expr.bc.InstrDWORD(asBC_JS, defaultLabel);
-			ReleaseTemporaryVariable(tmpOffset, &expr.bc);
-
-			int nextRangeLabel = nextLabel++;
-			// If this is the last range we don't have to make this test
-			if( range < (int)ranges.GetLength() - 1 )
-			{
-				// If the value is larger than the largest case value in the range, jump to the next range
-				tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
-				expr.bc.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, maxRange);
-				expr.bc.InstrW_W(asBC_CMPi, offset, tmpOffset);
-				expr.bc.InstrDWORD(asBC_JP, nextRangeLabel);
-				ReleaseTemporaryVariable(tmpOffset, &expr.bc);
-			}
-
-			// Jump forward according to the value
-			tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
-			expr.bc.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[ranges[range]]);
-			expr.bc.InstrW_W_W(asBC_SUBi, tmpOffset, offset, tmpOffset);
-			ReleaseTemporaryVariable(tmpOffset, &expr.bc);
-			expr.bc.JmpP(tmpOffset, maxRange - caseValues[ranges[range]]);
-
-			// Add the list of jumps to the correct labels (any holes, jump to default)
-			index = ranges[range];
-			for( int i = caseValues[index]; ; i++ )
-			{
-				if( caseValues[index] == i )
-					expr.bc.InstrINT(asBC_JMP, caseLabels[index++]);
-				else
-					expr.bc.InstrINT(asBC_JMP, defaultLabel);
-				if (i == maxRange) break;
-			}
-
-			expr.bc.Label((short)nextRangeLabel);
-		}
-		else
-		{
-			// Simply make a comparison with each value
-			for( int i = ranges[range]; i < index; ++i )
-			{
-				tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(ttInt, false), true);
-				expr.bc.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, caseValues[i]);
-				expr.bc.InstrW_W(asBC_CMPi, offset, tmpOffset);
-				expr.bc.InstrDWORD(asBC_JZ, caseLabels[i]);
-				ReleaseTemporaryVariable(tmpOffset, &expr.bc);
-			}
-		}
-	}
-
-	// Catch any value that falls trough
-	expr.bc.InstrINT(asBC_JMP, defaultLabel);
+	// ORGLIN (ADR-0049): the dispatch moved to CompileIntDispatch (shared with match)
+	CompileIntDispatch(&expr.bc, offset, caseValues, caseLabels, defaultLabel);
 
 	// Release the temporary variable previously stored
 	ReleaseTemporaryVariable(expr.type, &expr.bc);
@@ -6115,8 +6134,1049 @@ void asCCompiler::CompileSwitchStatement(asCScriptNode *snode, bool *hasReturn, 
 	// Add break label
 	bc->Label((short)breakLabel);
 
-	breakLabels.PopLast();
+	PopJumpTarget();
 	RemoveVariableScope();
+}
+
+// ORGLIN (ADR-0049) ---------------------------------------------------------------------------------------------
+// Jump targets: loops, the classic switch and match share one stack of entries. break/continue/redo look their
+// target up here and destroy every variable declared inside the target's scope on the way out.
+
+void asCCompiler::PushJumpTarget(int kind, int breakLabel, int continueLabel, const asCString &name)
+{
+	sJumpTarget t;
+	t.kind          = kind;
+	t.name          = name;
+	t.breakLabel    = breakLabel;
+	t.continueLabel = continueLabel;
+	t.scope         = variables;
+	t.redoLabel     = -1;
+	t.snapshot      = 0;
+	t.redoCounter   = 0;
+	t.prologue      = 0;
+	jumpTargets.PushLast(t);
+}
+
+void asCCompiler::PopJumpTarget()
+{
+	jumpTargets.PopLast();
+}
+
+int asCCompiler::FindLoopTarget(const asCString &name)
+{
+	for( int n = (int)jumpTargets.GetLength() - 1; n >= 0; n-- )
+		if( jumpTargets[n].kind == jtLoop && jumpTargets[n].name == name )
+			return n;
+	return -1;
+}
+
+bool asCCompiler::InsideLoop()
+{
+	for( asUINT n = 0; n < jumpTargets.GetLength(); n++ )
+		if( jumpTargets[n].kind == jtLoop )
+			return true;
+	return false;
+}
+
+// Destructor calls for the variables of every scope from the current one up to (not including) `scope`.
+// Put in a block to allow the exception handler to understand them.
+void asCCompiler::DestroyVariablesUntil(asCVariableScope *scope, asCByteCode *bc)
+{
+	bc->Block(true);
+	for( asCVariableScope *vs = variables; vs && vs != scope; vs = vs->parent )
+		for( int n = (int)vs->variables.GetLength() - 1; n >= 0; n-- )
+			CallDestructor(vs->variables[n]->type, vs->variables[n]->stackOffset, vs->variables[n]->onHeap, bc);
+	bc->Block(false);
+}
+
+// A loop may carry a label: an identifier node in front of its other children. Take it off the loop node.
+asCString asCCompiler::TakeLoopLabel(asCScriptNode *loop)
+{
+	if( loop->firstChild && loop->firstChild->nodeType == snIdentifier )
+	{
+		asCScriptNode *id = loop->firstChild;
+		asCString name(&script->code[id->tokenPos], id->tokenLength);
+		id->DisconnectParent();
+		id->Destroy(engine);
+		return name;
+	}
+	return asCString("");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// match: statement only. Layout as the switch: all tests first (the catch-all body right behind them), then the
+// bodies, every body ending in a jump to the end label. A run of unguarded single-pattern constant integer arms
+// is ONE CompileIntDispatch (the switch's range / JMPP emitter); everything else is sequential tests.
+
+// A guard: a bool expression; jumps to failLabel when it is false.
+void asCCompiler::CompileMatchGuard(asCScriptNode *g, asCByteCode *bc, int failLabel)
+{
+	asCExprContext gexpr(engine);
+	if( CompileAssignment(g->firstChild, &gexpr) < 0 ) return;
+	if( ProcessPropertyGetAccessor(&gexpr, g) < 0 ) return;
+
+	if( !gexpr.type.dataType.IsEqualExceptRefAndConst(asCDataType::CreatePrimitive(ttBool, true)) )
+	{
+		asCString str;
+		str.Format(TXT_EXPR_MUST_BE_BOOL_s, gexpr.type.dataType.Format(outFunc->nameSpace).AddressOf());
+		Error(str, g->firstChild);
+		return;
+	}
+
+	if( !gexpr.type.isConstant )
+	{
+		ConvertToVariable(&gexpr);
+		ProcessDeferredParams(&gexpr);
+		gexpr.bc.InstrSHORT(asBC_CpyVtoR4, (short)gexpr.type.stackOffset);
+		gexpr.bc.Instr(asBC_ClrHi);
+		gexpr.bc.InstrDWORD(asBC_JZ, failLabel);
+		ReleaseTemporaryVariable(gexpr.type, &gexpr.bc);
+		gexpr.bc.OptimizeLocally(tempVariableOffsets);
+		LineInstr(bc, g->firstChild->tokenPos);
+		bc->AddCode(&gexpr.bc);
+	}
+#if AS_SIZEOF_BOOL == 1
+	else if( gexpr.type.GetConstantB() == 0 )
+#else
+	else if( gexpr.type.GetConstantDW() == 0 )
+#endif
+		bc->InstrINT(asBC_JMP, failLabel);
+}
+
+// true when the node is exactly one identifier naming a local variable / parameter of this function
+bool asCCompiler::IsLocalVariableName(asCScriptNode *n)
+{
+	if( n->tokenLength == 0 ) return false;
+	for( size_t i = 0; i < n->tokenLength; i++ )
+	{
+		char c = script->code[n->tokenPos + i];
+		if( !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9')) ) return false;
+	}
+	asCString name(&script->code[n->tokenPos], n->tokenLength);
+	return variables && variables->GetVariable(name.AddressOf()) != 0;
+}
+
+// true when a guard of the match names `name` (a guard may assign it, which must not change a selection under way)
+bool asCCompiler::MatchGuardsMention(asCScriptNode *snode, asCScriptNode *name)
+{
+	asCString id(&script->code[name->tokenPos], name->tokenLength);
+	const size_t idLen = id.GetLength();
+	for( asCScriptNode *arm = snode->firstChild->next; arm; arm = arm->next )
+		for( asCScriptNode *c = arm->firstChild; c; c = c->next )
+		{
+			if( c->nodeType != snCondition ) continue;
+			const char *p = &script->code[c->tokenPos];
+			for( size_t i = 0; i + idLen <= c->tokenLength; i++ )
+			{
+				if( strncmp(p + i, id.AddressOf(), idLen) != 0 ) continue;
+				const char before = i > 0 ? p[i-1] : ' ';
+				const char after  = i + idLen < c->tokenLength ? p[i+idLen] : ' ';
+				const bool wb = (before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') || before == '_' || (before >= '0' && before <= '9');
+				const bool wa = (after  >= 'a' && after  <= 'z') || (after  >= 'A' && after  <= 'Z') || after  == '_' || (after  >= '0' && after  <= '9');
+				if( !wb && !wa ) return true;
+			}
+		}
+	return false;
+}
+
+// A pattern that is only a name, a member access or a literal: no calls, operators or side effects.
+static bool asMatchPlainPattern(asCScriptNode *n, bool *hasName)
+{
+	switch( n->nodeType )
+	{
+	case snFunctionCall: case snConstructCall: case snExprOperator: case snArgList: case snCast:
+	case snInitList: case snInitBlock: case snListPattern: case snCondition: case snAssignment:
+		return false;
+	case snExprPostOp:
+		if( n->tokenType != ttDot ) return false;
+		break;
+	case snExprPreOp:
+		if( n->tokenType == ttInc || n->tokenType == ttDec ) return false;
+		break;
+	case snVariableAccess:
+		*hasName = true;
+		break;
+	default:
+		break;
+	}
+	for( asCScriptNode *c = n->firstChild; c; c = c->next )
+		if( !asMatchPlainPattern(c, hasName) )
+			return false;
+	return true;
+}
+
+// ADR-0049 4: a pattern is a read-only expression. A compile-time constant, a literal, or a read-only name
+// (a registered `const int` global such as UiEvent.ACTIVATED) that is compared at run time. A plain variable is not.
+bool asCCompiler::MatchPatternIsReadOnly(asCScriptNode *pat, asCExprContext &c)
+{
+	if( c.type.isConstant ) return true;
+	bool hasName = false;
+	if( !asMatchPlainPattern(pat, &hasName) ) return false;
+	if( !hasName ) return true;    // only literals
+	return c.type.dataType.IsReadOnly();
+}
+
+// the sorted values contain a run that the jump table serves (more than 2 values within the emitter's gap of 5)
+static bool asMatchHasDenseRange(const asCArray<int> &values)
+{
+	asCArray<int> v = values;
+	for( asUINT i = 1; i < v.GetLength(); i++ )
+		for( int j = (int)i - 1; j >= 0 && v[j] > v[j+1]; j-- )
+		{
+			int t = v[j]; v[j] = v[j+1]; v[j+1] = t;
+		}
+	asUINT count = 1;
+	for( asUINT i = 1; i <= v.GetLength(); i++ )
+	{
+		if( i < v.GetLength() && asINT64(v[i]) <= asINT64(v[i-1]) + 5 )
+			count++;
+		else
+		{
+			if( count > 2 ) return true;
+			count = 1;
+		}
+	}
+	return false;
+}
+
+struct asSMatchPattern
+{
+	asCScriptNode  *node;
+	int             kind;     // 0 constant (value), 1 read-only expression compared at run time (expr), 2 f-pattern
+	asINT64         value;
+	asCExprContext *expr;
+	asCString       text;     // the source of a pattern that can repeat an earlier one (dead-arm check)
+	// kind 2: the matcher program, and one binding per hole (marker = the hole's type, the hidden variable that holds it)
+	asCString       program;
+	asCArray<int>        markers;
+	asCArray<asCString>  names;
+	asCArray<sVariable*> vars;
+};
+
+// The one piece of an f"..." pattern: the pattern node must be exactly one f-string literal
+static asCScriptNode *asMatchFStringPiece(asCScriptNode *n)
+{
+	while( n && (n->nodeType == snExpression || n->nodeType == snExprTerm || n->nodeType == snExprValue) )
+	{
+		if( n->firstChild != n->lastChild ) return 0;
+		n = n->firstChild;
+	}
+	if( n && n->nodeType == snConstant && n->firstChild && n->firstChild == n->lastChild && n->firstChild->tokenType == ttFStringConstant )
+		return n->firstChild;
+	return 0;
+}
+
+// ADR-0049 6: splits one f"..." pattern into its literals and typed holes `{type name}` and builds the matcher
+// program: the literals with one marker byte (core::HoleMarker, 1..8) in place of each hole. The compiler reads
+// the f-string as a template and does not call the format function.
+bool asCCompiler::SplitFPattern(asCScriptNode *piece, asCString &program, asCArray<int> &markers, asCArray<asCString> &names)
+{
+	if( engine->matchCfg.matchFunc == 0 )
+	{
+		Error(TXT_FPATTERN_UNAVAILABLE, piece);
+		return false;
+	}
+
+	// the raw text between the quotes
+	const bool triple = piece->tokenLength >= 7 && script->code[piece->tokenPos+2] == '"' && script->code[piece->tokenPos+3] == '"';
+	asCString raw;
+	if( triple )
+		raw.Assign(&script->code[piece->tokenPos+4], piece->tokenLength-7);
+	else
+		raw.Assign(&script->code[piece->tokenPos+2], piece->tokenLength-3);
+
+	asCArray<asCString> lits, holeText;
+	asCString cur;
+	const char *s = raw.AddressOf();
+	const size_t n = raw.GetLength();
+	for( size_t i = 0; i < n; i++ )
+	{
+		const char c = s[i];
+		if( c == '\\' && !triple && i + 1 < n ) { cur += c; cur += s[++i]; continue; }
+		if( c == '}' )
+		{
+			if( i + 1 < n && s[i+1] == '}' ) { cur += '}'; i++; continue; }
+			Error(TXT_FPATTERN_BAD_HOLE, piece);
+			return false;
+		}
+		if( c != '{' ) { cur += c; continue; }
+		if( i + 1 < n && s[i+1] == '{' ) { cur += '{'; i++; continue; }
+
+		size_t j = i + 1;
+		while( j < n && s[j] != '}' ) j++;
+		if( j >= n ) { Error(TXT_FPATTERN_BAD_HOLE, piece); return false; }
+		asCString inner(&s[i+1], j - i - 1);
+		if( strchr(inner.AddressOf(), ':') ) { Error(TXT_FPATTERN_HOLE_SPEC, piece); return false; }
+
+		// `type name`: two identifiers separated by blanks
+		asCString words[3];
+		int count = 0;
+		const char *p = inner.AddressOf();
+		while( *p )
+		{
+			while( *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' ) p++;
+			if( !*p ) break;
+			const char *start = p;
+			while( *p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' ) p++;
+			if( count < 3 ) words[count] = asCString(start, p - start);
+			count++;
+		}
+		bool okName = count == 2;
+		for( int w = 0; w < 2 && okName; w++ )
+		{
+			const asCString &word = words[w];
+			okName = word.GetLength() > 0 && !(word[0] >= '0' && word[0] <= '9');
+			for( asUINT k = 0; k < word.GetLength() && okName; k++ )
+				okName = (word[k] >= 'a' && word[k] <= 'z') || (word[k] >= 'A' && word[k] <= 'Z') || (word[k] >= '0' && word[k] <= '9') || word[k] == '_';
+		}
+		if( !okName ) { Error(TXT_FPATTERN_BAD_HOLE, piece); return false; }
+
+		int marker = 0;
+		if( words[0] == "string" ) marker = 1;
+		else if( words[0] == "int" ) marker = 2;
+		else if( words[0] == "int64" ) marker = 3;
+		else if( words[0] == "uint" ) marker = 4;
+		else if( words[0] == "uint64" ) marker = 5;
+		else if( words[0] == "float" ) marker = 6;
+		else if( words[0] == "double" ) marker = 7;
+		else if( words[0] == "bool" ) marker = 8;
+		if( marker == 0 )
+		{
+			asCString str;
+			str.Format(TXT_FPATTERN_UNKNOWN_TYPE_s, words[0].AddressOf());
+			Error(str, piece);
+			return false;
+		}
+
+		lits.PushLast(cur);
+		cur = "";
+		markers.PushLast(marker);
+		names.PushLast(words[1]);
+		holeText.PushLast(asCString("{") + words[0] + " " + words[1] + "}");
+		i = j;
+	}
+	lits.PushLast(cur);
+
+	const asUINT k = markers.GetLength();
+	if( k == 0 ) { Error(TXT_FPATTERN_NO_HOLE, piece); return false; }
+	if( k > 16 ) { Error(TXT_FPATTERN_TOO_MANY, piece); return false; }
+
+	for( asUINT h = 0; h < lits.GetLength(); h++ )
+	{
+		if( triple )
+			ProcessHeredocStringConstant(lits[h], piece);
+		else
+			ProcessStringConstant(lits[h], piece);
+		for( asUINT b = 0; b < lits[h].GetLength(); b++ )
+			if( lits[h][b] >= 1 && lits[h][b] <= 8 )
+			{
+				Error(TXT_FPATTERN_RESERVED_CHAR, piece);
+				return false;
+			}
+	}
+	for( asUINT h = 1; h < k; h++ )
+		if( lits[h].GetLength() == 0 )
+		{
+			asCString str;
+			str.Format(TXT_FPATTERN_ADJACENT_s_s, holeText[h-1].AddressOf(), holeText[h].AddressOf());
+			Error(str, piece);
+			return false;
+		}
+	for( asUINT h = 0; h < k; h++ )
+	{
+		const int m = markers[h];
+		if( m >= 2 && m <= 7 && lits[h+1].GetLength() > 0 )
+		{
+			const char c = lits[h+1][0];
+			const bool floating = m == 6 || m == 7;
+			if( (c >= '0' && c <= '9') || (floating && (c == '.' || c == 'e' || c == 'E')) )
+			{
+				asCString str;
+				str.Format(TXT_FPATTERN_NUMBER_CONTINUES_s, holeText[h].AddressOf());
+				Error(str, piece);
+				return false;
+			}
+		}
+		for( asUINT o = h + 1; o < k; o++ )
+			if( names[o] == names[h] )
+			{
+				asCString str;
+				str.Format(TXT_FPATTERN_BOUND_TWICE_s, names[h].AddressOf());
+				Error(str, piece);
+				return false;
+			}
+	}
+
+	program = lits[0];
+	for( asUINT h = 0; h < k; h++ )
+	{
+		program += (char)markers[h];
+		program += lits[h+1];
+	}
+	return true;
+}
+
+struct asSMatchArm
+{
+	asCScriptNode *node;
+	asCScriptNode *guard;
+	asCScriptNode *body;
+	asUINT         patStart;
+	asUINT         patCount;
+	bool           catchAll;
+};
+
+void asCCompiler::CompileMatchStatement(asCScriptNode *snode, bool *hasReturn, asCByteCode *bc)
+{
+	*hasReturn = false;
+
+	const int breakLabel = nextLabel++;
+	const int redoLabel  = nextLabel++;
+
+	// The match scope: a break scope that owns the hidden variables (scrutinee copy, redo counter)
+	bc->Block(true);
+	AddVariableScope(true, false);
+	asCByteCode prologue(engine);        // runs once per entry of the match, before the redo label
+	PushJumpTarget(jtMatch, breakLabel, -1);
+	const int ti = (int)jumpTargets.GetLength() - 1;
+	jumpTargets[ti].redoLabel = redoLabel;
+	jumpTargets[ti].prologue  = &prologue;
+
+	asCScriptNode *scrNode = snode->firstChild;
+
+	// ---- the scrutinee ------------------------------------------------------------------------------------------
+	// expr.bc evaluates it, then holds the tests. It is re-run by redo.
+	asCExprContext expr(engine);
+	bool failed = CompileAssignment(scrNode, &expr) < 0 || ProcessPropertyGetAccessor(&expr, scrNode) < 0;
+
+	enum { mdInt32, mdInt64, mdObject } mode = mdInt32;
+	bool scrBool = false, scrUnsigned = false, scrIsString = false, inPlace = false;
+	asCString scrTypeText;
+	asCDataType to, objDt;
+	int offset = 0, objOffset = 0;
+
+	if( !failed )
+	{
+		const asCDataType sdt = expr.type.dataType;
+		const bool isObj = !sdt.IsObjectHandle() && sdt.GetTypeInfo() &&
+		                   (sdt.GetTypeInfo() == engine->stringType.GetTypeInfo() || sdt.GetTypeInfo()->name == "any");
+		if( sdt.IsFloatType() || sdt.IsDoubleType() )
+		{
+			Error(TXT_MATCH_FLOAT_SCRUTINEE, scrNode);
+			failed = true;
+		}
+		else if( isObj )
+			mode = mdObject;
+		else if( sdt.IsPrimitive() && (sdt.IsIntegerType() || sdt.IsUnsignedType() || sdt.IsBooleanType()) )
+			mode = (!sdt.IsBooleanType() && sdt.GetSizeInMemoryBytes() > 4) ? mdInt64 : mdInt32;
+		else
+		{
+			asCDataType shown = sdt;
+			shown.MakeReference(false);
+			asCString str;
+			str.Format(TXT_MATCH_CANNOT_MATCH_TYPE_s, shown.Format(outFunc->nameSpace).AddressOf());
+			Error(str, scrNode);
+			failed = true;
+		}
+		scrBool     = sdt.IsBooleanType();
+		scrUnsigned = sdt.IsUnsignedType();
+		scrIsString = !sdt.IsObjectHandle() && sdt.GetTypeInfo() && sdt.GetTypeInfo() == engine->stringType.GetTypeInfo();
+		asCDataType shownType = sdt;
+		shownType.MakeReference(false);
+		scrTypeText = shownType.Format(outFunc->nameSpace);
+	}
+
+	// A local / parameter is read in place (no hidden copy) unless a guard names it
+	const bool localScrutinee = !failed && IsLocalVariableName(scrNode);
+	const bool mentioned      = localScrutinee && MatchGuardsMention(snode, scrNode);
+
+	if( !failed && mode != mdObject )
+	{
+		to.SetTokenType(mode == mdInt64 ? (scrUnsigned ? ttUInt64 : ttInt64) : (scrUnsigned ? ttUInt : ttInt));
+		if( expr.type.dataType.IsReference() )
+			ConvertToVariable(&expr);
+		ImplicitConversion(&expr, to, scrNode, asIC_IMPLICIT_CONV, true);
+		ConvertToVariable(&expr);
+		ProcessDeferredParams(&expr);
+		offset = expr.type.stackOffset;
+		if( mentioned && !expr.type.isTemporary )
+		{
+			// a guard may change the variable: select on a copy
+			const int tmp = AllocateVariable(asCDataType::CreatePrimitive(mode == mdInt64 ? ttInt64 : ttInt, false), true);
+			expr.bc.InstrW_W(mode == mdInt64 ? asBC_CpyVtoV8 : asBC_CpyVtoV4, tmp, offset);
+			expr.type.SetVariable(to, tmp, true);
+			offset = tmp;
+		}
+	}
+	else if( !failed && localScrutinee && !mentioned )
+	{
+		// ADR-0049 7: read in place; the scrutinee node is compiled again for every test (a variable read has no effect)
+		inPlace = true;
+		expr.bc.ClearAll();
+	}
+	else if( !failed )
+	{
+		// a hidden local of the match scope holds the value for one pass (destroyed at the end label, or by redo)
+		objDt = expr.type.dataType;
+		objDt.MakeReference(false);
+		objDt.MakeReadOnly(false);
+		objOffset = AllocateVariable(objDt, false);
+		if( DeclareVariable("", objDt, objOffset, &expr.bc, scrNode) < 0 )
+			failed = true;
+		else
+		{
+			CompileInitializationWithAssignment(&expr.bc, objDt, scrNode, objOffset, 0, asVGM_VARIABLE, scrNode, &expr);
+			ProcessDeferredParams(&expr);
+			jumpTargets[ti].snapshot = variables->variables[variables->variables.GetLength() - 1];
+		}
+	}
+
+	// ---- the arms: patterns, guards, bodies; constants are folded, the rest must be read-only expressions ---------
+	asCArray<asSMatchArm> arms;
+	asCArray<asSMatchPattern> pats;
+	int catchAllIdx = -1;
+
+	if( !failed )
+	{
+		asCArray<bool> seenConst;
+		asCArray<asINT64> seenVals;
+		asCArray<asCString> seenText;
+		asCArray<int> seenLines;
+		for( asCScriptNode *armNode = scrNode->next; armNode; armNode = armNode->next )
+		{
+			asSMatchArm a;
+			a.node = armNode; a.guard = 0; a.body = 0; a.patStart = pats.GetLength();
+			for( asCScriptNode *c = armNode->firstChild; c; c = c->next )
+			{
+				if( c->nodeType == snExpression )
+				{
+					asSMatchPattern p;
+					p.node = c; p.kind = 1; p.value = 0; p.expr = 0;
+					pats.PushLast(p);
+				}
+				else if( c->nodeType == snCondition ) a.guard = c;
+				else a.body = c;
+			}
+			a.patCount = pats.GetLength() - a.patStart;
+			a.catchAll = a.patCount == 0 && a.guard == 0;
+			if( a.catchAll ) catchAllIdx = (int)arms.GetLength();
+			int line = 0; script->ConvertPosToRowCol(armNode->tokenPos, &line, 0);
+
+			for( asUINT k = a.patStart; k < a.patStart + a.patCount; k++ )
+			{
+				asSMatchPattern &p = pats[k];
+				asCString src(&script->code[p.node->tokenPos], p.node->tokenLength);
+				p.text = src;
+				asCScriptNode *piece = asMatchFStringPiece(p.node);
+				if( piece )
+				{
+					// ADR-0049 6: an f"..." pattern is read as a template, not formatted
+					if( a.patCount > 1 ) { Error(TXT_FPATTERN_ALTERNATIVES, p.node); failed = true; continue; }
+					if( !scrIsString )
+					{
+						asCString str;
+						str.Format(TXT_FPATTERN_NOT_STRING_s, scrTypeText.AddressOf());
+						Error(str, p.node); failed = true; continue;
+					}
+					if( !SplitFPattern(piece, p.program, p.markers, p.names) ) { failed = true; continue; }
+					p.kind = 2;
+				}
+				else
+				{
+					p.expr = asNEW(asCExprContext)(engine);
+					if( CompileExpression(p.node, p.expr) < 0 ) { failed = true; continue; }
+
+					if( mode != mdObject && p.expr->type.isConstant )
+					{
+						const asCDataType pdt = p.expr->type.dataType;
+						if( scrBool )
+						{
+							if( !pdt.IsBooleanType() ) { Error(TXT_MATCH_PATTERN_NOT_BOOL, p.node); failed = true; continue; }
+							p.value = p.expr->type.GetConstantB() ? 1 : 0;
+						}
+						else if( pdt.IsBooleanType() || !(pdt.IsIntegerType() || pdt.IsUnsignedType()) )
+						{
+							Error(TXT_MATCH_PATTERN_NOT_INTEGER, p.node); failed = true; continue;
+						}
+						else
+						{
+							// fold to 64 bits keeping the sign of the pattern's own type, then check it fits the scrutinee
+							const bool patUns = pdt.IsUnsignedType();
+							ImplicitConversion(p.expr, asCDataType::CreatePrimitive(patUns ? ttUInt64 : ttInt64, true), p.node, asIC_IMPLICIT_CONV, true);
+							const asQWORD bits = p.expr->type.GetConstantQW();
+							bool fits;
+							if( mode == mdInt32 && !scrUnsigned )      fits = patUns ? bits <= 0x7FFFFFFFull : ((asINT64)bits >= -2147483648ll && (asINT64)bits <= 2147483647ll);
+							else if( mode == mdInt32 )                 fits = patUns ? bits <= 0xFFFFFFFFull : ((asINT64)bits >= 0 && (asINT64)bits <= 4294967295ll);
+							else if( !scrUnsigned )                    fits = patUns ? bits <= 0x7FFFFFFFFFFFFFFFull : true;
+							else                                       fits = patUns ? true : (asINT64)bits >= 0;
+							if( !fits )
+							{
+								asCString str;
+								str.Format(TXT_MATCH_PATTERN_RANGE_s, src.AddressOf());
+								Error(str, p.node); failed = true; continue;
+							}
+							p.value = (asINT64)bits;
+						}
+						p.kind = 0;
+					}
+					else
+					{
+						if( !MatchPatternIsReadOnly(p.node, *p.expr) )
+						{
+							asCString str;
+							str.Format(TXT_MATCH_NOT_CONSTANT_s, src.AddressOf());
+							Error(str, p.node); failed = true; continue;
+						}
+						if( scrBool && mode != mdObject ) { Error(TXT_MATCH_PATTERN_NOT_BOOL, p.node); failed = true; continue; }
+						p.kind = 1;
+					}
+				}
+
+				// dead arm: the same pattern already matched by an earlier unguarded arm (alternatives too)
+				for( asUINT s = 0; s < seenText.GetLength(); s++ )
+					if( p.kind == 0 ? (seenConst[s] && seenVals[s] == p.value) : (!seenConst[s] && seenText[s] == p.text) )
+					{
+						asCString str;
+						str.Format(TXT_MATCH_DEAD_ARM_s_d, src.AddressOf(), seenLines[s]);
+						Error(str, p.node); failed = true;
+						break;
+					}
+				if( a.guard == 0 )
+				{
+					seenConst.PushLast(p.kind == 0);
+					seenVals.PushLast(p.value);
+					seenText.PushLast(p.text);
+					seenLines.PushLast(line);
+				}
+			}
+			arms.PushLast(a);
+		}
+
+		// `_` must be the last arm, at most one
+		for( asUINT i = 0; i < arms.GetLength(); i++ )
+			if( arms[i].catchAll && i != arms.GetLength() - 1 )
+			{
+				Error(TXT_MATCH_UNDERSCORE_LAST, arms[i].node);
+				failed = true;
+			}
+		if( arms.GetLength() == 0 )
+		{
+			Error(TXT_MATCH_NEEDS_ARM, snode);
+			failed = true;
+		}
+
+		// f-pattern bindings are hoisted (ADR-0049 6.4): declared in the match scope under a hidden name and
+		// constructed once per entry, before the redo label, so the exception handler sees the same set of live
+		// objects whichever arm runs. An arm shows its own names only while its guard and body are compiled.
+		for( asUINT k = 0; k < pats.GetLength() && !failed; k++ )
+		{
+			asSMatchPattern &p = pats[k];
+			for( asUINT h = 0; h < p.markers.GetLength(); h++ )
+			{
+				asCDataType dt;
+				switch( p.markers[h] )
+				{
+				case 1: dt = engine->stringType; break;
+				case 2: dt = asCDataType::CreatePrimitive(ttInt, false); break;
+				case 3: dt = asCDataType::CreatePrimitive(ttInt64, false); break;
+				case 4: dt = asCDataType::CreatePrimitive(ttUInt, false); break;
+				case 5: dt = asCDataType::CreatePrimitive(ttUInt64, false); break;
+				case 6: dt = asCDataType::CreatePrimitive(ttFloat, false); break;
+				case 7: dt = asCDataType::CreatePrimitive(ttDouble, false); break;
+				default: dt = asCDataType::CreatePrimitive(ttBool, false); break;
+				}
+				dt.MakeReference(false);
+				dt.MakeReadOnly(false);
+				const int off = AllocateVariable(dt, false);
+				if( variables->DeclareVariable("", dt, off, IsVariableOnHeap(off)) < 0 ) { failed = true; break; }
+				sVariable *v = variables->variables[variables->variables.GetLength() - 1];
+				v->isInitialized = true;
+				if( variables->parent && variables->parent->GetVariable(p.names[h].AddressOf()) )
+				{
+					asCString str;
+					str.Format(TXT_s_HIDES_VAR_IN_OUTER_SCOPE, p.names[h].AddressOf());
+					Warning(str, p.node);
+				}
+				prologue.VarDecl((int)outFunc->scriptData->variables.GetLength());
+				outFunc->AddVariable(p.names[h], dt, off, IsVariableOnHeap(off));
+				if( p.markers[h] == 1 )
+					CallDefaultConstructor(dt, off, IsVariableOnHeap(off), &prologue, p.node);
+				p.vars.PushLast(v);
+			}
+		}
+	}
+
+	asCArray<asCByteCode*> bodyBC;
+	if( !failed )
+	{
+		const asUINT n = arms.GetLength();
+		asCByteCode &testBC = expr.bc;
+
+		asCArray<int> bodyLabel;
+		for( asUINT i = 0; i < n; i++ )
+			bodyLabel.PushLast(nextLabel++);
+
+		// the scrutinee as an expression: the variable of an integer scrutinee, the hidden copy, or the variable read in place
+		auto makeSubject = [&](asCExprContext &lctx)
+		{
+			if( mode != mdObject )
+				lctx.type.SetVariable(to, offset, false);
+			else if( inPlace )
+				CompileAssignment(scrNode, &lctx);
+			else
+			{
+				lctx.bc.InstrSHORT(asBC_PSF, (short)objOffset);
+				lctx.type.SetVariable(objDt, objOffset, false);
+				if( IsVariableOnHeap(objOffset) )
+					lctx.type.dataType.MakeReference(true);
+			}
+		};
+		// scrutinee == pattern: jumps to `label` when the result is `jumpIfEqual`, falls through otherwise
+		auto emitCompare = [&](asSMatchPattern &p, int label, bool jumpIfEqual)
+		{
+			if( p.kind == 0 )
+			{
+				const bool wide = mode == mdInt64;
+				const int tmpOffset = AllocateVariable(asCDataType::CreatePrimitive(wide ? ttInt64 : ttInt, false), true);
+				if( wide )
+				{
+					testBC.InstrSHORT_QW(asBC_SetV8, (short)tmpOffset, (asQWORD)p.value);
+					testBC.InstrW_W(asBC_CMPi64, offset, tmpOffset);
+				}
+				else
+				{
+					testBC.InstrSHORT_DW(asBC_SetV4, (short)tmpOffset, (asDWORD)p.value);
+					testBC.InstrW_W(asBC_CMPi, offset, tmpOffset);
+				}
+				testBC.InstrDWORD(jumpIfEqual ? asBC_JZ : asBC_JNZ, label);
+				ReleaseTemporaryVariable(tmpOffset, &testBC);
+				return;
+			}
+
+			asCExprContext lctx(engine);
+			makeSubject(lctx);
+			asCExprContext res(engine);
+			CompileOperator(p.node, &lctx, p.expr, &res, ttEqual);
+			if( res.type.dataType.IsEqualExceptRefAndConst(asCDataType::CreatePrimitive(ttBool, true)) && !res.type.isConstant )
+			{
+				ConvertToVariable(&res);
+				ProcessDeferredParams(&res);
+				res.bc.InstrSHORT(asBC_CpyVtoR4, (short)res.type.stackOffset);
+				res.bc.Instr(asBC_ClrHi);
+				res.bc.InstrDWORD(jumpIfEqual ? asBC_JNZ : asBC_JZ, label);
+				ReleaseTemporaryVariable(res.type, &res.bc);
+				testBC.AddCode(&res.bc);
+			}
+		};
+
+		// an arm with an f-pattern shows its bindings under their own names while its guard and body are compiled
+		auto bindNames = [&](const asSMatchArm &A, bool on)
+		{
+			for( asUINT k = A.patStart; k < A.patStart + A.patCount; k++ )
+				for( asUINT h = 0; h < pats[k].vars.GetLength(); h++ )
+					pats[k].vars[h]->name = on ? pats[k].names[h] : asCString("");
+		};
+
+		// the call  func(args)  into `out`; false when it does not compile
+		auto callFunction = [&](int funcId, asCArray<asCExprContext*> &args, asCExprContext &out, asCScriptNode *errNode) -> bool
+		{
+			asCScriptFunction *f = builder->GetFunctionDescription(funcId);
+			if( f == 0 ) return false;
+			asCArray<int> funcs;
+			funcs.PushLast(funcId);
+			MatchFunctions(funcs, args, errNode, f->name.AddressOf());
+			return funcs.GetLength() == 1 && MakeFunctionCall(&out, funcs[0], 0, args, errNode) >= 0;
+		};
+
+		// f-pattern: attempt the template (no match -> nextArm), then copy the captures into the bindings
+		auto emitFPattern = [&](asSMatchPattern &p, int nextArm)
+		{
+			{
+				asCExprContext *subject = asNEW(asCExprContext)(engine);
+				makeSubject(*subject);
+				asCExprContext *prog = asNEW(asCExprContext)(engine);
+				void *strPtr = const_cast<void*>(engine->stringFactory->GetStringConstant(p.program.AddressOf(), (asUINT)p.program.GetLength()));
+				usedStringConstants.PushLast(strPtr);
+				prog->bc.InstrPTR(asBC_PGA, strPtr);
+				prog->type.Set(engine->stringType);
+				prog->type.isConstant = true;
+				prog->type.isRefSafe = true;
+				asCArray<asCExprContext*> args;
+				args.PushLast(subject);
+				args.PushLast(prog);
+				asCExprContext call(engine);
+				const bool ok = callFunction(engine->matchCfg.matchFunc, args, call, p.node);
+				asDELETE(subject, asCExprContext);
+				asDELETE(prog, asCExprContext);
+				if( !ok ) return;
+				ConvertToVariable(&call);
+				ProcessDeferredParams(&call);
+				call.bc.InstrSHORT(asBC_CpyVtoR4, (short)call.type.stackOffset);
+				call.bc.Instr(asBC_ClrHi);
+				call.bc.InstrDWORD(asBC_JZ, nextArm);
+				ReleaseTemporaryVariable(call.type, &call.bc);
+				testBC.AddCode(&call.bc);
+			}
+
+			for( asUINT h = 0; h < p.markers.GetLength(); h++ )
+			{
+				const int marker = p.markers[h];
+				const int funcId = marker == 1 ? engine->matchCfg.capStringFunc :
+				                   (marker == 2 || marker == 3) ? engine->matchCfg.capIntFunc :
+				                   (marker == 4 || marker == 5) ? engine->matchCfg.capUintFunc :
+				                   (marker == 6 || marker == 7) ? engine->matchCfg.capDoubleFunc : engine->matchCfg.capBoolFunc;
+				asCExprContext *index = asNEW(asCExprContext)(engine);
+				index->type.SetConstantDW(asCDataType::CreatePrimitive(ttUInt, true), h);
+				asCArray<asCExprContext*> args;
+				args.PushLast(index);
+				asCExprContext rhs(engine);
+				const bool ok = callFunction(funcId, args, rhs, p.node);
+				asDELETE(index, asCExprContext);
+				if( !ok ) { failed = true; return; }
+
+				// the binding as an lvalue, as a variable access builds it
+				sVariable *v = p.vars[h];
+				asCExprContext lhs(engine);
+				if( v->type.IsPrimitive() )
+				{
+					lhs.type.SetVariable(v->type, v->stackOffset, false);
+					if( marker != 3 && marker != 5 && marker != 7 && marker != 8 )
+						ImplicitConversion(&rhs, v->type, p.node, asIC_EXPLICIT_VAL_CAST);
+				}
+				else
+				{
+					lhs.bc.InstrSHORT(asBC_PSF, (short)v->stackOffset);
+					lhs.type.SetVariable(v->type, v->stackOffset, false);
+					if( v->onHeap ) lhs.type.dataType.MakeReference(true);
+					lhs.type.isRefSafe = true;
+				}
+				lhs.type.isLValue = true;
+				asCExprContext asg(engine);
+				DoAssignment(&asg, &lhs, &rhs, p.node, p.node, ttAssignment, p.node);
+				if( !asg.type.dataType.IsPrimitive() )
+					asg.bc.Instr(asBC_PopPtr);
+				ReleaseTemporaryVariable(asg.type, &asg.bc);
+				ProcessDeferredParams(&asg);
+				testBC.AddCode(&asg.bc);
+			}
+		};
+		// ---- the tests ---------------------------------------------------------------------------------------
+		asUINT runEnd = 0;
+		bool endsInJump = false;
+		for( asUINT i = 0; i < n; i++ )
+		{
+			const asSMatchArm &A = arms[i];
+			if( A.catchAll || i < runEnd ) continue;
+			endsInJump = false;
+
+			// a run of unguarded single-pattern constant arms with a dense part is one jump-table dispatch
+			if( mode == mdInt32 )
+			{
+				asUINT j = i;
+				while( j < n && !arms[j].catchAll && arms[j].patCount == 1 && arms[j].guard == 0 && pats[arms[j].patStart].kind == 0 )
+					j++;
+				if( j - i >= 3 )
+				{
+					asCArray<int> runVals, runLabels;
+					for( asUINT k = i; k < j; k++ )
+					{
+						runVals.PushLast((int)(asDWORD)pats[arms[k].patStart].value);
+						runLabels.PushLast(bodyLabel[k]);
+					}
+					if( asMatchHasDenseRange(runVals) )
+					{
+						// the dispatch is the last test when only the catch-all (or nothing) follows it
+						const bool tail = j == n || arms[j].catchAll;
+						const int def = tail ? (catchAllIdx >= 0 ? bodyLabel[catchAllIdx] : breakLabel) : nextLabel++;
+						LineInstr(&testBC, A.node->tokenPos);
+						CompileIntDispatch(&testBC, offset, runVals, runLabels, def);
+						if( !tail ) testBC.Label((short)def);
+						endsInJump = tail;
+						runEnd = j;
+						continue;
+					}
+				}
+			}
+
+			// an f-pattern arm: attempt, bind, then the guard
+			if( A.patCount == 1 && pats[A.patStart].kind == 2 )
+			{
+				LineInstr(&testBC, A.node->tokenPos);
+				const int nextArm = nextLabel++;
+				bindNames(A, true);
+				emitFPattern(pats[A.patStart], nextArm);
+				if( A.guard )
+					CompileMatchGuard(A.guard, &testBC, nextArm);
+				bindNames(A, false);
+				testBC.InstrINT(asBC_JMP, bodyLabel[i]);
+				testBC.Label((short)nextArm);
+				continue;
+			}
+			// alternatives and/or a guard
+			LineInstr(&testBC, A.node->tokenPos);
+			const int nextArm = nextLabel++;
+			if( A.guard == 0 )
+			{
+				for( asUINT k = A.patStart; k < A.patStart + A.patCount; k++ )
+					emitCompare(pats[k], bodyLabel[i], true);
+			}
+			else
+			{
+				const int ok = nextLabel++;
+				for( asUINT k = A.patStart; k < A.patStart + A.patCount; k++ )
+				{
+					const bool lastPat = k + 1 == A.patStart + A.patCount;
+					emitCompare(pats[k], lastPat ? nextArm : ok, !lastPat);
+				}
+				if( A.patCount > 1 ) testBC.Label((short)ok);
+				CompileMatchGuard(A.guard, &testBC, nextArm);
+				testBC.InstrINT(asBC_JMP, bodyLabel[i]);
+				testBC.Label((short)nextArm);
+			}
+		}
+
+		// nothing matched: the catch-all body is laid out right behind the tests, else leave the match
+		if( catchAllIdx < 0 && !endsInJump )
+			testBC.InstrINT(asBC_JMP, breakLabel);
+		if( mode != mdObject )
+			ReleaseTemporaryVariable(expr.type, &testBC);
+		testBC.OptimizeLocally(tempVariableOffsets);
+
+		// ---- the bodies --------------------------------------------------------------------------------------
+		asCArray<bool> term, endsInContinue;
+		for( asUINT i = 0; i < n; i++ )
+		{
+			// `continue` enters the next arm's body, no test: it cannot enter an arm whose bindings only the test makes
+			jumpTargets[ti].continueLabel = -1;
+			jumpTargets[ti].continueError = "";
+			if( i + 1 < n )
+			{
+				const asSMatchArm &next = arms[i+1];
+				const asSMatchPattern *bound = next.patCount == 1 && pats[next.patStart].kind == 2 ? &pats[next.patStart] : 0;
+				if( bound )
+				{
+					asCString str;
+					str.Format(TXT_MATCH_CONTINUE_BINDS_s, bound->names[0].AddressOf());
+					jumpTargets[ti].continueError = str;
+				}
+				else
+					jumpTargets[ti].continueLabel = bodyLabel[i+1];
+			}
+			else
+				jumpTargets[ti].continueError = TXT_MATCH_CONTINUE_LAST;
+			bool r = false;
+			asCByteCode *bb = asNEW(asCByteCode)(engine);
+			bindNames(arms[i], true);
+			CompileStatementBlock(arms[i].body, true, &r, bb);
+			bindNames(arms[i], false);
+			bodyBC.PushLast(bb);
+			term.PushLast(r);
+			asCScriptNode *last = arms[i].body->lastChild;
+			endsInContinue.PushLast(last && last->nodeType == snContinue && last->firstChild == 0);
+		}
+
+		// returns on all paths: a catch-all, and every body ends in a return / redo, or in a continue into a body that does
+		bool allReturn = catchAllIdx >= 0, nextTerm = false;
+		for( int i = (int)n - 1; i >= 0; i-- )
+		{
+			nextTerm = term[i] || (endsInContinue[i] && nextTerm);
+			if( !nextTerm ) allReturn = false;
+		}
+		*hasReturn = allReturn;
+
+		asCArray<int> order;
+		if( catchAllIdx >= 0 ) order.PushLast(catchAllIdx);
+		for( int i = 0; i < (int)n; i++ )
+			if( i != catchAllIdx ) order.PushLast(i);
+		for( asUINT o = 0; o < order.GetLength(); o++ )
+		{
+			const int k = order[o];
+			testBC.Label((short)bodyLabel[k]);
+			LineInstr(&testBC, arms[k].body->tokenPos);
+			testBC.AddCode(bodyBC[k]);
+			if( !term[k] && !endsInContinue[k] )
+				testBC.InstrINT(asBC_JMP, breakLabel);
+		}
+	}
+
+	// ---- end ----------------------------------------------------------------------------------------------------
+	bc->AddCode(&prologue);
+	bc->Label((short)redoLabel);
+	bc->AddCode(&expr.bc);
+	bc->Label((short)breakLabel);
+
+	for( asUINT i = 0; i < bodyBC.GetLength(); i++ )
+		asDELETE(bodyBC[i], asCByteCode);
+	for( asUINT i = 0; i < pats.GetLength(); i++ )
+		if( pats[i].expr )
+			asDELETE(pats[i].expr, asCExprContext);
+
+	PopJumpTarget();
+
+	// destroy / free the match scope's hidden variables
+	for( int v = (int)variables->variables.GetLength() - 1; v >= 0; v-- )
+	{
+		sVariable *var = variables->variables[v];
+		if( !*hasReturn )
+			CallDestructor(var->type, var->stackOffset, var->onHeap, bc);
+		DeallocateVariable(var->stackOffset);
+	}
+	RemoveVariableScope();
+	bc->Block(false);
+}
+
+// `redo`: count the pass (the cap raises a script exception), leave every scope inside the match, restart selection.
+void asCCompiler::CompileRedoStatement(asCScriptNode *node, asCByteCode *bc)
+{
+	int ti = -1;
+	for( int n = (int)jumpTargets.GetLength() - 1; n >= 0; n-- )
+		if( jumpTargets[n].kind == jtMatch ) { ti = n; break; }
+	if( ti < 0 )
+	{
+		Error(TXT_MATCH_REDO_OUTSIDE, node);
+		return;
+	}
+	if( engine->matchCfg.redoOverflowFunc == 0 )
+	{
+		Error(TXT_MATCH_REDO_UNAVAILABLE, node);
+		return;
+	}
+
+	// the pass counter: a hidden int of the match scope, zeroed once per entry (in the prologue)
+	if( jumpTargets[ti].redoCounter == 0 )
+	{
+		asCDataType intDt = asCDataType::CreatePrimitive(ttInt, false);
+		int off = AllocateVariable(intDt, false);
+		jumpTargets[ti].scope->DeclareVariable("", intDt, off, false);
+		jumpTargets[ti].redoCounter = off;
+		jumpTargets[ti].prologue->InstrSHORT_DW(asBC_SetV4, (short)off, 0);
+	}
+
+	const int counter = jumpTargets[ti].redoCounter;
+	const int okLabel = nextLabel++;
+	bc->InstrSHORT(asBC_IncVi, (short)counter);
+	bc->InstrW_DW(asBC_CMPIi, counter, (asDWORD)engine->matchCfg.redoLimit);
+	bc->InstrDWORD(asBC_JNP, okLabel);
+	asCExprContext call(engine);
+	PerformFunctionCall(engine->matchCfg.redoOverflowFunc, &call);
+	bc->AddCode(&call.bc);
+	bc->Label((short)okLabel);
+
+	// same rule as the loops (ADR-0037): with script debug on, a backward jump is a suspend point
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
+
+	// leave the scopes inside the match, and the scrutinee copy of this pass (the hoisted bindings stay)
+	DestroyVariablesUntil(jumpTargets[ti].scope, bc);
+	if( jumpTargets[ti].snapshot )
+	{
+		sVariable *s = jumpTargets[ti].snapshot;
+		bc->Block(true);
+		CallDestructor(s->type, s->stackOffset, s->onHeap, bc);
+		bc->Block(false);
+	}
+
+	bc->InstrINT(asBC_JMP, jumpTargets[ti].redoLabel);
 }
 
 void asCCompiler::CompileCase(asCScriptNode *node, asCByteCode *bc, bool *hasReturn, bool *hasBreak)
@@ -6416,6 +7476,8 @@ void asCCompiler::CompileIfStatement(asCScriptNode *inode, bool *hasReturn, asCB
 
 void asCCompiler::CompileForStatement(asCScriptNode *fnode, asCByteCode *bc)
 {
+	asCString loopLabel = TakeLoopLabel(fnode);
+
 	// Add a variable scope that will be used by CompileBreak/Continue to know where to stop deallocating variables
 	bc->Block(true);
 	AddVariableScope(true, true);
@@ -6426,8 +7488,7 @@ void asCCompiler::CompileForStatement(asCScriptNode *fnode, asCByteCode *bc)
 	int continueLabel = nextLabel++;
 	int insideLabel = nextLabel++;
 
-	continueLabels.PushLast(continueLabel);
-	breakLabels.PushLast(afterLabel);
+	PushJumpTarget(jtLoop, afterLabel, continueLabel, loopLabel);
 
 	//---------------------------------------
 	// Compile the initialization statement
@@ -6531,8 +7592,7 @@ void asCCompiler::CompileForStatement(asCScriptNode *fnode, asCByteCode *bc)
 
 	bc->Label((short)afterLabel);
 
-	continueLabels.PopLast();
-	breakLabels.PopLast();
+	PopJumpTarget();
 
 	// Deallocate variables in this block, in reverse order
 	for( int n = (int)variables->variables.GetLength() - 1; n >= 0; n-- )
@@ -6585,6 +7645,8 @@ int asCCompiler::DeclareVariable(const asCString& name, const asCDataType& type,
 
 void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 {
+	asCString loopLabel = TakeLoopLabel(node);
+
 	const char* const BEGIN_NAME = "opForBegin";
 	const char* const END_NAME = "opForEnd";
 	const char* const NEXT_NAME = "opForNext";
@@ -6824,8 +7886,7 @@ void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 	int continueLabel = nextLabel++;
 	int insideLabel = nextLabel++;
 
-	continueLabels.PushLast(continueLabel);
-	breakLabels.PushLast(afterLabel);
+	PushJumpTarget(jtLoop, afterLabel, continueLabel, loopLabel);
 
 	//---------------------------------------
 	// Compile the initialization statement
@@ -7059,8 +8120,7 @@ void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 
 	bc->Label((short)afterLabel);
 
-	continueLabels.PopLast();
-	breakLabels.PopLast();
+	PopJumpTarget();
 
 	// Deallocate variables in this block, in reverse order
 	for (int n = (int)variables->variables.GetLength() - 1; n >= 0; n--)
@@ -7080,6 +8140,8 @@ void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 
 void asCCompiler::CompileWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 {
+	asCString loopLabel = TakeLoopLabel(wnode);
+
 	// Add a variable scope that will be used by CompileBreak/Continue to know where to stop deallocating variables
 	AddVariableScope(true, true);
 
@@ -7087,8 +8149,7 @@ void asCCompiler::CompileWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 	int beforeLabel = nextLabel++;
 	int afterLabel = nextLabel++;
 
-	continueLabels.PushLast(beforeLabel);
-	breakLabels.PushLast(afterLabel);
+	PushJumpTarget(jtLoop, afterLabel, beforeLabel, loopLabel);
 
 	// Add label before the expression
 	bc->Label((short)beforeLabel);
@@ -7152,14 +8213,15 @@ void asCCompiler::CompileWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 	// Add label after the statement
 	bc->Label((short)afterLabel);
 
-	continueLabels.PopLast();
-	breakLabels.PopLast();
+	PopJumpTarget();
 
 	RemoveVariableScope();
 }
 
 void asCCompiler::CompileDoWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 {
+	asCString loopLabel = TakeLoopLabel(wnode);
+
 	// Add a variable scope that will be used by CompileBreak/Continue to know where to stop deallocating variables
 	AddVariableScope(true, true);
 
@@ -7168,8 +8230,7 @@ void asCCompiler::CompileDoWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 	int beforeTest = nextLabel++;
 	int afterLabel = nextLabel++;
 
-	continueLabels.PushLast(beforeTest);
-	breakLabels.PushLast(afterLabel);
+	PushJumpTarget(jtLoop, afterLabel, beforeTest, loopLabel);
 
 	// Add label before the statement
 	bc->Label((short)beforeLabel);
@@ -7234,60 +8295,77 @@ void asCCompiler::CompileDoWhileStatement(asCScriptNode *wnode, asCByteCode *bc)
 	// Add label after the statement
 	bc->Label((short)afterLabel);
 
-	continueLabels.PopLast();
-	breakLabels.PopLast();
+	PopJumpTarget();
 
 	RemoveVariableScope();
 }
 
 void asCCompiler::CompileBreakStatement(asCScriptNode *node, asCByteCode *bc)
 {
-	if( breakLabels.GetLength() == 0 )
+	// ORGLIN (ADR-0049 M4): `break` leaves the innermost loop, switch or match; `break outer` the loop labeled outer
+	int ti = (int)jumpTargets.GetLength() - 1;
+	if( node->firstChild )
+	{
+		asCString name(&script->code[node->firstChild->tokenPos], node->firstChild->tokenLength);
+		ti = FindLoopTarget(name);
+		if( ti < 0 )
+		{
+			asCString str;
+			str.Format(TXT_NOT_AN_ENCLOSING_LOOP_s, name.AddressOf());
+			Error(str, node->firstChild);
+			return;
+		}
+	}
+	else if( ti < 0 )
 	{
 		Error(TXT_INVALID_BREAK, node);
 		return;
 	}
 
 	// Add destructor calls for all variables that will go out of scope
-	// Put this clean up in a block to allow exception handler to understand them
-	bc->Block(true);
-	asCVariableScope *vs = variables;
-	while( !vs->isBreakScope )
-	{
-		for( int n = (int)vs->variables.GetLength() - 1; n >= 0; n-- )
-			CallDestructor(vs->variables[n]->type, vs->variables[n]->stackOffset, vs->variables[n]->onHeap, bc);
+	DestroyVariablesUntil(jumpTargets[ti].scope, bc);
 
-		vs = vs->parent;
-	}
-	bc->Block(false);
-
-	bc->InstrINT(asBC_JMP, breakLabels[breakLabels.GetLength()-1]);
+	bc->InstrINT(asBC_JMP, jumpTargets[ti].breakLabel);
 }
 
 void asCCompiler::CompileContinueStatement(asCScriptNode *node, asCByteCode *bc)
 {
-	if( continueLabels.GetLength() == 0 )
+	// ORGLIN (ADR-0049 M2/M4): `continue` goes to the innermost loop, or into the next arm of the innermost match
+	// (a classic switch is transparent); `continue outer` continues the loop labeled outer
+	int ti = -1;
+	if( node->firstChild )
 	{
-		Error(TXT_INVALID_CONTINUE, node);
-		return;
+		asCString name(&script->code[node->firstChild->tokenPos], node->firstChild->tokenLength);
+		ti = FindLoopTarget(name);
+		if( ti < 0 )
+		{
+			asCString str;
+			str.Format(TXT_NOT_AN_ENCLOSING_LOOP_s, name.AddressOf());
+			Error(str, node->firstChild);
+			return;
+		}
+	}
+	else
+	{
+		for( int n = (int)jumpTargets.GetLength() - 1; n >= 0; n-- )
+			if( jumpTargets[n].kind != jtSwitch ) { ti = n; break; }
+		if( ti < 0 )
+		{
+			Error(TXT_INVALID_CONTINUE, node);
+			return;
+		}
+		if( jumpTargets[ti].continueLabel < 0 )
+		{
+			Error(jumpTargets[ti].continueError, node);
+			return;
+		}
 	}
 
 	// Add destructor calls for all variables that will go out of scope
-	// Put this clean up in a block to allow exception handler to understand them
-	bc->Block(true);
-	asCVariableScope *vs = variables;
-	while( !vs->isContinueScope )
-	{
-		for( int n = (int)vs->variables.GetLength() - 1; n >= 0; n-- )
-			CallDestructor(vs->variables[n]->type, vs->variables[n]->stackOffset, vs->variables[n]->onHeap, bc);
+	DestroyVariablesUntil(jumpTargets[ti].scope, bc);
 
-		vs = vs->parent;
-	}
-	bc->Block(false);
-
-	bc->InstrINT(asBC_JMP, continueLabels[continueLabels.GetLength()-1]);
+	bc->InstrINT(asBC_JMP, jumpTargets[ti].continueLabel);
 }
-
 void asCCompiler::CompileExpressionStatement(asCScriptNode *enode, asCByteCode *bc)
 {
 	if( enode->firstChild )
@@ -11308,12 +12386,12 @@ int asCCompiler::DoAssignment(asCExprContext *ctx, asCExprContext *lctx, asCExpr
 					m_initializedProperties.PushLast(prop);
 
 					// Give an error if the initialization is happening inside a loop or switch statement
-					if (continueLabels.GetLength() > 0)
+					if (InsideLoop())
 					{
 						// If a continue label is set we are in a loop
 						Error(TXT_CANNOT_INIT_MEMBERS_IN_LOOPS, opNode);
 					}
-					else if (breakLabels.GetLength() > 0)
+					else if (jumpTargets.GetLength() > 0)
 					{
 						// TODO: Should eventually allow initialization in switch statements
 						// If a break label is set we are either in a loop or a switch statements
@@ -15020,12 +16098,12 @@ int asCCompiler::CompileFunctionCall(asCScriptNode *node, asCExprContext *ctx, a
 				funcs = outFunc->objectType->derivedFrom->beh.constructors;
 
 			// Must not allow calling base class' constructor multiple times
-			if (continueLabels.GetLength() > 0)
+			if (InsideLoop())
 			{
 				// If a continue label is set we are in a loop
 				Error(TXT_CANNOT_CALL_CONSTRUCTOR_IN_LOOPS, node);
 			}
-			else if (breakLabels.GetLength() > 0)
+			else if (jumpTargets.GetLength() > 0)
 			{
 				// TODO: inheritance: Should eventually allow constructors in switch statements
 				// If a break label is set we are either in a loop or a switch statements

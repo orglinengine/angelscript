@@ -108,6 +108,11 @@ protected:
 	asCScriptNode *ParseStatement();
 	asCScriptNode *ParseExpressionStatement();
 	asCScriptNode *ParseSwitch();
+	asCScriptNode *ParseMatch();	// ORGLIN (ADR-0049)
+	asCScriptNode *ParseMatchArm();
+	asCScriptNode *ParseRedo();
+	bool IsMatchStatement();
+	bool IsRedoStatement();
 	asCScriptNode *ParseCase();
 	asCScriptNode *ParseIf();
 	asCScriptNode *ParseFor();

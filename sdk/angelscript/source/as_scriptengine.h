@@ -400,6 +400,9 @@ public:
 	// is the asEAnyKind of a registered function (0 = none, or the fast path is off).
 	asSAnyLayout   anyLayout;
 	int            AnyKindOf(asCScriptFunction *func) const;
+
+	// ORGLIN (ADR-0049): what match needs from the application (asEP_MATCH_SUPPORT).
+	asSMatchSupport matchCfg;
 	asCArray<int>                 freeScriptFunctionIds;
 	asCArray<asCScriptFunction *> signatureIds;
 
@@ -526,6 +529,8 @@ public:
 		bool   arrayLayoutSet;					// ORGLIN: arrayLayout below is valid
 		bool   tableLayoutSet;					// ORGLIN (ADR-0048): tableLayout is valid
 		bool   tableLiterals;					// ORGLIN (ADR-0048): `{ }` into any / ? builds table<string,any>
+		bool   matchSupport;					// ORGLIN (ADR-0049): match / => / redo / arm-head _ / loop labels
+		bool   disableSwitch;					// ORGLIN (ADR-0049 M5): switch is a compile error (default true)
 		bool   anyLayoutSet;					// ORGLIN: anyLayout is valid and the any fast path is on
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;

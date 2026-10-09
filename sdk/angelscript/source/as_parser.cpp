@@ -1278,7 +1278,7 @@ asCString asCParser::InsteadFound(sToken &t)
 		asCString id(&script->code[t.pos], t.length);
 		str.Format(TXT_INSTEAD_FOUND_IDENTIFIER_s, id.AddressOf());
 	}
-	else if( t.type >= ttIf )
+	else if( t.type >= ttIf && t.type != ttFatArrow )	// ORGLIN (ADR-0049): `=>` is a punctuator, not a reserved word
 		str.Format(TXT_INSTEAD_FOUND_KEYWORD_s, asCTokenizer::GetDefinition(t.type));
 	else
 		str.Format(TXT_INSTEAD_FOUND_s, asCTokenizer::GetDefinition(t.type));
@@ -4211,7 +4211,12 @@ asCScriptNode *asCParser::ParseStatementBlock()
 			{
 				RewindTo(&t1);
 
-				if( IsVarDecl() )
+				// ORGLIN (ADR-0049): contextual match / redo are decided BEFORE IsVarDecl (redo + line break + `x = 1` would read as the declaration `redo x = 1`).
+				if( IsMatchStatement() )
+					node->AddChildLast(ParseMatch());
+				else if( IsRedoStatement() )
+					node->AddChildLast(ParseRedo());
+				else if( IsVarDecl() )
 					node->AddChildLast(ParseDeclaration());
 				else
 					node->AddChildLast(ParseStatement());
@@ -4995,7 +5000,20 @@ asCScriptNode *asCParser::ParseStatement()
 	else if (t1.type == ttDo)
 		return ParseDoWhile();
 	else if (t1.type == ttSwitch)
+	{
+		// ORGLIN (ADR-0049 M5): with asEP_DISABLE_SWITCH (the default) the classic switch is a signpost error.
+		// The statement recovery in ParseStatementBlock skips the braces, so one error is reported.
+		if (engine->ep.disableSwitch)
+		{
+			Error(TXT_SWITCH_DOES_NOT_EXIST, &t1);
+			return 0;
+		}
 		return ParseSwitch();
+	}
+	else if (IsMatchStatement())
+		return ParseMatch();
+	else if (IsRedoStatement())
+		return ParseRedo();
 	else if (t1.type == ttTry)
 		return ParseTryCatch();
 	else
@@ -5058,6 +5076,216 @@ asCScriptNode *asCParser::ParseExpressionStatement()
 		return node;
 	}
 
+	return node;
+}
+
+// ORGLIN (ADR-0049): contextual `match`. A statement starting with the identifier `match`,
+// then `(`, a balanced `)`, then `{`. Anywhere else `match` is an ordinary identifier (`bool match = true`).
+bool asCParser::IsMatchStatement()
+{
+	if( !engine->ep.matchSupport ) return false;
+
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if( IdentifierIs(t, "match") )
+	{
+		GetToken(&t1);
+		if( t1.type == ttOpenParenthesis )
+		{
+			int nest = 1;
+			while( nest > 0 && t1.type != ttEnd )
+			{
+				GetToken(&t1);
+				if( t1.type == ttOpenParenthesis ) nest++;
+				else if( t1.type == ttCloseParenthesis ) nest--;
+			}
+			if( nest == 0 )
+			{
+				GetToken(&t1);
+				ok = t1.type == ttStartStatementBlock;
+			}
+		}
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+// ORGLIN (ADR-0049): contextual `redo`: the identifier alone, ended by `;`, a line break or `}`.
+// `redo = 1`, `redo++`, `redo(1)` on the same line, and `x.redo()` are not it.
+bool asCParser::IsRedoStatement()
+{
+	if( !engine->ep.matchSupport ) return false;
+
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if( IdentifierIs(t, "redo") )
+	{
+		GetToken(&t1);
+		ok = t1.type == ttEndStatement || t1.type == ttEndStatementBlock || t1.type == ttEnd ||
+		     OptionalStatementTerminatorIsNewLine(t1);
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+asCScriptNode *asCParser::ParseRedo()
+{
+	asCScriptNode *node = CreateNode(snRedo);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+
+	GetToken(&t);
+	if( t.type == ttEndStatementBlock || t.type == ttEnd || (t.type != ttEndStatement && OptionalStatementTerminatorIsNewLine(t)) )
+		RewindTo(&t);
+	return node;
+}
+
+// MATCH ::= 'match' '(' ASSIGN ')' '{' ARM+ '}'      children: [scrutinee, arm...]
+asCScriptNode *asCParser::ParseMatch()
+{
+	asCScriptNode *node = CreateNode(snMatch);
+	if( node == 0 ) return 0;
+
+	sToken t;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+
+	GetToken(&t);
+	if( t.type != ttOpenParenthesis ) { Error(ExpectedToken("("), &t); Error(InsteadFound(t), &t); return node; }
+
+	node->AddChildLast(ParseAssignment());
+	if( isSyntaxError ) return node;
+
+	GetToken(&t);
+	if( t.type != ttCloseParenthesis ) { Error(ExpectedToken(")"), &t); Error(InsteadFound(t), &t); return node; }
+
+	GetToken(&t);
+	if( t.type != ttStartStatementBlock ) { Error(ExpectedToken("{"), &t); Error(InsteadFound(t), &t); return node; }
+
+	for(;;)
+	{
+		GetToken(&t);
+		if( t.type == ttEndStatementBlock ) break;
+		if( t.type == ttEnd ) { Error(TXT_UNEXPECTED_END_OF_FILE, &t); return node; }
+		RewindTo(&t);
+		node->AddChildLast(ParseMatchArm());
+		if( isSyntaxError )
+		{
+			// skip the rest of the match so one bad arm head is one error, not a cascade of statements
+			int level = 1;
+			while( level > 0 )
+			{
+				GetToken(&t);
+				if( t.type == ttStartStatementBlock ) level++;
+				else if( t.type == ttEndStatementBlock ) level--;
+				else if( t.type == ttEnd ) { RewindTo(&t); break; }
+			}
+			isSyntaxError = false;
+			return node;
+		}
+	}
+	return node;
+}
+
+// ARM  ::= HEAD '=>' STATBLOCK
+// HEAD ::= '_' | EXPR (',' EXPR)* ('if' ASSIGN)? | 'if' ASSIGN
+// children: [pattern EXPR...] [snCondition(guard)]? STATBLOCK      (no pattern and no guard = the catch-all)
+asCScriptNode *asCParser::ParseMatchArm()
+{
+	asCScriptNode *node = CreateNode(snMatchArm);
+	if( node == 0 ) return 0;
+
+	sToken t, t1;
+	GetToken(&t);
+	node->UpdateSourcePos(t.pos, t.length);
+	RewindTo(&t);
+
+	bool catchAll = false;
+	if( IdentifierIs(t, "_") )
+	{
+		// contextual: `_` is the catch-all only as the WHOLE head (`_` directly followed by `=>`)
+		GetToken(&t1);
+		GetToken(&t1);
+		if( t1.type == ttFatArrow ) catchAll = true;
+		else if( t1.type == ttIf ) { Error(TXT_MATCH_UNDERSCORE_NO_GUARD, &t1); return node; }
+		else if( t1.type == ttListSeparator ) { Error(TXT_MATCH_UNDERSCORE_WHOLE_HEAD, &t1); return node; }
+		RewindTo(&t);
+	}
+	else if( t.type == ttDefault )
+	{
+		Error(TXT_MATCH_NO_DEFAULT, &t);
+		return node;
+	}
+
+	if( catchAll )
+	{
+		GetToken(&t1);	// '_'
+		GetToken(&t1);	// '=>'
+	}
+	else
+	{
+		bool guardOnly = t.type == ttIf;
+		if( !guardOnly )
+		{
+			for(;;)
+			{
+				node->AddChildLast(ParseExpression());
+				if( isSyntaxError ) return node;
+				GetToken(&t1);
+				if( t1.type == ttListSeparator )
+				{
+					sToken a, b;
+					GetToken(&a);
+					GetToken(&b);
+					RewindTo(&a);
+					if( IdentifierIs(a, "_") && (b.type == ttFatArrow || b.type == ttListSeparator) )
+					{
+						Error(TXT_MATCH_UNDERSCORE_WHOLE_HEAD, &a);
+						return node;
+					}
+					continue;
+				}
+				RewindTo(&t1);
+				break;
+			}
+			GetToken(&t1);
+			RewindTo(&t1);
+		}
+		else
+			t1 = t;
+
+		if( t1.type == ttIf )
+		{
+			GetToken(&t1);
+			asCScriptNode *g = CreateNode(snCondition);
+			if( g == 0 ) return node;
+			g->AddChildLast(ParseAssignment());
+			node->AddChildLast(g);
+			if( isSyntaxError ) return node;
+		}
+
+		GetToken(&t1);
+		if( t1.type != ttFatArrow )
+		{
+			Error(ExpectedToken("=>"), &t1);
+			Error(InsteadFound(t1), &t1);
+			return node;
+		}
+	}
+
+	GetToken(&t1);
+	RewindTo(&t1);
+	if( t1.type != ttStartStatementBlock )
+	{
+		Error(TXT_MATCH_ARM_BODY_BLOCK, &t1);
+		return node;
+	}
+	node->AddChildLast(ParseStatementBlock());
 	return node;
 }
 
@@ -5296,6 +5524,14 @@ asCScriptNode *asCParser::ParseFor()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	GetToken(&t);
+	// ORGLIN (ADR-0049 M4): an identifier between the keyword and '(' names the loop (`for outer (...)`)
+	if( engine->ep.matchSupport && t.type == ttIdentifier )
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if( isSyntaxError ) return node;
+		GetToken(&t);
+	}
 	if( t.type != ttOpenParenthesis)
 	{
 		Error(ExpectedToken("("), &t);
@@ -5364,6 +5600,14 @@ asCScriptNode *asCParser::ParseForEach()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	GetToken(&t);
+	// ORGLIN (ADR-0049 M4): an identifier between the keyword and '(' names the loop
+	if (engine->ep.matchSupport && t.type == ttIdentifier)
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if (isSyntaxError) return node;
+		GetToken(&t);
+	}
 	if (t.type != ttOpenParenthesis)
 	{
 		Error(ExpectedToken("("), &t);
@@ -5432,6 +5676,14 @@ asCScriptNode *asCParser::ParseWhile()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	GetToken(&t);
+	// ORGLIN (ADR-0049 M4): an identifier between the keyword and '(' names the loop
+	if( engine->ep.matchSupport && t.type == ttIdentifier )
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if( isSyntaxError ) return node;
+		GetToken(&t);
+	}
 	if( t.type != ttOpenParenthesis)
 	{
 		Error(ExpectedToken("("), &t);
@@ -5471,6 +5723,21 @@ asCScriptNode *asCParser::ParseDoWhile()
 	}
 
 	node->UpdateSourcePos(t.pos, t.length);
+
+	// ORGLIN (ADR-0049 M4): an identifier directly followed by '{' names the loop (`do outer { ... } while (...)`);
+	// a statement never starts that way (an initializer block is not a statement).
+	if( engine->ep.matchSupport )
+	{
+		sToken l1, l2;
+		GetToken(&l1);
+		GetToken(&l2);
+		RewindTo(&l1);
+		if( l1.type == ttIdentifier && l2.type == ttStartStatementBlock )
+		{
+			node->AddChildLast(ParseIdentifier());
+			if( isSyntaxError ) return node;
+		}
+	}
 
 	node->AddChildLast(ParseStatement());
 	if( isSyntaxError ) return node;
@@ -5590,6 +5857,14 @@ asCScriptNode *asCParser::ParseBreak()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	GetToken(&t);
+	// ORGLIN (ADR-0049 M4): `break outer` names an enclosing loop; the label is on the same line as the keyword.
+	if( engine->ep.matchSupport && t.type == ttIdentifier && !OptionalStatementTerminatorIsNewLine(t) )
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if( isSyntaxError ) return node;
+		GetToken(&t);
+	}
 	if( t.type != ttEndStatement )
 	{
 		// ORGLIN: a line break (or the enclosing '}') also terminates the break
@@ -5626,6 +5901,14 @@ asCScriptNode *asCParser::ParseContinue()
 	node->UpdateSourcePos(t.pos, t.length);
 
 	GetToken(&t);
+	// ORGLIN (ADR-0049 M4): `continue outer` names an enclosing loop; the label is on the same line as the keyword.
+	if( engine->ep.matchSupport && t.type == ttIdentifier && !OptionalStatementTerminatorIsNewLine(t) )
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if( isSyntaxError ) return node;
+		GetToken(&t);
+	}
 	if( t.type != ttEndStatement )
 	{
 		// ORGLIN: a line break (or the enclosing '}') also terminates the continue

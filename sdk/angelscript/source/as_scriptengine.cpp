@@ -390,6 +390,30 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.tableLiterals = value != 0;
 		break;
 
+	// ORGLIN (ADR-0049): match support. The `=>` token is added to / removed from the keyword table.
+	case asEP_MATCH_SUPPORT:
+		if( value != 0 )
+		{
+			const asSMatchSupport &in = *(const asSMatchSupport*)value;
+			if( in.size != (int)sizeof(asSMatchSupport) || in.redoLimit < 0 )
+				return asINVALID_ARG;
+			const int ids[] = { in.redoOverflowFunc, in.matchFunc, in.capStringFunc, in.capIntFunc, in.capUintFunc, in.capDoubleFunc, in.capBoolFunc };
+			for( asUINT n = 0; n < sizeof(ids)/sizeof(ids[0]); n++ )
+				if( ids[n] < 0 || ids[n] >= (int)scriptFunctions.GetLength() || (ids[n] > 0 && scriptFunctions[ids[n]] == 0) )
+					return asINVALID_ARG;
+			matchCfg = in;
+			if( matchCfg.redoLimit == 0 )
+				matchCfg.redoLimit = 1000;
+		}
+		ep.matchSupport = value != 0;
+		tok.InitJumpTable();
+		break;
+
+	// ORGLIN (ADR-0049 M5): switch is a compile error that points at match.
+	case asEP_DISABLE_SWITCH:
+		ep.disableSwitch = value != 0;
+		break;
+
 	// ORGLIN (ADR-0048): the table layout.
 	case asEP_TABLE_LAYOUT:
 	{
@@ -691,6 +715,12 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_TABLE_LITERALS:
 		return ep.tableLiterals;
 
+	case asEP_MATCH_SUPPORT:
+		return ep.matchSupport ? (asPWORD)&matchCfg : 0;
+
+	case asEP_DISABLE_SWITCH:
+		return ep.disableSwitch;
+
 	// ORGLIN: the any layout.
 	case asEP_ANY_LAYOUT:
 		return ep.anyLayoutSet ? (asPWORD)&anyLayout : 0;
@@ -842,6 +872,11 @@ asCScriptEngine::asCScriptEngine()
 		ep.fstringFormatFunc             = 0;		// ORGLIN: no f-string function (f"..." is a plain string)
 		ep.loopSuspend                   = true;	// ORGLIN: upstream behaviour
 		ep.tableLayoutSet                = false;	// ORGLIN (ADR-0048)
+		ep.matchSupport                  = false;	// ORGLIN (ADR-0049)
+		ep.disableSwitch                 = true;	// ORGLIN (ADR-0049 M5): `switch` is an error that points at `match`
+		memset(&matchCfg, 0, sizeof(matchCfg));
+		matchCfg.size                    = (int)sizeof(asSMatchSupport);
+		matchCfg.redoLimit               = 1000;
 	ep.tableLiterals                 = false;	// ORGLIN (ADR-0048): literals into any / ? stay dictionaries until the content is migrated
 	ep.arrayLayoutSet                = false;	// ORGLIN: no array fast path until the application describes its array
 		ep.anyLayoutSet                  = false;	// ORGLIN: no any fast path until the application describes its value type

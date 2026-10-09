@@ -254,7 +254,37 @@ enum asEEngineProp
 	// (the default) it builds the legacy `dictionary`. Off until the content is migrated to table.
 	asEP_TABLE_LITERALS                     = 51,
 
+	// ORGLIN (ADR-0049): `match`, `=>`, contextual `redo`, arm-head `_`, loop labels and f-string
+	// patterns. The value is a pointer to an asSMatchSupport (copied by the engine), or 0 for off.
+	asEP_MATCH_SUPPORT                      = 52,
+
+	// ORGLIN (ADR-0049 M5): when on (the default) `switch`/`case`/`default` are a compile error that
+	// points at `match`. Off restores the classic switch statement untouched.
+	asEP_DISABLE_SWITCH                     = 53,
+
 	asEP_LAST_PROPERTY
+};
+
+// ORGLIN (ADR-0049): what `match` needs from the application. Function ids are registered
+// functions (0 = not provided; the construct that needs one is then a compile error).
+//   redoOverflowFunc  void f()                   raises the script exception when a match redoes more than redoLimit times
+//   matchFunc         bool f(const string &in subject, const string &in program)     f-pattern attempt; keeps the captures
+//   capStringFunc     string f(uint i)           capture i as text
+//   capIntFunc        int64 f(uint i)            capture i as a signed integer
+//   capUintFunc       uint64 f(uint i)           capture i as an unsigned integer
+//   capDoubleFunc     double f(uint i)           capture i as a floating point number
+//   capBoolFunc       bool f(uint i)             capture i as a bool
+struct asSMatchSupport
+{
+	int size;                // sizeof(asSMatchSupport), checked by the engine
+	int redoLimit;           // redo passes allowed per entry of a match; 0 = the default (1000)
+	int redoOverflowFunc;
+	int matchFunc;
+	int capStringFunc;
+	int capIntFunc;
+	int capUintFunc;
+	int capDoubleFunc;
+	int capBoolFunc;
 };
 
 // ORGLIN: what the VM may do inline for the application's value type (asEP_ANY_LAYOUT).

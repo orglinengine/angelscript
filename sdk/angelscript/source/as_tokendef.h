@@ -180,7 +180,8 @@ enum eTokenType
 	ttAuto,                // auto
 	ttTry,                 // try
 	ttCatch,               // catch
-	ttUsing                // using
+	ttUsing,               // using
+	ttFatArrow             // =>   ORGLIN (ADR-0049): only a token with asEP_MATCH_SUPPORT
 };
 
 struct sTokenWord
@@ -210,6 +211,7 @@ sTokenWord const tokenWords[] =
 	asTokenDef("**="       , ttPowAssign),
 	asTokenDef("="         , ttAssignment),
 	asTokenDef("=="        , ttEqual),
+	asTokenDef("=>"        , ttFatArrow),
 	asTokenDef("."         , ttDot),
 	asTokenDef("..."       , ttVariadic),
 	asTokenDef("|"         , ttBitOr),
