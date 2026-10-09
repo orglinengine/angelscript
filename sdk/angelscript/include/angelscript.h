@@ -270,6 +270,9 @@ enum asEEngineProp
 	// `for (T x : t)`. Off restores the classic foreach statement untouched.
 	asEP_DISABLE_FOREACH                    = 55,
 
+	// ORGLIN (S-12): `(params) => expr | { block }` lambdas (the `=>` token, as with match support). Off by default.
+	asEP_ARROW_LAMBDAS                      = 56,
+
 	asEP_LAST_PROPERTY
 };
 

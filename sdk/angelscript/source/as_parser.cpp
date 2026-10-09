@@ -72,6 +72,7 @@ asCParser::asCParser(asCBuilder *builder) : lastToken()
 	isParsingAppInterface = false;
 	errorWhileParsing     = false;
 	isSyntaxError         = false;
+	noArrowLambda         = 0;
 	sourcePos             = 0;
 }
 
@@ -86,6 +87,7 @@ void asCParser::Reset()
 	isSyntaxError         = false;
 	checkValidTypes       = false;
 	isParsingAppInterface = false;
+	noArrowLambda = 0;
 
 	sourcePos = 0;
 
@@ -1772,6 +1774,8 @@ asCScriptNode *asCParser::ParseExprValue()
 		node->AddChildLast(ParseCast());
 	else if( IsConstant(t1.type) )
 		node->AddChildLast(ParseConstant());
+	else if( t1.type == ttOpenParenthesis && IsArrowLambda() )
+		node->AddChildLast(ParseLambda(true));
 	else if( t1.type == ttOpenParenthesis)
 	{
 		GetToken(&t1);
@@ -1918,7 +1922,12 @@ bool asCParser::FindIdentifierAfterScope(sToken& identifierToken)
 }
 
 // BNF:12: LAMBDA        ::= 'function' '(' ((TYPE TYPEMOD)? IDENTIFIER? (',' (TYPE TYPEMOD)? IDENTIFIER?)*)? ')' STATBLOCK
-asCScriptNode *asCParser::ParseLambda()
+// ORGLIN (S-12): `(params) => expr` and `(params) => { block }` lower onto the same snFunction node as
+// `function(params) { block }`; the parameter types come from the destination funcdef either way. An
+// expression body becomes a snStatementBlock flagged with ttFatArrow whose tokenPos is the expression start
+// (the compiler re-parses it as `return expr;` or `expr;` once the funcdef's return type is known).
+// BNF: ARROWLAMBDA ::= '(' ((TYPE TYPEMOD)? IDENTIFIER? (',' (TYPE TYPEMOD)? IDENTIFIER?)*)? ')' '=>' (STATBLOCK | ASSIGN)
+asCScriptNode *asCParser::ParseLambda(bool arrow)
 {
 	asCScriptNode *node = CreateNode(snFunction);
 	if( node == 0 ) return 0;
@@ -1926,13 +1935,14 @@ asCScriptNode *asCParser::ParseLambda()
 	sToken t;
 	GetToken(&t);
 
-	if( t.type != ttIdentifier || !IdentifierIs(t, FUNCTION_TOKEN) )
+	if( !arrow && (t.type != ttIdentifier || !IdentifierIs(t, FUNCTION_TOKEN)) )
 	{
 		Error(ExpectedToken("function"), &t);
 		return node;
 	}
 
-	GetToken(&t);
+	if( !arrow )
+		GetToken(&t);
 	if( t.type != ttOpenParenthesis)
 	{
 		Error(ExpectedToken("("), &t);
@@ -1991,11 +2001,139 @@ asCScriptNode *asCParser::ParseLambda()
 		return node;
 	}
 
+	if( arrow )
+	{
+		GetToken(&t);
+		if( t.type != ttFatArrow )
+		{
+			Error(ExpectedToken("=>"), &t);
+			return node;
+		}
+
+		GetToken(&t);
+		RewindTo(&t);
+		if( t.type != ttStartStatementBlock )
+		{
+			// Expression body: parse it once to find its end, the compiler parses it again
+			asCScriptNode *block = CreateNode(snStatementBlock);
+			if( block == 0 ) return node;
+			const size_t start = t.pos;
+			asCScriptNode *expr = ParseAssignment();
+			if( expr ) expr->Destroy(engine);
+			if( isSyntaxError ) { block->Destroy(engine); return node; }
+			block->tokenType   = ttFatArrow;
+			block->tokenPos    = start;
+			block->tokenLength = sourcePos - start;
+			node->AddChildLast(block);
+			return node;
+		}
+	}
+
 	// We should just find the end of the statement block here. The statements
 	// will be parsed on request by the compiler once it starts the compilation.
 	node->AddChildLast(SuperficiallyParseStatementBlock());
 
 	return node;
+}
+
+// ORGLIN (S-12): `(` params `)` `=>` lookahead. A parenthesised expression never looks like a parameter list
+// followed by `=>` except inside a match-arm head (`1 if (flag) =>`), where noArrowLambda switches this off.
+bool asCParser::IsArrowLambda()
+{
+	if( noArrowLambda > 0 || !engine->ep.arrowLambdas ) return false;
+
+	sToken start, t;
+	GetToken(&start);
+	bool result = false;
+	if( start.type == ttOpenParenthesis )
+	{
+		int depth = 1;
+		for(;;)
+		{
+			GetToken(&t);
+			if( t.type == ttOpenParenthesis ) depth++;
+			else if( t.type == ttCloseParenthesis && --depth == 0 ) break;
+			else if( t.type == ttEnd || t.type == ttEndStatement || t.type == ttStartStatementBlock || t.type == ttEndStatementBlock )
+			{
+				depth = -1;
+				break;
+			}
+		}
+		if( depth == 0 )
+		{
+			GetToken(&t);
+			result = t.type == ttFatArrow;
+		}
+	}
+	RewindTo(&start);
+	return result;
+}
+
+// ORGLIN (S-12): the raw-text adjacency checks below keep `a ? .5 : b` and `a ? b : c` unambiguous: `?.` is a
+// null-safe access only when `?` is directly followed by `.` and then an identifier start; `??` only when two
+// `?` touch.
+bool asCParser::IsNullSafeDot(const sToken &t)
+{
+	if( t.type != ttQuestion || t.pos + 2 >= script->codeLength ) return false;
+	const char *c = &script->code[t.pos];
+	return c[1] == '.' && (c[2] == '_' || (c[2] >= 'a' && c[2] <= 'z') || (c[2] >= 'A' && c[2] <= 'Z'));
+}
+
+bool asCParser::IsCoalesceOp(const sToken &t)
+{
+	if( t.type != ttQuestion || t.pos + 1 >= script->codeLength ) return false;
+	return script->code[t.pos + 1] == '?';
+}
+
+// BNF: COALESCE ::= EXPR ('??' COALESCE)?     (right associative; binds looser than every EXPR operator, tighter than '?:' and '=')
+// A plain EXPR (no '??') is returned as is, so everything that expects CONDITION's first child to be an
+// snExpression keeps working; with '??' the result is an snCoalesce [lhs snExpression, rhs snExpression | snCoalesce].
+asCScriptNode *asCParser::ParseCoalesce()
+{
+	asCScriptNode *lhs = ParseExpression();
+	if( lhs == 0 || isSyntaxError ) return lhs;
+
+	sToken t;
+	GetToken(&t);
+	if( !IsCoalesceOp(t) )
+	{
+		RewindTo(&t);
+		return lhs;
+	}
+
+	asCScriptNode *node = CreateNode(snCoalesce);
+	if( node == 0 ) return lhs;
+	node->UpdateSourcePos(t.pos, 2);
+	node->AddChildLast(lhs);
+
+	GetToken(&t);	// the second '?'
+	node->AddChildLast(ParseCoalesce());
+	return node;
+}
+
+// ORGLIN (S-12): the compiler's re-parse of an `=> expr` lambda body, from the expression start. Builds
+// `{ return expr; }` (wantReturn) or `{ expr; }` so the rest of the pipeline sees an ordinary block.
+int asCParser::ParseExprBody(asCScriptCode *in_script, asCScriptNode *in_block, bool wantReturn)
+{
+	Reset();
+	checkValidTypes = true;
+	this->script = in_script;
+	sourcePos = in_block->tokenPos;
+
+	asCScriptNode *block = CreateNode(snStatementBlock);
+	asCScriptNode *stmt  = CreateNode(wantReturn ? snReturn : snExpressionStatement);
+	if( block == 0 || stmt == 0 ) return -1;
+	scriptNode = block;
+	block->AddChildLast(stmt);
+
+	stmt->AddChildLast(ParseAssignment());
+	if( isSyntaxError || errorWhileParsing ) return -1;
+
+	block->tokenPos = in_block->tokenPos;
+	block->tokenLength = in_block->tokenLength;
+	stmt->tokenPos = in_block->tokenPos;
+	stmt->tokenLength = in_block->tokenLength;
+	return 0;
 }
 
 asCScriptNode *asCParser::ParseStringConstant()
@@ -2249,7 +2387,7 @@ asCScriptNode *asCParser::ParseCondition()
 	asCScriptNode *node = CreateNode(snCondition);
 	if( node == 0 ) return 0;
 
-	node->AddChildLast(ParseExpression());
+	node->AddChildLast(ParseCoalesce());	// ORGLIN (S-12): an snExpression, or an snCoalesce when `??` is present
 	if( isSyntaxError ) return node;
 
 	sToken t;
@@ -2382,7 +2520,7 @@ asCScriptNode *asCParser::ParseExprTerm()
 	{
 		GetToken(&t);
 		RewindTo(&t);
-		if( !IsPostOperator(t.type) )
+		if( !IsPostOperator(t.type) && !IsNullSafeDot(t) )
 			return node;
 
 		// ORGLIN: with optional statement termination a '++'/'--' that begins a new
@@ -2430,7 +2568,7 @@ asCScriptNode *asCParser::ParseExprPostOp()
 
 	sToken t;
 	GetToken(&t);
-	if( !IsPostOperator(t.type) )
+	if( !IsPostOperator(t.type) && !IsNullSafeDot(t) )
 	{
 		Error(TXT_EXPECTED_POST_OPERATOR, &t);
 		Error(InsteadFound(t), &t);
@@ -2440,7 +2578,22 @@ asCScriptNode *asCParser::ParseExprPostOp()
 	node->SetToken(&t);
 	node->UpdateSourcePos(t.pos, t.length);
 
-	if( t.type == ttDot )
+	if( t.type == ttQuestion )
+	{
+		// ORGLIN (S-12): `?.` — the node keeps tokenType ttQuestion, then looks like the `.` form
+		sToken dot;
+		GetToken(&dot);
+		node->UpdateSourcePos(dot.pos, dot.length);
+		sToken t1, t2;
+		GetToken(&t1);
+		GetToken(&t2);
+		RewindTo(&t1);
+		if (t2.type == ttOpenParenthesis || IsTemplateTypeList(t2))
+			node->AddChildLast(ParseFunctionCall());
+		else
+			node->AddChildLast(ParseIdentifier());
+	}
+	else if( t.type == ttDot )
 	{
 		sToken t1, t2;
 		GetToken(&t1);
@@ -5375,7 +5528,9 @@ asCScriptNode *asCParser::ParseMatchArm()
 		{
 			for(;;)
 			{
+				noArrowLambda++;
 				node->AddChildLast(ParseExpression());
+				noArrowLambda--;
 				if( isSyntaxError ) return node;
 				GetToken(&t1);
 				if( t1.type == ttListSeparator )
@@ -5405,7 +5560,9 @@ asCScriptNode *asCParser::ParseMatchArm()
 			GetToken(&t1);
 			asCScriptNode *g = CreateNode(snCondition);
 			if( g == 0 ) return node;
+			noArrowLambda++;
 			g->AddChildLast(ParseAssignment());
+			noArrowLambda--;
 			node->AddChildLast(g);
 			if( isSyntaxError ) return node;
 		}

@@ -532,6 +532,7 @@ public:
 		bool   arrayLayoutSet;					// ORGLIN: arrayLayout below is valid
 		bool   tableLayoutSet;					// ORGLIN (ADR-0048): tableLayout is valid
 		bool   tableLiterals;					// ORGLIN (ADR-0048): `{ }` into any / ? builds table<string,any>
+		bool   arrowLambdas;					// ORGLIN (S-12): `(params) => body` lambdas (the `=>` token)
 		bool   matchSupport;					// ORGLIN (ADR-0049): match / => / redo / arm-head _ / loop labels
 		bool   coroutineSupport;				// ORGLIN (ADR-0051): contextual yield / await / spawn
 		bool   disableSwitch;					// ORGLIN (ADR-0049 M5): switch is a compile error (default true)

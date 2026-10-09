@@ -440,6 +440,12 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.disableForeach = value != 0;
 		break;
 
+	// ORGLIN (S-12): arrow lambdas. The `=>` token is added to / removed from the keyword table.
+	case asEP_ARROW_LAMBDAS:
+		ep.arrowLambdas = value != 0;
+		tok.InitJumpTable();
+		break;
+
 	// ORGLIN (ADR-0048): the table layout.
 	case asEP_TABLE_LAYOUT:
 	{
@@ -750,6 +756,9 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_DISABLE_FOREACH:
 		return ep.disableForeach;
 
+	case asEP_ARROW_LAMBDAS:
+		return ep.arrowLambdas;
+
 	case asEP_COROUTINE_SUPPORT:
 		return ep.coroutineSupport ? (asPWORD)&coCfg : 0;
 
@@ -904,6 +913,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.fstringFormatFunc             = 0;		// ORGLIN: no f-string function (f"..." is a plain string)
 		ep.loopSuspend                   = true;	// ORGLIN: upstream behaviour
 		ep.tableLayoutSet                = false;	// ORGLIN (ADR-0048)
+		ep.arrowLambdas                  = false;	// ORGLIN (S-12)
 		ep.matchSupport                  = false;	// ORGLIN (ADR-0049)
 		ep.disableSwitch                 = true;	// ORGLIN (ADR-0049 M5): `switch` is an error that points at `match`
 		ep.disableForeach                = true;	// ORGLIN (ADR-0052): `foreach` is an error that points at `for (T x : t)`

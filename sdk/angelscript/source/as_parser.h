@@ -63,6 +63,7 @@ public:
 
 	// Called from compiler
 	int ParseStatementBlock(asCScriptCode *script, asCScriptNode *block);
+	int ParseExprBody(asCScriptCode *script, asCScriptNode *block, bool wantReturn);	// ORGLIN (S-12): `=> expr` lambda body
 	int ParseVarInit(asCScriptCode *script, asCScriptNode *init);
 	int ParseExpression(asCScriptCode *script);
 #endif
@@ -164,6 +165,11 @@ protected:
 	bool IsVirtualPropertyDecl();
 	bool IsFuncDecl(bool isMethod);
 	bool IsLambda();
+	// ORGLIN (S-12): `(params) => expr | { block }`, `a ?? b`, `x?.y`
+	bool IsArrowLambda();
+	bool IsNullSafeDot(const sToken &t);
+	bool IsCoalesceOp(const sToken &t);
+	asCScriptNode *ParseCoalesce();
 	bool IsFunctionCall(bool isTemplate);
 	bool IsTemplateTypeList(sToken startFrom, sToken *after = 0);
 
@@ -184,7 +190,7 @@ protected:
 	asCScriptNode *ParseCast();
 	asCScriptNode *ParseConstant();
 	asCScriptNode *ParseStringConstant();
-	asCScriptNode *ParseLambda();
+	asCScriptNode *ParseLambda(bool arrow = false);
 
 	bool FindTokenAfterType(sToken &nextToken);
 	bool FindIdentifierAfterScope(sToken& nextToken);
@@ -231,6 +237,7 @@ protected:
 	bool isSyntaxError;
 	bool checkValidTypes;
 	bool isParsingAppInterface;
+	int  noArrowLambda;		// ORGLIN (S-12): >0 while a match-arm head is parsed (`(x) =>` there is a pattern, not a lambda)
 
 	asCScriptEngine *engine;
 	asCBuilder      *builder;

@@ -316,6 +316,11 @@ protected:
 	// Expressions
 	int  CompileAssignment(asCScriptNode *expr, asCExprContext *out);
 	int  CompileCondition(asCScriptNode *expr, asCExprContext *out);
+	// ORGLIN (S-12): `a ?? b` and `x?.y`, both built on the ternary's tail
+	int  CompileConditionTail(asCScriptNode *expr, asCScriptNode *lnode, asCScriptNode *rnode, asCExprContext &e, asCExprContext &le, asCExprContext &re, asCExprContext *out);
+	int  CompileCoalesceOperand(asCScriptNode *node, asCExprContext *out);
+	int  CompileCoalesce(asCScriptNode *node, asCExprContext *out);
+	int  CompileNullSafeChain(asCScriptNode *first, asCExprContext *ctx);
 	int  CompileExpression(asCScriptNode *expr, asCExprContext *out);
 	int  CompilePostFixExpression(asCArray<asCScriptNode *> *postfix, asCExprContext *out);
 	int  CompileExpressionTerm(asCScriptNode *node, asCExprContext *out);
@@ -324,6 +329,7 @@ protected:
 	int  IndexAccessMode(asCScriptNode *node);   // SPIKE-PATCH-9
 	int  CompileOpIndexCall(asCScriptNode *node, asCExprContext *ctx, asCArray<asCExprContext*> &args);   // SPIKE-PATCH-9
 	int  CompileTableDot(asCScriptNode *node, asCExprContext *ctx);   // SPIKE-PATCH-11
+	int  CompileAnyDot(asCScriptNode *node, asCExprContext *ctx);     // `any` forwards `.name` to its get/set_opIndex
 	void CompileTableLiteral(asCExprValue *var, asCScriptNode *node, asCByteCode *bc, int isVarGlobOrMem);   // SPIKE-PATCH-10
 	int  TableLiteralCall(asCScriptNode *node, int objOffset, const asCDataType &hdt, asCObjectType *ot, const char *method, asCArray<asCExprContext*> &args, asCByteCode *bc);   // SPIKE-PATCH-10
 	int  CompileExpressionValue(asCScriptNode *node, asCExprContext *out);
@@ -391,6 +397,7 @@ protected:
 	void ConvertToPostFix(asCScriptNode *expr, asCArray<asCScriptNode *> &postfix);
 	int  ProcessPropertyGetAccessor(asCExprContext *ctx, asCScriptNode *node);
 	int  ProcessPropertySetAccessor(asCExprContext *ctx, asCExprContext *arg, asCScriptNode *node);
+	int  CompileIncDecOnProperty(asCExprContext *ctx, eTokenType op, asCScriptNode *node);
 	int  ProcessPropertyGetSetAccessor(asCExprContext *ctx, asCExprContext *lctx, asCExprContext *rctx, eTokenType op, asCScriptNode *errNode);
 	int  FindPropertyAccessor(const asCString &name, asCExprContext *ctx, asCScriptNode *node, asSNameSpace *ns, bool isThisAccess = false);
 	int  FindPropertyAccessor(const asCString &name, asCExprContext *ctx, asCExprContext *arg, asCScriptNode *node, asSNameSpace *ns, bool isThisAccess = false);
@@ -427,6 +434,7 @@ protected:
 	asSNameSpace *DetermineNameSpace(const asCString &scope);
 	int  SetupParametersAndReturnVariable(asCArray<asCString> &parameterNames, asCScriptNode *func);
 	int  InstantiateTemplateFunctions(asCArray<int>& funcs, asCScriptNode* node);
+	int  DeduceTemplateFunctions(asCArray<int>& funcs, asCArray<asCExprContext*>& args, asCScriptNode* node);
 	asCString BuildLambdaSignature(asCScriptNode* node);
 
 	enum SYMBOLTYPE

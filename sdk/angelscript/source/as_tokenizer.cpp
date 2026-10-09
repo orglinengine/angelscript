@@ -83,7 +83,7 @@ void asCTokenizer::InitJumpTable()
 		// Check if a token must be skipped due to engine properties
 		if (current.tokenType == ttForEach && engine && !engine->ep.foreachSupport)
 			continue;
-		if (current.tokenType == ttFatArrow && !(engine && engine->ep.matchSupport))
+		if (current.tokenType == ttFatArrow && !(engine && (engine->ep.matchSupport || engine->ep.arrowLambdas)))
 			continue;
 
 		unsigned char start = current.word[0];
