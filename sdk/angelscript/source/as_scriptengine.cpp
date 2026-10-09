@@ -435,6 +435,11 @@ int asCScriptEngine::SetEngineProperty(asEEngineProp property, asPWORD value)
 		ep.disableSwitch = value != 0;
 		break;
 
+	// ORGLIN (ADR-0052): foreach is a compile error that points at for-in.
+	case asEP_DISABLE_FOREACH:
+		ep.disableForeach = value != 0;
+		break;
+
 	// ORGLIN (ADR-0048): the table layout.
 	case asEP_TABLE_LAYOUT:
 	{
@@ -742,6 +747,9 @@ asPWORD asCScriptEngine::GetEngineProperty(asEEngineProp property) const
 	case asEP_DISABLE_SWITCH:
 		return ep.disableSwitch;
 
+	case asEP_DISABLE_FOREACH:
+		return ep.disableForeach;
+
 	case asEP_COROUTINE_SUPPORT:
 		return ep.coroutineSupport ? (asPWORD)&coCfg : 0;
 
@@ -898,6 +906,7 @@ asCScriptEngine::asCScriptEngine()
 		ep.tableLayoutSet                = false;	// ORGLIN (ADR-0048)
 		ep.matchSupport                  = false;	// ORGLIN (ADR-0049)
 		ep.disableSwitch                 = true;	// ORGLIN (ADR-0049 M5): `switch` is an error that points at `match`
+		ep.disableForeach                = true;	// ORGLIN (ADR-0052): `foreach` is an error that points at `for (T x : t)`
 		memset(&matchCfg, 0, sizeof(matchCfg));
 		matchCfg.size                    = (int)sizeof(asSMatchSupport);
 		matchCfg.redoLimit               = 1000;
@@ -1081,6 +1090,12 @@ int asCScriptEngine::IsArrayAt(asCScriptFunction *func) const
 		return (L.servedFlags & 2) != 0 ? which : 0;
 	}
 	return which;
+}
+// ORGLIN (ADR-0052): is this the application table's opIndex (either overload), whether or not the VM serves its element type?
+bool asCScriptEngine::IsTableAt(asCScriptFunction *func) const
+{
+	return ep.tableLayoutSet && func && func->sysFuncIntf &&
+	       (func->sysFuncIntf->func == tableAtFunc[0] || func->sysFuncIntf->func == tableAtFunc[1]);
 }
 // ORGLIN: the asEAnyKind of a registered function (0 when the fast path is off)
 int asCScriptEngine::AnyKindOf(asCScriptFunction *func) const

@@ -105,7 +105,8 @@ enum eScriptNode
 	snRedo,          // ORGLIN (ADR-0049)
 	snYield,         // ORGLIN (ADR-0051): statement
 	snAwait,         // ORGLIN (ADR-0051): in an snExprTerm; children [operand snExprTerm]
-	snSpawn          // ORGLIN (ADR-0051): in an snExprTerm; children [snFunctionCall] [owner snExpression]?
+	snSpawn,         // ORGLIN (ADR-0051): in an snExprTerm; children [snFunctionCall] [owner snExpression]?
+	snForIn          // ORGLIN (ADR-0052): `for (T x : t)`; children [label snIdentifier]? (snDataType snIdentifier)+ snAssignment body
 };
 
 struct sToken

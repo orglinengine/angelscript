@@ -301,6 +301,10 @@ protected:
 	void CompileCase(asCScriptNode *node, asCByteCode *bc, bool *hasReturn, bool *hasBreak);
 	void CompileForStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileForEachStatement(asCScriptNode* node, asCByteCode* bc);
+	// ORGLIN (ADR-0052): `for (T x : t)`. A table runs an array-part walk with no native call per element, then the iterator
+	// protocol for the hash part; range(a, b[, step]) with a constant step is a counted loop; a class uses the protocol.
+	void CompileForInStatement(asCScriptNode* node, asCByteCode* bc);
+	bool CompileForInRange(asCScriptNode* node, asCScriptNode* rangeNode, asCDataType itemDt, asCScriptNode* itemNode, const asCString& loopLabel, asCByteCode* bc);
 	void CompileWhileStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileDoWhileStatement(asCScriptNode *node, asCByteCode *bc);
 	void CompileBreakStatement(asCScriptNode *node, asCByteCode *bc);

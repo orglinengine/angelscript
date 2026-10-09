@@ -234,6 +234,13 @@
 #define TXT_s_NOT_DECLARED                         "'%s' is not declared"
 #define TXT_NOT_EXACT                              "Implicit conversion of value is not exact"
 #define TXT_s_NOT_A_FOREACH_TYPE                   "Type '%s' is not valid type for foreach loops"
+// ORGLIN (ADR-0052): `foreach` folded into `for (T x : t)`
+#define TXT_FOREACH_DOES_NOT_EXIST                     "foreach is now for: write for (T x : t)  (the key comes first: foreach (V v, K k : t) becomes for (K k, V v : t))"
+#define TXT_s_NOT_A_FORIN_TYPE                         "Type '%s' is not valid type for 'for (T x : t)': it needs a table, range(...) or opForBegin/opForEnd/opForNext/opForValue"
+#define TXT_FORIN_TABLE_VARS                           "for: a table loop has one (value) or two (key, value) variables"
+#define TXT_FORIN_KEY_TYPE_s                           "for: the key variable of this table must be an integer or '%s'"
+#define TXT_FORIN_RANGE_VAR                            "for: the variable of a range loop must be an integer"
+#define TXT_FORIN_RANGE_VARS                           "for: a range loop has one variable"
 #define TXT_s_NOT_INITIALIZED                      "'%s' is not initialized."
 #define TXT_NOT_LVALUE                             "Expression is not an l-value"
 #define TXT_s_NOT_MEMBER_OF_s                      "'%s' is not a member of '%s'"

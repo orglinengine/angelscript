@@ -5001,9 +5001,18 @@ asCScriptNode *asCParser::ParseStatement()
 	if (t1.type == ttIf)
 		return ParseIf();
 	else if (t1.type == ttFor)
-		return ParseFor();
+		return IsForInStatement() ? ParseForIn() : ParseFor();
 	else if (t1.type == ttForEach)
+	{
+		// ORGLIN (ADR-0052): with asEP_DISABLE_FOREACH (the default) foreach is a signpost error that points at for-in.
+		// The recovery in ParseStatementBlock skips the braces (or to the `;`), so one error is reported.
+		if (engine->ep.disableForeach)
+		{
+			Error(TXT_FOREACH_DOES_NOT_EXIST, &t1);
+			return 0;
+		}
 		return ParseForEach();
+	}
 	else if (t1.type == ttWhile)
 		return ParseWhile();
 	else if (t1.type == ttReturn)
@@ -5707,6 +5716,125 @@ asCScriptNode *asCParser::ParseFor()
 				return node;
 			}
 		}
+	}
+
+	node->AddChildLast(ParseStatement());
+
+	return node;
+}
+
+// ORGLIN (ADR-0052): after `for` [label] `(`: is the head `TYPE IDENT (',' TYPE IDENT)* ':'`? A classic head never has
+// a type word, a name and then `:` or `,` followed by another type word and name (`for (int a, b = 0; ...)` has a bare
+// `b`), and a ternary cannot start with `TYPE IDENT`, so the `:` of the head never meets `?:`. The position is unchanged.
+bool asCParser::IsForInHead()
+{
+	sToken t, t1;
+	GetToken(&t);
+	RewindTo(&t);
+
+	bool ok = false;
+	for (;;)
+	{
+		if (!FindTokenAfterType(t1))
+			break;
+		RewindTo(&t1);
+		GetToken(&t1);
+		if (t1.type != ttIdentifier)
+			break;
+		GetToken(&t1);
+		if (t1.type == ttColon)
+		{
+			ok = true;
+			break;
+		}
+		if (t1.type != ttListSeparator)
+			break;
+	}
+
+	RewindTo(&t);
+	return ok;
+}
+
+// ORGLIN (ADR-0052): `for` [label] `(` and then a for-in head. The position is unchanged.
+bool asCParser::IsForInStatement()
+{
+	sToken t, t1;
+	GetToken(&t);
+	bool ok = false;
+	if (t.type == ttFor)
+	{
+		GetToken(&t1);
+		if (engine->ep.matchSupport && t1.type == ttIdentifier)
+			GetToken(&t1);
+		if (t1.type == ttOpenParenthesis)
+			ok = IsForInHead();
+	}
+	RewindTo(&t);
+	return ok;
+}
+
+// BNF:8: FORIN         ::= 'for' IDENTIFIER? '(' TYPE IDENTIFIER (',' TYPE IDENTIFIER)* ':' ASSIGN ')' STATEMENT
+// ORGLIN (ADR-0052): the node is snForIn; the children are the same as a foreach's.
+asCScriptNode *asCParser::ParseForIn()
+{
+	asCScriptNode* node = CreateNode(snForIn);
+	if (node == 0) return 0;
+
+	sToken t;
+	GetToken(&t);
+	if (t.type != ttFor)
+	{
+		Error(ExpectedToken("for"), &t);
+		Error(InsteadFound(t), &t);
+		return node;
+	}
+
+	node->UpdateSourcePos(t.pos, t.length);
+
+	GetToken(&t);
+	if (engine->ep.matchSupport && t.type == ttIdentifier)
+	{
+		RewindTo(&t);
+		node->AddChildLast(ParseIdentifier());
+		if (isSyntaxError) return node;
+		GetToken(&t);
+	}
+	if (t.type != ttOpenParenthesis)
+	{
+		Error(ExpectedToken("("), &t);
+		Error(InsteadFound(t), &t);
+		return node;
+	}
+
+	for (;;)
+	{
+		node->AddChildLast(ParseType(true, false, true));
+		if (isSyntaxError) return node;
+		node->AddChildLast(ParseIdentifier());
+		if (isSyntaxError) return node;
+
+		GetToken(&t);
+		if (t.type == ttListSeparator)
+			continue;
+		if (t.type != ttColon)
+		{
+			const char* tokens[] = { ",", ":" };
+			Error(ExpectedOneOf(tokens, 2), &t);
+			Error(InsteadFound(t), &t);
+			return node;
+		}
+		break;
+	}
+
+	node->AddChildLast(ParseAssignment());
+	if (isSyntaxError) return node;
+
+	GetToken(&t);
+	if (t.type != ttCloseParenthesis)
+	{
+		Error(ExpectedToken(")"), &t);
+		Error(InsteadFound(t), &t);
+		return node;
 	}
 
 	node->AddChildLast(ParseStatement());

@@ -5789,6 +5789,8 @@ void asCCompiler::CompileStatement(asCScriptNode *statement, bool *hasReturn, as
 		CompileForStatement(statement, bc);
 	else if (statement->nodeType == snForEach)
 		CompileForEachStatement(statement, bc);
+	else if (statement->nodeType == snForIn)
+		CompileForInStatement(statement, bc);
 	else if (statement->nodeType == snWhile)
 		CompileWhileStatement(statement, bc);
 	else if (statement->nodeType == snDoWhile)
@@ -8393,6 +8395,707 @@ void asCCompiler::CompileForEachStatement(asCScriptNode* node, asCByteCode* bc)
 		// The items (values) were already destroyed as part of the loop statement, so don't destroy them again outside the loop
 		if( !itemOffsets.Exists(v->stackOffset) )
 			CallDestructor(v->type, v->stackOffset, v->onHeap, bc);
+		DeallocateVariable(v->stackOffset);
+	}
+
+	RemoveVariableScope();
+	bc->Block(false);
+}
+
+// ORGLIN (ADR-0052) ---------------------------------------------------------------------------------------------
+// for (T x : t). The node is snForIn: [label] (type identifier)+ iterable body, the same children as a foreach.
+//
+//   range(a, b[, step])   a constant-step call of the registered `range` is a counted loop with no object
+//   table                 the array part is walked by an index (ArrAt, no native call per element), then the hash part
+//                         through the iterator protocol; ONE iterator object per loop is the guard that makes structural
+//                         change throw. The body is compiled once and entered from both walks.
+//   anything else         the opForBegin / opForEnd / opForNext / opForValueN protocol (a script class, a K-typed key)
+// Loop variables are read-only and live in a scope of their own per iteration, so break / continue / return /
+// an exception destroy them (and the guard) through the normal scope unwind.
+
+// the single call `name(args)` an iterable is made of, with no operator, cast or member access around it; 0 otherwise
+static asCScriptNode *asForInPlainCall(asCScriptNode *assign)
+{
+	static const eScriptNode chain[] = { snAssignment, snCondition, snExpression, snExprTerm, snExprValue };
+	asCScriptNode *n = assign;
+	for( int i = 0; i < 5; i++ )
+	{
+		if( n == 0 || n->nodeType != chain[i] || n->firstChild == 0 || n->firstChild != n->lastChild )
+			return 0;
+		n = n->firstChild;
+	}
+	return n && n->nodeType == snFunctionCall ? n : 0;
+}
+
+// `for (int i : range(a, b[, step]))` with a constant non-zero step: the variable is the counter. Returns false when the
+// iterable is not such a call (nothing has been emitted), true when the loop is compiled (or its error reported).
+bool asCCompiler::CompileForInRange(asCScriptNode *node, asCScriptNode *rangeNode, asCDataType itemDt, asCScriptNode *itemNode, const asCString &loopLabel, asCByteCode *bc)
+{
+	asCScriptNode *call = asForInPlainCall(rangeNode);
+	if( call == 0 || call->firstChild->nodeType != snIdentifier ) return false;
+	if( call->lastChild->nodeType != snArgList || call->firstChild->next != call->lastChild ) return false;
+	if( asCString(&script->code[call->firstChild->tokenPos], call->firstChild->tokenLength) != "range" ) return false;
+
+	asCScriptNode *argNodes[3];
+	int argc = 0;
+	for( asCScriptNode *a = call->lastChild->firstChild; a; a = a->next )
+	{
+		if( a->nodeType != snAssignment || argc == 3 ) return false;
+		argNodes[argc++] = a;
+	}
+	if( argc < 2 ) return false;
+
+	// `range` must be the application's function: a local, a method of this class or a script function of that name wins
+	if( variables && variables->GetVariable("range") ) return false;
+	if( outFunc->objectType )
+		for( asUINT n = 0; n < outFunc->objectType->methods.GetLength(); n++ )
+			if( engine->scriptFunctions[outFunc->objectType->methods[n]]->name == "range" ) return false;
+	asCArray<int> funcs;
+	for( asSNameSpace *ns = outFunc->nameSpace; ns && funcs.GetLength() == 0; ns = engine->GetParentNameSpace(ns) )
+		builder->GetFunctionDescriptions("range", funcs, ns);
+	if( funcs.GetLength() == 0 ) return false;
+	for( asUINT n = 0; n < funcs.GetLength(); n++ )
+		if( engine->scriptFunctions[funcs[n]]->funcType != asFUNC_SYSTEM ) return false;
+
+	// the variable: an integer of 32 or 64 bits (auto is int64, the type of range's values)
+	asCDataType vDt = itemDt;
+	if( vDt.IsAuto() ) vDt = asCDataType::CreatePrimitive(ttInt64, false);
+	if( vDt.IsReference() || vDt.IsEnumType() ) return false;
+	const eTokenType tt = vDt.GetTokenType();
+	if( tt != ttInt && tt != ttUInt && tt != ttInt64 && tt != ttUInt64 ) return false;
+	const bool is64 = tt == ttInt64 || tt == ttUInt64;
+
+	// the step must be a non-zero decimal integer literal (read from the source text, so nothing is compiled and
+	// discarded); anything else (a name, an expression, 0) is the materialised table
+	asINT64 step = 1;
+	if( argc == 3 )
+	{
+		const char *p = &script->code[argNodes[2]->tokenPos];
+		const char *e = p + argNodes[2]->tokenLength;
+		while( p < e && *p == ' ' ) p++;
+		bool neg = false;
+		if( p < e && (*p == '-' || *p == '+') ) { neg = *p == '-'; p++; }
+		while( p < e && *p == ' ' ) p++;
+		asINT64 mag = 0;
+		int digits = 0;
+		for( ; p < e && *p >= '0' && *p <= '9'; p++, digits++ )
+			mag = mag * 10 + (*p - '0');
+		while( p < e && *p == ' ' ) p++;
+		if( digits == 0 || digits > 15 || p != e || mag == 0 ) return false;
+		step = neg ? -mag : mag;
+	}
+
+	// the bounds are evaluated once, in order, before the variable's name is visible
+	asCExprContext ea(engine), eb(engine);
+	if( CompileAssignment(argNodes[0], &ea) < 0 ) return true;
+	if( CompileAssignment(argNodes[1], &eb) < 0 ) return true;
+
+	bc->Block(true);
+	AddVariableScope(true, true);
+
+	asCDataType plainDt = vDt;
+	plainDt.MakeReadOnly(false);
+	asCDataType roDt = vDt;
+	roDt.MakeReadOnly(true);
+
+	asCByteCode initBC(engine);
+	asCString name(&script->code[itemNode->tokenPos], itemNode->tokenLength);
+	int vOff = AllocateVariable(roDt, false);
+	if( DeclareVariable(name, roDt, vOff, &ea.bc, node) < 0 ) { RemoveVariableScope(); bc->Block(false); return true; }
+	asQWORD constValue = 0;   // a read-only variable initialised from a constant reports it here; the counter is not a constant
+	CompileInitializationWithAssignment(&ea.bc, roDt, itemNode->prev, vOff, &constValue, asVGM_VARIABLE, rangeNode, &ea);
+	ProcessDeferredParams(&ea);
+	ea.bc.OptimizeLocally(tempVariableOffsets);
+	variables->GetVariableByOffset(vOff)->isInitialized = true;
+
+	int endOff = AllocateVariable(plainDt, false);
+	if( DeclareVariable("", plainDt, endOff, &eb.bc, node) < 0 ) { RemoveVariableScope(); bc->Block(false); return true; }
+	CompileInitializationWithAssignment(&eb.bc, plainDt, itemNode->prev, endOff, &constValue, asVGM_VARIABLE, rangeNode, &eb);
+	ProcessDeferredParams(&eb);
+	eb.bc.OptimizeLocally(tempVariableOffsets);
+	variables->GetVariableByOffset(endOff)->isInitialized = true;
+
+	// a step other than 1 / -1 is added from a variable
+	const bool unit = step == 1 || step == -1;
+	int stepOff = 0;
+	if( !unit )
+	{
+		stepOff = AllocateVariable(plainDt, false);
+		if( DeclareVariable("", plainDt, stepOff, &initBC, node) < 0 ) { RemoveVariableScope(); bc->Block(false); return true; }
+		if( is64 ) initBC.InstrSHORT_QW(asBC_SetV8, (short)stepOff, (asQWORD)step);
+		else       initBC.InstrSHORT_DW(asBC_SetV4, (short)stepOff, (asDWORD)(asINT64)step);
+	}
+
+	int conditionLabel = nextLabel++;
+	int afterLabel = nextLabel++;
+	int continueLabel = nextLabel++;
+	int insideLabel = nextLabel++;
+	PushJumpTarget(jtLoop, afterLabel, continueLabel, loopLabel);
+
+	bool hasReturn;
+	asCByteCode bodyBC(engine);
+	CompileStatement(node->lastChild, &hasReturn, &bodyBC);
+
+	// the step, then the test: ascending jumps back while v < end, descending while v > end
+	const bool up = step > 0;
+	asCByteCode stepBC(engine), testBC(engine);
+	if( unit )
+	{
+		if( is64 ) stepBC.InstrSHORT(up ? asBC_IncVi64 : asBC_DecVi64, (short)vOff);
+		else       stepBC.InstrSHORT(up ? asBC_IncVi : asBC_DecVi, (short)vOff);
+	}
+	else
+		stepBC.InstrW_W_W(is64 ? asBC_ADDi64 : asBC_ADDi, vOff, vOff, stepOff);
+	asEBCInstr cmp = tt == ttInt ? asBC_CMPi : tt == ttUInt ? asBC_CMPu : tt == ttInt64 ? asBC_CMPi64 : asBC_CMPu64;
+	testBC.InstrW_W(cmp, vOff, endOff);
+	testBC.InstrDWORD(up ? asBC_JS : asBC_JP, insideLabel);
+	testBC.OptimizeLocally(tempVariableOffsets);   // CMP + J becomes one JCMP, and the step in front of it fuses with that
+
+	bc->AddCode(&ea.bc);
+	bc->AddCode(&eb.bc);
+	bc->AddCode(&initBC);
+	bc->InstrDWORD(asBC_JMP, conditionLabel);
+	bc->Label((short)insideLabel);
+	if( engine->ep.loopSuspend )
+		bc->Instr(asBC_SUSPEND);
+	bc->InstrPTR(asBC_JitEntry, 0);
+	LineInstr(bc, node->lastChild->tokenPos);
+	bc->AddCode(&bodyBC);
+	bc->Label((short)continueLabel);
+	bc->AddCode(&stepBC);
+	bc->Label((short)conditionLabel);
+	bc->AddCode(&testBC);
+	bc->Label((short)afterLabel);
+
+	PopJumpTarget();
+
+	for( int n = (int)variables->variables.GetLength() - 1; n >= 0; n-- )
+	{
+		sVariable *v = variables->variables[n];
+		CallDestructor(v->type, v->stackOffset, v->onHeap, bc);
+		DeallocateVariable(v->stackOffset);
+	}
+
+	RemoveVariableScope();
+	bc->Block(false);
+	return true;
+}
+
+void asCCompiler::CompileForInStatement(asCScriptNode *node, asCByteCode *bc)
+{
+	asCString loopLabel = TakeLoopLabel(node);
+
+	const char* const BEGIN_NAME = "opForBegin";
+	const char* const END_NAME   = "opForEnd";
+	const char* const NEXT_NAME  = "opForNext";
+	const char* const VALUE_NAME = "opForValue";
+	const char* const SEEK_NAME  = "opForSeek";    // table: the iterator moves to the hash part
+	const char* const INDEX_NAME = "opForIndex";   // table: the key as an integer (integer key variable)
+
+	asCArray<asCDataType> itemDts;
+	asQWORD constValue = 0;   // a read-only variable initialised from a constant reports it here (never the case for a loop variable)
+	asCArray<asCScriptNode*> itemNodes;
+	asUINT itemCount = 0;
+
+	asCScriptNode *rangeNode = node->firstChild;
+	while( rangeNode->nodeType != snAssignment )
+	{
+		++itemCount;
+		asASSERT(rangeNode->nodeType == snDataType);
+		itemDts.PushLast(builder->CreateDataTypeFromNode(rangeNode, script, outFunc->nameSpace, false, outFunc->objectType, true, 0, 0, &m_namespaceVisibility));
+		asASSERT(rangeNode->next->nodeType == snIdentifier);
+		itemNodes.PushLast(rangeNode->next);
+		rangeNode = rangeNode->next->next;
+	}
+
+	if( itemCount == 1 && CompileForInRange(node, rangeNode, itemDts[0], itemNodes[0], loopLabel, bc) )
+		return;
+
+	//---------------------------------------
+	// The iterable, evaluated once
+	asCExprContext rangeExpr(engine);
+	if( CompileAssignment(rangeNode, &rangeExpr) < 0 )
+		return;
+	const bool isConstRange = rangeExpr.type.dataType.IsReadOnly() || rangeExpr.type.dataType.IsHandleToConst();
+
+	asCTypeInfo *rangeTypeInfo = rangeExpr.type.dataType.GetTypeInfo();
+	asCObjectType *rangeOT = rangeTypeInfo ? CastToObjectType(rangeTypeInfo) : 0;
+	asCDataType shownDt = rangeExpr.type.dataType;   // the type as the author wrote it: no reference, no handle
+	shownDt.MakeReference(false);
+	shownDt.MakeHandle(false);
+	if( rangeOT == 0 )
+	{
+		asCString str;
+		str.Format(TXT_s_NOT_A_FORIN_TYPE, shownDt.Format(outFunc->nameSpace).AddressOf());
+		Error(str, rangeNode);
+		return;
+	}
+
+	// A table is recognised by its opIndex (the one the VM serves): its (key, value) variables are the reverse of the
+	// protocol's positional (opForValue0, opForValue1), its array part is walked by index, and it has length().
+	bool isTable = false;
+	int indexId = 0, lengthId = 0;
+	if( engine->ep.tableLayoutSet )
+		for( asUINT n = 0; n < rangeOT->methods.GetLength(); n++ )
+		{
+			asCScriptFunction *f = engine->scriptFunctions[rangeOT->methods[n]];
+			if( f && engine->IsTableAt(f) )
+			{
+				isTable = true;
+				if( f->IsReadOnly() && f->parameterTypes.GetLength() == 1 && !f->parameterTypes[0].IsReference() && f->parameterTypes[0].GetSizeInMemoryBytes() == 8 )
+					indexId = f->id;
+			}
+			else if( f && f->name == "length" && f->parameterTypes.GetLength() == 0 && f->IsReadOnly() )
+				lengthId = f->id;
+		}
+	if( isTable && itemCount > 2 )
+	{
+		Error(TXT_FORIN_TABLE_VARS, itemNodes[2]);
+		return;
+	}
+	const bool tableKeyFirst = isTable && itemCount == 2;   // item 0 is the key: the protocol's value 1
+
+	//---------------------------------------
+	// The protocol methods
+	int opForBeginId = 0, opForEndId = 0, opForNextId = 0, opForSeekId = 0, opForIndexId = 0;
+	asCArray<int> opForValueNIds;
+	int iterTid = asTYPEID_VOID;
+
+	{
+		asCArray<int> funcs;
+		builder->GetObjectMethodDescriptions(BEGIN_NAME, rangeOT, funcs, isConstRange);
+		for( asUINT i = 0; i < funcs.GetLength(); i++ )
+		{
+			asIScriptFunction *f = engine->scriptFunctions[funcs[i]];
+			if( f->GetParamCount() == 0 )
+			{
+				if( opForBeginId != 0 && !isConstRange ) { if( !f->IsReadOnly() ) opForBeginId = funcs[i]; }
+				else opForBeginId = funcs[i];
+			}
+		}
+		if( opForBeginId )
+			iterTid = engine->scriptFunctions[opForBeginId]->GetReturnTypeId();
+	}
+
+	if( iterTid )
+	{
+		// end(it) -> bool
+		{
+			asCArray<int> funcs;
+			builder->GetObjectMethodDescriptions(END_NAME, rangeOT, funcs, isConstRange);
+			for( asUINT i = 0; i < funcs.GetLength(); i++ )
+			{
+				asIScriptFunction *f = engine->scriptFunctions[funcs[i]];
+				asDWORD flags;
+				int paramTid;
+				if( f->GetParamCount() == 1 && f->GetReturnTypeId(&flags) == asTYPEID_BOOL && !(flags & asTM_INOUTREF) && f->GetParam(0, &paramTid) >= 0 && paramTid == iterTid )
+				{
+					if( opForEndId != 0 && !isConstRange ) { if( !f->IsReadOnly() ) opForEndId = funcs[i]; }
+					else opForEndId = funcs[i];
+				}
+			}
+		}
+		// next(it) -> it, and the table's seek(it) -> it
+		for( int pass = 0; pass < (isTable ? 2 : 1); pass++ )
+		{
+			int &target = pass == 0 ? opForNextId : opForSeekId;
+			asCArray<int> funcs;
+			builder->GetObjectMethodDescriptions(pass == 0 ? NEXT_NAME : SEEK_NAME, rangeOT, funcs, isConstRange);
+			for( asUINT i = 0; i < funcs.GetLength(); i++ )
+			{
+				asIScriptFunction *f = engine->scriptFunctions[funcs[i]];
+				int paramTid;
+				if( f->GetParamCount() == 1 && f->GetReturnTypeId() == iterTid && f->GetParam(0, &paramTid) >= 0 && paramTid == iterTid )
+				{
+					if( target != 0 && !isConstRange ) { if( !f->IsReadOnly() ) target = funcs[i]; }
+					else target = funcs[i];
+				}
+			}
+		}
+		// index(it) -> int64
+		if( isTable )
+		{
+			asCArray<int> funcs;
+			builder->GetObjectMethodDescriptions(INDEX_NAME, rangeOT, funcs, isConstRange);
+			for( asUINT i = 0; i < funcs.GetLength(); i++ )
+			{
+				asIScriptFunction *f = engine->scriptFunctions[funcs[i]];
+				int paramTid;
+				if( f->GetParamCount() == 1 && f->GetReturnTypeId() == asTYPEID_INT64 && f->GetParam(0, &paramTid) >= 0 && paramTid == iterTid )
+					opForIndexId = funcs[i];
+			}
+		}
+
+		// value n -> the item's value; a table's key form swaps the two
+		for( asUINT i = 0; i < itemCount; ++i )
+		{
+			const asUINT src = tableKeyFirst ? 1 - i : i;
+			int found = 0;
+			asCArray<int> funcs;
+			if( itemCount == 1 )
+				builder->GetObjectMethodDescriptions(VALUE_NAME, rangeOT, funcs, isConstRange);
+			if( funcs.GetLength() == 0 )
+			{
+				asCString methodName;
+				methodName.Format("%s%d", VALUE_NAME, (int)src);
+				builder->GetObjectMethodDescriptions(methodName.AddressOf(), rangeOT, funcs, isConstRange);
+			}
+			for( asUINT j = 0; j < funcs.GetLength(); j++ )
+			{
+				asIScriptFunction *f = engine->scriptFunctions[funcs[j]];
+				int paramTid;
+				if( f->GetParamCount() == 1 && f->GetParam(0, &paramTid) >= 0 && paramTid == iterTid )
+				{
+					if( found != 0 && !isConstRange ) { if( !f->IsReadOnly() ) found = funcs[j]; }
+					else found = funcs[j];
+				}
+			}
+			if( found == 0 )
+				break;
+			opForValueNIds.PushLast(found);
+
+			// auto takes the collection's declared type of that value (never a per-item type)
+			if( itemDts[i].IsAuto() )
+			{
+				asDWORD retFlags;
+				int retTid = engine->scriptFunctions[found]->GetReturnTypeId(&retFlags);
+				bool isConst = itemDts[i].IsReadOnly() || (retFlags & asTM_CONST);
+				asCDataType dt = asCDataType::CreateById(engine, retTid, isConst);
+				dt.MakeHandle(true);
+				itemDts[i] = dt;
+			}
+		}
+	}
+
+	if( !(opForBeginId && opForEndId && opForNextId && opForValueNIds.GetLength() == itemCount) )
+	{
+		asCString str;
+		str.Format(TXT_s_NOT_A_FORIN_TYPE, shownDt.Format(outFunc->nameSpace).AddressOf());
+		Error(str, rangeNode);
+		if( !opForBeginId )
+		{
+			str.Format(TXT_MISSING_OR_INVALID_DEFINITON_OF_s, BEGIN_NAME);
+			Information(str, rangeNode);
+		}
+		else
+		{
+			if( !opForEndId )  { str.Format(TXT_MISSING_OR_INVALID_DEFINITON_OF_s, END_NAME);  Information(str, rangeNode); }
+			if( !opForNextId ) { str.Format(TXT_MISSING_OR_INVALID_DEFINITON_OF_s, NEXT_NAME); Information(str, rangeNode); }
+			if( opForValueNIds.GetLength() != itemCount )
+			{
+				str.Format(TXT_MISSING_OR_INVALID_DEFINITON_OF_s, (asCString(VALUE_NAME) + "#").AddressOf());
+				Information(str, rangeNode);
+			}
+		}
+		return;
+	}
+
+	// A table's key variable: an integer (the position / integer key) or the table's own K; nothing else
+	bool keyIsInt = false;
+	if( tableKeyFirst )
+	{
+		const asCDataType &kv = itemDts[0];
+		keyIsInt = !kv.IsReference() && !kv.IsEnumType() && kv.IsPrimitive() && (kv.IsIntegerType() || kv.IsUnsignedType());
+		asDWORD kflags;
+		const int kTid = engine->scriptFunctions[opForValueNIds[0]]->GetReturnTypeId(&kflags);
+		asCDataType kDt = asCDataType::CreateById(engine, kTid, false);
+		const bool isK = kv.GetTypeInfo() ? kv.GetTypeInfo() == kDt.GetTypeInfo() : kv.IsEqualExceptRefAndConst(kDt);
+		if( !keyIsInt && !isK )
+		{
+			asCString str;
+			str.Format(TXT_FORIN_KEY_TYPE_s, kDt.Format(outFunc->nameSpace).AddressOf());
+			Error(str, itemNodes[0]);
+			return;
+		}
+	}
+	const bool fast = isTable && (itemCount == 1 || keyIsInt) && indexId && lengthId && opForSeekId && (itemCount == 1 || opForIndexId);
+
+	// loop variables are read-only (a handle stays a handle: it is the variable that cannot be reassigned)
+	for( asUINT i = 0; i < itemCount; ++i )
+		itemDts[i].MakeReadOnly(true);
+
+	//---------------------------------------
+	// Scope, labels, the iterable held in a variable
+	bc->Block(true);
+	AddVariableScope(true, true);
+
+	asCDataType rangeDt = rangeExpr.type.dataType;
+	rangeDt.MakeReference(false);
+	if( rangeDt.SupportHandles() ) rangeDt.MakeHandle(true);
+	int rangeOffset = AllocateVariable(rangeDt, false);
+	if( DeclareVariable("", rangeDt, rangeOffset, &rangeExpr.bc, node) < 0 )
+		return;
+
+	CompileInitializationWithAssignment(&rangeExpr.bc, rangeDt, rangeNode, rangeOffset, 0, asVGM_VARIABLE, rangeNode, &rangeExpr);
+	ProcessDeferredParams(&rangeExpr);
+	rangeExpr.bc.OptimizeLocally(tempVariableOffsets);
+
+	int conditionLabel = nextLabel++;
+	int afterLabel = nextLabel++;
+	int continueLabel = nextLabel++;
+	int insideLabel = nextLabel++;
+	int insideALabel = nextLabel++, condALabel = nextLabel++, stepBLabel = nextLabel++, bodyLabel = nextLabel++;
+
+	PushJumpTarget(jtLoop, afterLabel, continueLabel, loopLabel);
+
+	// the iterator: the guard that makes structural change throw, released with the scope
+	asCByteCode initBC(engine);
+	LineInstr(&initBC, node->firstChild->tokenPos);
+	asCDataType iterDt = asCDataType::CreateById(engine, iterTid, false);
+	int iterOffset = AllocateVariable(iterDt, false);
+	if( DeclareVariable("", iterDt, iterOffset, &initBC, node) < 0 )
+		return;
+
+	// calls on the iterable: f(), f(iterator)
+	auto iterArg = [&](asCExprContext &arg) {
+		arg.type.SetVariable(iterDt, iterOffset, false);
+		if( !iterDt.IsPrimitive() )
+		{
+			arg.bc.InstrSHORT(asBC_PSF, (short)iterOffset);
+			if( iterDt.IsObjectHandle() ) arg.type.dataType.MakeReference(true);
+		}
+		arg.type.isLValue = true;
+		arg.exprNode = node;
+	};
+	auto callWithIter = [&](asCExprContext &e, int funcId, asCScriptNode *errNode) {
+		e.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		asCArray<asCExprContext*> args;
+		asCExprContext arg(engine);
+		iterArg(arg);
+		args.PushLast(&arg);
+		int r = MakeFunctionCall(&e, funcId, rangeOT, args, errNode);
+		UNUSED_VAR(r);
+		asASSERT(r >= 0);
+	};
+
+	asCExprContext opForBeginExpr(engine);
+	{
+		opForBeginExpr.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		asCArray<asCExprContext*> args;
+		int r = MakeFunctionCall(&opForBeginExpr, opForBeginId, rangeOT, args, node->firstChild);
+		UNUSED_VAR(r);
+		asASSERT(r >= 0);
+	}
+	CompileInitializationWithAssignment(&initBC, iterDt, node->firstChild, iterOffset, NULL, asVGM_VARIABLE, rangeNode, &opForBeginExpr);
+
+	// the array walk's length (read once: the guard forbids structural change) and index
+	asCDataType i64Dt = asCDataType::CreatePrimitive(ttInt64, false);
+	int lenOffset = 0, idxOffset = 0;
+	if( fast )
+	{
+		lenOffset = AllocateVariable(i64Dt, false);
+		if( DeclareVariable("", i64Dt, lenOffset, &initBC, node) < 0 )
+			return;
+		asCExprContext lenExpr(engine);
+		lenExpr.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+		asCArray<asCExprContext*> args;
+		int r = MakeFunctionCall(&lenExpr, lengthId, rangeOT, args, node->firstChild);
+		UNUSED_VAR(r);
+		asASSERT(r >= 0);
+		CompileInitializationWithAssignment(&initBC, i64Dt, node->firstChild, lenOffset, &constValue, asVGM_VARIABLE, rangeNode, &lenExpr);
+		variables->GetVariableByOffset(lenOffset)->isInitialized = true;
+
+		idxOffset = AllocateVariable(i64Dt, false);
+		if( DeclareVariable("", i64Dt, idxOffset, &initBC, node) < 0 )
+			return;
+		initBC.InstrSHORT_QW(asBC_SetV8, (short)idxOffset, 0);
+		variables->GetVariableByOffset(idxOffset)->isInitialized = true;
+	}
+	initBC.OptimizeLocally(tempVariableOffsets);
+
+	//-----------------------------------
+	// The condition (the protocol's end test), the step (next) and the table's seek
+	asCExprContext opForEndExpr(engine);
+	{
+		callWithIter(opForEndExpr, opForEndId, node);
+		ConvertToVariable(&opForEndExpr);
+		ProcessDeferredParams(&opForEndExpr);
+
+		// not ended: go inside
+		opForEndExpr.bc.InstrSHORT(asBC_CpyVtoR4, (short)opForEndExpr.type.stackOffset);
+		opForEndExpr.bc.Instr(asBC_ClrHi);
+		opForEndExpr.bc.InstrDWORD(asBC_JZ, insideLabel);
+		ReleaseTemporaryVariable(opForEndExpr.type, &opForEndExpr.bc);
+		opForEndExpr.bc.OptimizeLocally(tempVariableOffsets);
+
+		asCByteCode tmp(engine);
+		LineInstr(&tmp, node->firstChild->tokenPos);
+		tmp.AddCode(&opForEndExpr.bc);
+		opForEndExpr.bc.AddCode(&tmp);
+	}
+
+	// `it = f(it)`
+	auto iterAssign = [&](asCExprContext &out, int funcId) {
+		asCExprContext call(engine);
+		callWithIter(call, funcId, node);
+
+		asCExprContext lhs(engine);
+		lhs.type.SetVariable(iterDt, iterOffset, false);
+		if( !iterDt.IsPrimitive() )
+		{
+			lhs.bc.InstrSHORT(asBC_PSF, (short)iterOffset);
+			if( iterDt.IsObjectHandle() ) lhs.type.dataType.MakeReference(true);
+		}
+		if( iterDt.IsObjectHandle() )
+			lhs.type.isExplicitHandle = true;
+		lhs.type.isLValue = true;
+		lhs.exprNode = node;
+
+		DoAssignment(&out, &lhs, &call, node, node, ttAssignment, node);
+		ProcessDeferredParams(&out);
+		ReleaseTemporaryVariable(out.type, &out.bc);
+		if( !out.type.dataType.IsPrimitive() )
+			out.bc.Instr(asBC_PopPtr);
+		out.bc.OptimizeLocally(tempVariableOffsets);
+	};
+	asCExprContext next(engine), seek(engine);
+	iterAssign(next, opForNextId);
+	if( fast )
+		iterAssign(seek, opForSeekId);
+
+	//------------------------------
+	// The loop variables (a scope per iteration) and the body
+	bool hasReturn;
+	AddVariableScope();
+	asCByteCode declBC(engine), initABC(engine), initBBC(engine), bodyBC(engine);
+
+	for( asUINT i = 0; i < itemCount; ++i )
+	{
+		asCDataType &itemDt = itemDts[i];
+		asCScriptNode *itemNode = itemNodes[i];
+
+		int itemOffset = AllocateVariable(itemDt, false);
+		asCString itemName(&script->code[itemNode->tokenPos], itemNode->tokenLength);
+		if( DeclareVariable(itemName, itemDt, itemOffset, &declBC, node) < 0 )
+			return;
+
+		// the protocol's value (or, for an integer key variable of a table, the key as an integer)
+		const int srcB = (fast && tableKeyFirst && i == 0) ? opForIndexId : opForValueNIds[i];
+		{
+			asCExprContext e(engine);
+			callWithIter(e, srcB, node->firstChild);
+			CompileInitializationWithAssignment(&initBBC, itemDt, itemNode->prev, itemOffset, &constValue, asVGM_VARIABLE, rangeNode, &e);
+		}
+		if( fast )
+		{
+			asCExprContext e(engine);
+			if( tableKeyFirst && i == 0 )
+			{
+				// the position
+				e.type.SetVariable(i64Dt, idxOffset, false);
+				e.exprNode = node;
+			}
+			else
+			{
+				// range[index]: the VM's own element read
+				e.bc.InstrSHORT(asBC_PshVPtr, short(rangeOffset));
+				asCArray<asCExprContext*> args;
+				asCExprContext arg(engine);
+				arg.type.SetVariable(i64Dt, idxOffset, false);
+				arg.type.isLValue = true;
+				arg.exprNode = node;
+				args.PushLast(&arg);
+				int r = MakeFunctionCall(&e, indexId, rangeOT, args, node->firstChild);
+				UNUSED_VAR(r);
+				asASSERT(r >= 0);
+			}
+			CompileInitializationWithAssignment(&initABC, itemDt, itemNode->prev, itemOffset, &constValue, asVGM_VARIABLE, rangeNode, &e);
+		}
+
+		// Suppress the compiler warning of uninitialized variable
+		variables->GetVariableByOffset(itemOffset)->isInitialized = true;
+	}
+	initBBC.OptimizeLocally(tempVariableOffsets);
+	initABC.OptimizeLocally(tempVariableOffsets);
+
+	CompileStatement(node->lastChild, &hasReturn, &bodyBC);
+
+	// destroy the loop variables in reverse; they are initialised again by the next iteration
+	for( int n = (int)variables->variables.GetLength() - 1; n >= 0; n-- )
+	{
+		sVariable *v = variables->variables[n];
+		CallDestructor(v->type, v->stackOffset, v->onHeap, &bodyBC);
+		DeallocateVariable(v->stackOffset);
+	}
+	RemoveVariableScope();
+
+	//-------------------------------
+	// Join the code pieces
+	bc->AddCode(&rangeExpr.bc);
+	bc->AddCode(&initBC);
+	if( fast )
+	{
+		bc->InstrDWORD(asBC_JMP, condALabel);
+
+		// an array slot
+		bc->Label((short)insideALabel);
+		if( engine->ep.loopSuspend )
+			bc->Instr(asBC_SUSPEND);
+		bc->InstrPTR(asBC_JitEntry, 0);
+		LineInstr(bc, node->lastChild->tokenPos);
+		bc->Block(true);
+		bc->AddCode(&declBC);
+		bc->AddCode(&initABC);
+		bc->InstrDWORD(asBC_JMP, bodyLabel);
+
+		// a hash entry
+		bc->Label((short)insideLabel);
+		if( engine->ep.loopSuspend )
+			bc->Instr(asBC_SUSPEND);
+		bc->InstrPTR(asBC_JitEntry, 0);
+		LineInstr(bc, node->lastChild->tokenPos);
+		bc->AddCode(&initBBC);
+		bc->Label((short)bodyLabel);
+	}
+	else
+	{
+		bc->InstrDWORD(asBC_JMP, conditionLabel);
+		bc->Label((short)insideLabel);
+		if( engine->ep.loopSuspend )
+			bc->Instr(asBC_SUSPEND);
+		bc->InstrPTR(asBC_JitEntry, 0);
+		LineInstr(bc, node->lastChild->tokenPos);
+		bc->Block(true);
+		bc->AddCode(&declBC);
+		bc->AddCode(&initBBC);
+	}
+	bc->AddCode(&bodyBC);
+	bc->Block(false);
+
+	bc->Label((short)continueLabel);
+	if( fast )
+	{
+		// in the hash walk (index == length) the step is next(); in the array walk it is ++index, and the first test
+		// that fails moves the iterator to the hash part
+		asCByteCode dispatchBC(engine), testABC(engine);
+		dispatchBC.InstrW_W(asBC_CMPi64, idxOffset, lenOffset);
+		dispatchBC.InstrDWORD(asBC_JNS, stepBLabel);
+		dispatchBC.OptimizeLocally(tempVariableOffsets);
+		testABC.InstrW_W(asBC_CMPi64, idxOffset, lenOffset);
+		testABC.InstrDWORD(asBC_JS, insideALabel);
+		testABC.OptimizeLocally(tempVariableOffsets);
+		bc->AddCode(&dispatchBC);
+		bc->InstrSHORT(asBC_IncVi64, (short)idxOffset);
+		bc->Label((short)condALabel);
+		bc->AddCode(&testABC);
+		bc->AddCode(&seek.bc);
+		bc->InstrDWORD(asBC_JMP, conditionLabel);
+		bc->Label((short)stepBLabel);
+	}
+	bc->AddCode(&next.bc);
+
+	bc->Label((short)conditionLabel);
+	bc->AddCode(&opForEndExpr.bc);
+
+	bc->Label((short)afterLabel);
+
+	PopJumpTarget();
+
+	// Deallocate the loop's variables, in reverse order (the iterator is released here)
+	for( int n = (int)variables->variables.GetLength() - 1; n >= 0; n-- )
+	{
+		sVariable *v = variables->variables[n];
+		CallDestructor(v->type, v->stackOffset, v->onHeap, bc);
 		DeallocateVariable(v->stackOffset);
 	}
 

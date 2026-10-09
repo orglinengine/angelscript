@@ -123,6 +123,9 @@ protected:
 	asCScriptNode *ParseIf();
 	asCScriptNode *ParseFor();
 	asCScriptNode *ParseForEach();
+	asCScriptNode *ParseForIn();       // ORGLIN (ADR-0052)
+	bool IsForInStatement();           // ORGLIN (ADR-0052)
+	bool IsForInHead();                // ORGLIN (ADR-0052)
 	asCScriptNode *ParseWhile();
 	asCScriptNode *ParseDoWhile();
 	asCScriptNode *ParseReturn();

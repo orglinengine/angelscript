@@ -394,6 +394,7 @@ public:
 	asSArrayLayout tableLayout;
 	asFUNCTION_t   tableAtFunc[2];
 	int            IsArrayAt(asCScriptFunction *func) const;
+	bool           IsTableAt(asCScriptFunction *func) const;   // ORGLIN (ADR-0052): the table's opIndex, whatever its element type
 	const asSArrayLayout &LayoutOf(int sel) const { return sel ? tableLayout : arrayLayout; }
 
 	// ORGLIN: the application's dynamic value layout (asEP_ANY_LAYOUT); AnyKindOf()
@@ -534,6 +535,7 @@ public:
 		bool   matchSupport;					// ORGLIN (ADR-0049): match / => / redo / arm-head _ / loop labels
 		bool   coroutineSupport;				// ORGLIN (ADR-0051): contextual yield / await / spawn
 		bool   disableSwitch;					// ORGLIN (ADR-0049 M5): switch is a compile error (default true)
+		bool   disableForeach;					// ORGLIN (ADR-0052): foreach is a compile error (default true)
 		bool   anyLayoutSet;					// ORGLIN: anyLayout is valid and the any fast path is on
 		bool   buildWithoutLineCues;
 		bool   initGlobalVarsAfterBuild;

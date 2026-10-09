@@ -266,6 +266,10 @@ enum asEEngineProp
 	// reserved). The value is a pointer to an asSCoroutineSupport (copied by the engine), or 0 for off.
 	asEP_COROUTINE_SUPPORT                  = 54,
 
+	// ORGLIN (ADR-0052): when on (the default) the `foreach` statement is a compile error that points at
+	// `for (T x : t)`. Off restores the classic foreach statement untouched.
+	asEP_DISABLE_FOREACH                    = 55,
+
 	asEP_LAST_PROPERTY
 };
 
